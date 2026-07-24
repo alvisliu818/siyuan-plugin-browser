@@ -1,0 +1,24 @@
+{
+  "name": "siyuan-plugin-browser",
+  "author": "alvisliu818",
+  "url": "https://github.com/alvisliu818/siyuan-plugin-browser",
+  "version": "0.1.0",
+  "minAppVersion": "3.7.0",
+  "backends": ["all"],
+  "frontends": ["desktop", "desktop-window"],
+  "kernels": ["all"],
+  "disabledInPublish": true,
+  "displayName": {
+    "default": "Browser",
+    "zh-CN": "思源浏览器"
+  },
+  "description": {
+    "default": "A full-featured browser inside SiYuan, powered by Electron <webview>. Supports multi-tab, bookmarks, history, downloads.",
+    "zh-CN": "思源浏览器，基于 Electron <webview>，支持多页签、书签、历史、下载。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.zh-CN.md"
+  },
+  "keywords": ["browser", "webview", "浏览器"]
+}
