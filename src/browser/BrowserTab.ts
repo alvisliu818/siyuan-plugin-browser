@@ -312,6 +312,9 @@ export class BrowserTab {
             case "findInPage":
                 this.controller.findInPage(payload?.text ?? "", payload?.forward ?? true, true);
                 break;
+            case "openExternal":
+                await this.openInDefaultBrowser();
+                break;
         }
     }
 
@@ -321,6 +324,28 @@ export class BrowserTab {
         const title = this.controller.getCurrentTitle() || url;
         await this.deps.bookmarks.toggle({ title, url });
         this.updateBookmarkButton(url);
+    }
+
+    /** 在系统默认浏览器中打开当前页面 URL */
+    private async openInDefaultBrowser(): Promise<void> {
+        const url = this.controller.getCurrentUrl();
+        if (!url || !/^https?:\/\//i.test(url)) {
+            showMessage(this.deps.i18n.openExternal);
+            return;
+        }
+        try {
+            const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
+            const shell = electron?.shell;
+            if (shell?.openExternal) {
+                await shell.openExternal(url);
+            } else {
+                // 回退：用思源的方式打开
+                window.open(url, "_blank");
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] openInDefaultBrowser failed:", e);
+            window.open(url, "_blank");
+        }
     }
 
     private updateBookmarkButton(url: string): void {

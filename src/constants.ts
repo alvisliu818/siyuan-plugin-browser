@@ -34,6 +34,7 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     enablePreload: true,
     excerptNotebook: "",
     interceptAllLinks: false,
+    excludedSites: "github.com",
 };
 
 /** 历史上限硬上限 */

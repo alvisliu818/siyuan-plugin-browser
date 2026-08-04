@@ -106,6 +106,13 @@ export class SettingsDialog {
                 <label>${this.i18n.interceptAllLinks}</label>
                 <input id="sb-intercept-all" type="checkbox" ${s.interceptAllLinks ? "checked" : ""} />
             </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.excludedSites}</label>
+                <textarea id="sb-excluded-sites" rows="4" style="width:100%;resize:vertical;font-family:monospace;" placeholder="weibo.com&#10;twitter.com&#10;# *.google.com">${escapeAttr(s.excludedSites)}</textarea>
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.excludedSitesDesc}
+            </div>
             <div class="b3-form__row sb-settings-actions">
                 <button class="b3-button" id="sb-save">${this.i18n.save}</button>
                 <button class="b3-button b3-button--cancel" id="sb-cancel">${this.i18n.cancel}</button>
@@ -142,6 +149,7 @@ export class SettingsDialog {
                 enablePreload: (root.querySelector("#sb-preload") as HTMLInputElement).checked,
                 excerptNotebook: (root.querySelector("#sb-excerpt-nb") as HTMLSelectElement).value,
                 interceptAllLinks: (root.querySelector("#sb-intercept-all") as HTMLInputElement).checked,
+                excludedSites: (root.querySelector("#sb-excluded-sites") as HTMLTextAreaElement).value,
             };
             await this.store.save(patch);
             showMessage(this.i18n.save + " ✓", 2000, "info");
