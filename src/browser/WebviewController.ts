@@ -141,8 +141,8 @@ export class WebviewController {
                 this.callbacks.onUrlChange(url);
                 return;
             }
-            // 去重：如果 2 秒内已通过任意机制（ipc/new-window）开过同一 URL 的新标签页，
-            // will-navigate 不再重复开，只阻止导航
+            // 去重：如果 2 秒内已通过 ipc/new-window 开过同一 URL 的新标签页，
+            // 说明 preload 已拦截并开新标签，这里阻止 webview 内重复导航
             if (
                 this.lastNewTabUrl === url &&
                 this.lastNewTabTime &&
@@ -152,28 +152,9 @@ export class WebviewController {
                 e.preventDefault?.();
                 return;
             }
-            const currentUrl = this.webview.getURL?.() || "";
-            // 当前页是 about:blank（标签页首次加载）时放行
-            if (!currentUrl || currentUrl === "about:blank" || currentUrl.startsWith("data:")) {
-                this.callbacks.onUrlChange(url);
-                return;
-            }
-            // 同源同路径仅 hash 变化的导航放行（页内锚点跳转）
-            try {
-                const cur = new URL(currentUrl);
-                const next = new URL(url);
-                if (cur.origin === next.origin && cur.pathname === next.pathname && cur.search === next.search && next.hash !== cur.hash) {
-                    this.callbacks.onUrlChange(url);
-                    return;
-                }
-            } catch {}
-            // 拦截外部/跨页导航 → 改为在思源新标签页打开
-            if (/^https?:\/\//i.test(url) && url !== currentUrl) {
-                console.log("[browser-plugin] will-navigate intercepted, opening new tab:", url);
-                e.preventDefault?.();
-                this.openNewTabDedup(url, "will-navigate");
-                return;
-            }
+            // 其余导航（window.location.href、表单提交、点击普通链接等）
+            // 全部放行，让 webview 在当前页导航（浏览器行为）。
+            // 新标签页的打开由 preload 的 openInNewTab（ipc-message）负责。
             this.callbacks.onUrlChange(url);
         });
         this.on("did-fail-load", (e) => {
@@ -389,7 +370,11 @@ export class WebviewController {
      * 兜底链接拦截器：通过 executeJavaScript 注入。
      * 即使 preload 未加载，也能拦截 link 点击 / window.open / form submit。
      *
-     * 实现方式：在页面中拦截 click 事件并阻止默认导航，把目标 URL 写入 window.__pendingNewTab。
+     * 行为与浏览器一致：
+     * - 普通左键点击：放行，让 webview 在当前页导航
+     * - Ctrl/Cmd/Shift+左键、中键、target=_blank、window.open：开新标签页
+     *
+     * 实现方式：在页面中拦截 click 事件，仅在新标签页意图时阻止默认导航并写入 window.__pendingNewTab。
      * 主进程通过轮询读取该变量并打开新页签。
      */
     private pendingNewTabCheckTimer: any = null;
@@ -404,7 +389,8 @@ export class WebviewController {
                 var isHttp = function(u){
                     try { return /^https?:\\/\\//i.test(new URL(u, location.href).href); } catch(e) { return false; }
                 };
-                // 拦截 link 点击
+                // link 点击：仅新标签页意图时拦截，普通左键放行让 webview 导航
+                // 注意：target=_top/_parent 在无框架 webview 中等同于 _self，不开新标签页
                 document.addEventListener('click', function(e){
                     if (e.button !== 0 && e.button !== 1) return;
                     var t = e.target;
@@ -412,12 +398,26 @@ export class WebviewController {
                     var link = t.closest('a');
                     if (!link || !link.href) return;
                     if (!isHttp(link.href)) return;
+                    var openNewTab = e.button === 1 || e.ctrlKey || e.metaKey || e.shiftKey ||
+                        link.target === '_blank';
+                    if (!openNewTab) return; // 普通左键放行
                     e.preventDefault();
                     e.stopPropagation();
                     try { window.__pendingNewTab = new URL(link.href, location.href).href; } catch(err) { window.__pendingNewTab = link.href; }
                     return false;
                 }, true);
-                // 拦截 window.open
+                // 中键 auxclick
+                document.addEventListener('auxclick', function(e){
+                    if (e.button !== 1) return;
+                    var t = e.target;
+                    if (!t || typeof t.closest !== 'function') return;
+                    var link = t.closest('a');
+                    if (!link || !link.href || !isHttp(link.href)) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try { window.__pendingNewTab = new URL(link.href, location.href).href; } catch(err) { window.__pendingNewTab = link.href; }
+                }, true);
+                // 拦截 window.open：总是开新标签页
                 var origOpen = window.open;
                 window.open = function(u, t, f){
                     if (u && isHttp(u)) {

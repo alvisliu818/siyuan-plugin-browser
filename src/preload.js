@@ -136,12 +136,13 @@
             });
         } catch {}
 
-        // === 2. 拦截所有链接点击 → 在思源新标签页打开 ===
-        // 包括：普通链接、target=_blank/_top/_parent、Ctrl/Cmd+点击、中键点击
+        // === 2. 链接点击拦截：行为与浏览器一致 ===
+        // - 普通左键：放行，让 webview 在当前页导航（替换当前页）
+        //   * target=_top / _parent 在无框架的 webview 中等同于 _self（当前页导航）
+        // - Ctrl/Cmd+左键、Shift+左键、中键、target=_blank：拦截并开新标签页
         document.addEventListener(
             "click",
             function (e) {
-                // 仅处理左键(0)和中键(1)
                 if (e.button !== 0 && e.button !== 1) return;
                 const target = e.target;
                 if (!target || typeof target.closest !== "function") return;
@@ -149,12 +150,39 @@
                 if (!link) return;
                 const href = link.href;
                 if (!href) return;
-                // 仅拦截 http(s) 链接，mailto:/tel:/# 等放行
                 if (!isHttpUrl(href)) return;
-                // 阻止 webview 内导航，改为在思源新标签页打开
+                // 判断是否需要开新标签页（浏览器行为）
+                // 注意：_top/_parent 在无框架 webview 中等同于 _self，不开新标签页
+                const openNewTab =
+                    e.button === 1 ||
+                    e.ctrlKey ||
+                    e.metaKey ||
+                    e.shiftKey ||
+                    link.target === "_blank";
+                if (!openNewTab) {
+                    // 普通左键：放行，webview 在当前页导航
+                    return;
+                }
+                // 需要开新标签页：拦截默认导航
                 e.preventDefault();
                 e.stopPropagation();
                 openInNewTab(href);
+            },
+            true
+        );
+
+        // 中键 auxclick（部分浏览器 click 不触发中键）
+        document.addEventListener(
+            "auxclick",
+            function (e) {
+                if (e.button !== 1) return;
+                const target = e.target;
+                if (!target || typeof target.closest !== "function") return;
+                const link = target.closest("a");
+                if (!link || !link.href || !isHttpUrl(link.href)) return;
+                e.preventDefault();
+                e.stopPropagation();
+                openInNewTab(link.href);
             },
             true
         );
