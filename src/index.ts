@@ -268,44 +268,49 @@ export default class BrowserPlugin extends Plugin {
      * 全局链接拦截器：当 interceptAllLinks=true 时，
      * 拦截思源内所有 http(s) 链接点击，用浏览器插件打开而非系统浏览器。
      *
+     * 点击行为与浏览器一致：
+     * - 普通左键：在当前激活的浏览器标签页中替换 URL（不开新标签）
+     * - Ctrl/Cmd+左键、中键、target=_blank、window.open(_blank)：开新标签页
+     * - 如当前激活页签不是浏览器标签页，则开新标签页
+     *
      * 思源中链接的两种形式：
      * 1. protyle 编辑器内的链接：<span data-type="a" data-href="http://...">text</span>
      *    点击时思源 JS 调用 window.open(url) → 触发 Electron setWindowOpenHandler → shell.openExternal
      * 2. HTML <a> 标签：<a href="http://..." target="_blank"> → 触发 setWindowOpenHandler
-     *
-     * 拦截策略：
-     * - monkey-patch window.open：拦截 JS 调用的 window.open(url)，最可靠
-     * - click capture + preventDefault：拦截 <a> 标签默认导航
-     * - 同时检查 <a> 和 span[data-type=a]，处理两种链接形式
      */
     private updateGlobalLinkInterceptor(): void {
         const enabled = this.settingsStore.get().interceptAllLinks;
         if (enabled && !this.globalLinkHandler) {
-            // 1. Monkey-patch window.open：拦截所有 JS window.open 调用
+            // 1. Monkey-patch window.open：按 target 参数决定开新标签还是替换当前页
             this.originalWindowOpen = window.open.bind(window);
             window.open = (url?: string, target?: string, features?: string): Window | null => {
                 if (url && /^https?:\/\//i.test(url)) {
-                    console.log("[browser-plugin] window.open intercept:", url);
-                    this.openUrl(url);
+                    const newTab = target === "_blank" || !this.getActiveBrowserTab();
+                    console.log("[browser-plugin] window.open intercept:", url, "newTab:", newTab);
+                    if (newTab) this.openUrl(url);
+                    else this.openUrlInCurrent(url);
                     return null;
                 }
                 return this.originalWindowOpen!(url, target, features);
             };
 
-            // 2. DOM click 拦截：处理 <a> 标签和 span[data-type=a]
+            // 2. DOM click 拦截：按修饰键和 target 判断开新标签还是替换当前页
             this.globalLinkHandler = (e: MouseEvent) => {
-                if (e.button !== 0) return; // 仅左键
+                // 中键（button=1）也处理，交给浏览器新标签逻辑
+                if (e.button !== 0 && e.button !== 1) return;
                 const target = e.target as HTMLElement;
                 if (!target || typeof target.closest !== "function") return;
-                // 跳过浏览器插件自身的 webview 内点击
+                // 跳过浏览器插件自身的 webview 内点击（webview 内有自己的 preload 拦截）
                 const webview = target.closest("webview");
                 if (webview) return;
 
                 // 检查 <a> 标签
                 let href = "";
+                let anchorTarget = "";
                 const anchor = target.closest("a") as HTMLAnchorElement | null;
                 if (anchor && anchor.href) {
                     href = anchor.href;
+                    anchorTarget = anchor.target || "";
                 } else {
                     // 检查思源 protyle 的 span 链接
                     const span = target.closest('span[data-type="a"]') as HTMLElement | null;
@@ -317,10 +322,23 @@ export default class BrowserPlugin extends Plugin {
                 if (!href || !/^https?:\/\//i.test(href)) return;
                 e.preventDefault();
                 e.stopImmediatePropagation();
-                console.log("[browser-plugin] click intercept:", href);
-                this.openUrl(href);
+
+                // 浏览器行为：修饰键/中键/target=_blank → 开新标签；否则替换当前页
+                const openNewTab =
+                    e.button === 1 ||
+                    e.ctrlKey ||
+                    e.metaKey ||
+                    e.shiftKey ||
+                    anchorTarget === "_blank" ||
+                    !this.getActiveBrowserTab();
+
+                console.log("[browser-plugin] click intercept:", href, "newTab:", openNewTab);
+                if (openNewTab) this.openUrl(href);
+                else this.openUrlInCurrent(href);
             };
             document.addEventListener("click", this.globalLinkHandler, true);
+            // 中键 auxclick 也拦截（部分浏览器 click 不触发中键）
+            document.addEventListener("auxclick", this.globalLinkHandler as any, true);
             console.log("[browser-plugin] global link interceptor enabled (window.open + click)");
         } else if (!enabled && this.globalLinkHandler) {
             // 恢复 window.open
@@ -329,8 +347,36 @@ export default class BrowserPlugin extends Plugin {
                 this.originalWindowOpen = null;
             }
             document.removeEventListener("click", this.globalLinkHandler, true);
+            document.removeEventListener("auxclick", this.globalLinkHandler as any, true);
             this.globalLinkHandler = null;
             console.log("[browser-plugin] global link interceptor disabled");
+        }
+    }
+
+    /**
+     * 获取当前激活的浏览器标签页实例。
+     * 若当前激活的思源页签不是浏览器页签，返回 null。
+     */
+    private getActiveBrowserTab(): BrowserTab | null {
+        try {
+            const active = getActiveTab() as any;
+            if (!active) return null;
+            // tabInstances 的 key 是页签 id
+            const tabId = active.id;
+            if (!tabId) return null;
+            return this.tabInstances.get(tabId) || null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** 在当前激活的浏览器标签页中加载 URL（替换当前页）；若无则开新标签页 */
+    openUrlInCurrent(url: string): void {
+        const tab = this.getActiveBrowserTab();
+        if (tab) {
+            tab.loadURL(url);
+        } else {
+            this.openUrl(url);
         }
     }
 

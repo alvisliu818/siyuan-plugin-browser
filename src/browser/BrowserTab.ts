@@ -125,6 +125,11 @@ export class BrowserTab {
         this.init(initialUrl);
     }
 
+    /** 在当前浏览器标签页中加载新 URL（替换当前页，浏览器行为） */
+    loadURL(url: string): void {
+        this.controller.loadURL(url);
+    }
+
     /**
      * 通过 session 的 webRequest API 移除响应头中的 CSP / X-Frame-Options，
      * 并为所有出站请求注入 Referer，避免 CDN 防盗链 403。
