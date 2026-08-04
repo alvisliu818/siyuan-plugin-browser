@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-browser",
   "author": "alvisliu818",
   "url": "https://github.com/alvisliu818/siyuan-plugin-browser",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "3.7.0",
   "backends": ["all"],
   "frontends": ["desktop", "desktop-window"],
