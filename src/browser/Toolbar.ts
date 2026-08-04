@@ -12,7 +12,8 @@ export type ToolbarAction =
     | "home"
     | "submit"
     | "toggleBookmark"
-    | "findInPage";
+    | "findInPage"
+    | "openExternal";
 
 /** 工具栏回调 */
 export interface ToolbarCallbacks {
@@ -66,6 +67,7 @@ export class Toolbar {
                 <input class="sy-browser-urlbar" type="text" placeholder="${this.i18n.addressBar}" spellcheck="false" />
                 <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">☆</button>
                 <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">🔍</button>
+                <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">↗</button>
             </div>
             <div class="sy-browser-findbar-wrap" style="display:none;">
                 <input class="sy-browser-findbar" type="text" placeholder="${this.i18n.findInPage}" spellcheck="false" />
@@ -115,6 +117,9 @@ export class Toolbar {
                     break;
                 case "stop":
                     this.cb.onAction("stop");
+                    break;
+                case "openExternal":
+                    this.cb.onAction("openExternal");
                     break;
             }
         });

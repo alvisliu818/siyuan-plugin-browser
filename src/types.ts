@@ -82,6 +82,8 @@ export interface BrowserSettings {
     excerptNotebook: string;
     /** 所有 http(s) 链接都用浏览器插件打开（拦截全局点击） */
     interceptAllLinks: boolean;
+    /** 排除网站列表（每行一个 hostname，匹配的 URL 在系统默认浏览器打开） */
+    excludedSites: string;
 }
 
 /** webview 元素的扩展类型（Electron webview tag） */

@@ -51,6 +51,40 @@ export function getDomain(url: string): string {
     }
 }
 
+/**
+ * 判断单个 hostname 是否匹配某个模式。
+ * - 模式以 `*.` 开头：仅匹配子域名（如 `*.weibo.com` 匹配 `www.weibo.com`，不匹配 `weibo.com`）
+ * - 否则：精确匹配 hostname，或匹配其任意子域名（如 `weibo.com` 匹配 `weibo.com`、`www.weibo.com`）
+ */
+function matchHost(hostname: string, pattern: string): boolean {
+    hostname = hostname.toLowerCase();
+    pattern = pattern.toLowerCase();
+    if (pattern.startsWith("*.")) {
+        const base = pattern.slice(2);
+        return !!base && hostname.endsWith("." + base);
+    }
+    return hostname === pattern || hostname.endsWith("." + pattern);
+}
+
+/**
+ * 检查 URL 是否匹配排除列表中的任一模式。
+ * patternsText 按行分隔，每行一个 hostname；空行和 `#` 开头的行视为注释。
+ * 匹配的 URL 应在系统默认浏览器打开，而非插件。
+ */
+export function isUrlExcluded(url: string, patternsText: string): boolean {
+    if (!patternsText) return false;
+    const hostname = getDomain(url);
+    if (!hostname) return false;
+    const patterns = patternsText
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#"));
+    for (const p of patterns) {
+        if (matchHost(hostname, p)) return true;
+    }
+    return false;
+}
+
 /** 规范化显示 URL（去掉协议前缀，地址栏更简洁时用） */
 export function prettyUrl(url: string): string {
     return url.replace(/^https?:\/\//, "");

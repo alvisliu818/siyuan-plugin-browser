@@ -18,7 +18,7 @@ import { HistoryDock } from "./docks/HistoryDock";
 import { DownloadsDock } from "./docks/DownloadsDock";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { registerShortcuts } from "./commands/shortcuts";
-import { getFilenameFromUrl } from "./utils/url";
+import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
 import "./index.scss";
 
@@ -233,7 +233,7 @@ export default class BrowserPlugin extends Plugin {
                 id: "open-in-browser-plugin",
                 iconHTML: '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>',
                 label: this.i18n.openInBrowser,
-                click: () => this.openUrl(url),
+                click: () => this.openUrl(url, { force: true }),
             });
         });
 
@@ -245,7 +245,7 @@ export default class BrowserPlugin extends Plugin {
                 id: "open-in-browser-plugin",
                 iconHTML: "",
                 label: this.i18n.openInBrowser,
-                click: () => this.openUrl(url),
+                click: () => this.openUrl(url, { force: true }),
             });
         });
 
@@ -285,6 +285,10 @@ export default class BrowserPlugin extends Plugin {
             this.originalWindowOpen = window.open.bind(window);
             window.open = (url?: string, target?: string, features?: string): Window | null => {
                 if (url && /^https?:\/\//i.test(url)) {
+                    // 排除网站：不拦截，回退到原始 window.open（触发思源系统浏览器打开）
+                    if (this.isUrlExcluded(url)) {
+                        return this.originalWindowOpen!(url, target, features);
+                    }
                     const newTab = target === "_blank" || !this.getActiveBrowserTab();
                     console.log("[browser-plugin] window.open intercept:", url, "newTab:", newTab);
                     if (newTab) this.openUrl(url);
@@ -320,6 +324,8 @@ export default class BrowserPlugin extends Plugin {
                 }
 
                 if (!href || !/^https?:\/\//i.test(href)) return;
+                // 排除网站：不拦截，放行让思源默认行为（系统浏览器）处理
+                if (this.isUrlExcluded(href)) return;
                 e.preventDefault();
                 e.stopImmediatePropagation();
 
@@ -371,12 +377,38 @@ export default class BrowserPlugin extends Plugin {
     }
 
     /** 在当前激活的浏览器标签页中加载 URL（替换当前页）；若无则开新标签页 */
-    openUrlInCurrent(url: string): void {
+    openUrlInCurrent(url: string, opts?: { force?: boolean }): void {
+        if (!opts?.force && this.isUrlExcluded(url)) {
+            this.openInSystemBrowser(url);
+            return;
+        }
         const tab = this.getActiveBrowserTab();
         if (tab) {
             tab.loadURL(url);
         } else {
-            this.openUrl(url);
+            this.openUrl(url, opts);
+        }
+    }
+
+    /** 判断 URL 是否在排除网站列表中（匹配则用系统默认浏览器打开） */
+    isUrlExcluded(url: string): boolean {
+        if (!url || !/^https?:\/\//i.test(url)) return false;
+        return isUrlExcluded(url, this.settingsStore.get().excludedSites);
+    }
+
+    /** 在系统默认浏览器中打开 URL */
+    openInSystemBrowser(url: string): void {
+        try {
+            const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
+            const shell = electron?.shell;
+            if (shell?.openExternal) {
+                shell.openExternal(url);
+            } else {
+                window.open(url, "_blank");
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] openInSystemBrowser failed:", e);
+            window.open(url, "_blank");
         }
     }
 
@@ -556,6 +588,26 @@ export default class BrowserPlugin extends Plugin {
             createActionElement: () => makeCheckbox("interceptAllLinks", s.interceptAllLinks),
         });
 
+        // 排除网站
+        setting.addItem({
+            title: this.i18n.excludedSites,
+            direction: "row",
+            description: this.i18n.excludedSitesDesc,
+            createActionElement: () => {
+                const ta = document.createElement("textarea");
+                ta.className = "b3-text-field";
+                ta.rows = 4;
+                ta.style.width = "100%";
+                ta.style.resize = "vertical";
+                ta.style.fontFamily = "monospace";
+                ta.style.minWidth = "240px";
+                ta.value = s.excludedSites;
+                ta.placeholder = "weibo.com\ntwitter.com\n# *.google.com";
+                refs.excludedSites = ta as unknown as HTMLInputElement;
+                return ta;
+            },
+        });
+
         this.setting = setting;
     }
 
@@ -631,8 +683,13 @@ export default class BrowserPlugin extends Plugin {
     }
 
     /** 打开 URL（在新的浏览器页签中） */
-    openUrl(url: string): void {
+    openUrl(url: string, opts?: { force?: boolean }): void {
         console.log("[browser-plugin] openUrl called with:", url);
+        // 排除网站：交由系统默认浏览器打开（显式 force 时跳过检查）
+        if (!opts?.force && this.isUrlExcluded(url)) {
+            this.openInSystemBrowser(url);
+            return;
+        }
         openTab({
             app: this.app,
             custom: {
