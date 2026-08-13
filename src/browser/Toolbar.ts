@@ -1,6 +1,22 @@
 import type { BrowserSettings, IWebviewTag } from "../types";
 import { normalizeUrl } from "../utils/url";
-import { el, clearChildren } from "../utils/dom";
+import { el, clearChildren, svgIcon } from "../utils/dom";
+
+/** Material Design 图标路径（单色，fill=currentColor 跟随主题） */
+const ICON = {
+    back: "M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z",
+    forward: "M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z",
+    reload: "M17.65 6.35A7.958 7.958 0 0012 4a8 8 0 108 8h-2a6 6 0 11-6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z",
+    stop: "M6 6h12v12H6z",
+    home: "M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z",
+    bookmark: "M22 9.24l-7.19-.62L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.63-7.03L22 9.24zM12 15.4l-3.76 2.27 1-4.28-3.32-2.88 4.38-.38L12 6.1l1.71 4.04 4.38.38-3.32 2.88 1 4.28L12 15.4z",
+    bookmarkActive: "M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z",
+    search: "M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z",
+    openExternal: "M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z",
+    down: "M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8 8-8z",
+    up: "M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z",
+    close: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
+} as const;
 
 /** 工具栏按钮动作 */
 export type ToolbarAction =
@@ -60,21 +76,21 @@ export class Toolbar {
         root.innerHTML = `
             <div class="sy-browser-loading-bar"></div>
             <div class="sy-browser-toolbar-row">
-                <button class="sy-browser-btn" data-act="back" title="${this.i18n.back}" disabled>←</button>
-                <button class="sy-browser-btn" data-act="forward" title="${this.i18n.forward}" disabled>→</button>
-                <button class="sy-browser-btn" data-act="reload" title="${this.i18n.reload}">⟳</button>
-                <button class="sy-browser-btn" data-act="home" title="${this.i18n.home}">⌂</button>
+                <button class="sy-browser-btn" data-act="back" title="${this.i18n.back}" disabled>${svgIcon(ICON.back)}</button>
+                <button class="sy-browser-btn" data-act="forward" title="${this.i18n.forward}" disabled>${svgIcon(ICON.forward)}</button>
+                <button class="sy-browser-btn" data-act="reload" title="${this.i18n.reload}">${svgIcon(ICON.reload)}</button>
+                <button class="sy-browser-btn" data-act="home" title="${this.i18n.home}">${svgIcon(ICON.home)}</button>
                 <input class="sy-browser-urlbar" type="text" placeholder="${this.i18n.addressBar}" spellcheck="false" />
-                <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">☆</button>
-                <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">🔍</button>
-                <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">↗</button>
+                <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">${svgIcon(ICON.bookmark)}</button>
+                <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">${svgIcon(ICON.search)}</button>
+                <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">${svgIcon(ICON.openExternal)}</button>
             </div>
             <div class="sy-browser-findbar-wrap" style="display:none;">
                 <input class="sy-browser-findbar" type="text" placeholder="${this.i18n.findInPage}" spellcheck="false" />
                 <span class="sy-browser-findbar-result"></span>
-                <button class="sy-browser-btn" data-act="findNext">↓</button>
-                <button class="sy-browser-btn" data-act="findPrev">↑</button>
-                <button class="sy-browser-btn" data-act="findClose">✕</button>
+                <button class="sy-browser-btn" data-act="findNext">${svgIcon(ICON.down)}</button>
+                <button class="sy-browser-btn" data-act="findPrev">${svgIcon(ICON.up)}</button>
+                <button class="sy-browser-btn" data-act="findClose">${svgIcon(ICON.close)}</button>
             </div>
         `;
         return root;
@@ -188,13 +204,13 @@ export class Toolbar {
     /** 设置加载状态 */
     setLoading(loading: boolean): void {
         this.loadingBar.style.opacity = loading ? "1" : "0";
-        this.reloadBtn.textContent = loading ? "✕" : "⟳";
+        this.reloadBtn.innerHTML = svgIcon(loading ? ICON.stop : ICON.reload);
         this.reloadBtn.dataset.act = loading ? "stop" : "reload";
     }
 
     /** 切换收藏按钮高亮状态 */
     setBookmarked(bookmarked: boolean): void {
-        this.bookmarkBtn.textContent = bookmarked ? "★" : "☆";
+        this.bookmarkBtn.innerHTML = svgIcon(bookmarked ? ICON.bookmarkActive : ICON.bookmark);
         this.bookmarkBtn.classList.toggle("is-active", bookmarked);
     }
 

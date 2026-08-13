@@ -41,6 +41,8 @@ export default class BrowserPlugin extends Plugin {
     private tabInstances: Map<string, BrowserTab> = new Map();
     /** Dock 实例引用（用于动态打开） */
     private dockInstances: Map<string, any> = new Map();
+    /** Dock 图标补丁的 MutationObserver（用于卸载时断开） */
+    private dockIconObservers: MutationObserver[] = [];
     /** preload.js 的 file:// URL（用于 webview preload 属性） */
     private preloadFileUrl: string = "";
     private preloadPathPromise: Promise<string> | null = null;
@@ -136,7 +138,7 @@ export default class BrowserPlugin extends Plugin {
             config: {
                 position: "LeftBottom",
                 size: { width: 240, height: 0 },
-                icon: "iconBookmark",
+                icon: "iconStar",
                 title: this.i18n.bookmarks,
                 hotkey: "⌥⌘B",
             },
@@ -622,7 +624,37 @@ export default class BrowserPlugin extends Plugin {
         this.setting.open(this.name);
     }
 
+    /** 修正已持久化布局的 Dock 图标
+     *  思源仅在首次初始化时采用 addDock 的 config.icon，之后一直复用已保存的旧配置
+     *  （pluginDockState 只同步 show/position/index/size），故需在 DOM 上覆盖为最新图标 */
+    private patchDockIcon(dockType: string, icon: string): void {
+        const type = `${this.name}${dockType}`;
+        const patch = (): void => {
+            const use = document.querySelector(`.dock__item[data-type="${type}"] svg use`);
+            if (use && use.getAttribute("xlink:href") !== `#${icon}`) {
+                use.setAttribute("xlink:href", `#${icon}`);
+            }
+        };
+        patch();
+        // Dock 项被重建（移动位置、重开面板等）时重新应用
+        const observer = new MutationObserver((mutations) => {
+            for (const m of mutations) {
+                for (const node of m.addedNodes) {
+                    if (node instanceof Element && node.classList.contains("dock__item")) {
+                        patch();
+                        return;
+                    }
+                }
+            }
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
+        this.dockIconObservers.push(observer);
+    }
+
     async onLayoutReady(): Promise<void> {
+        // 修正布局持久化导致的 Dock 图标不一致（书签 Dock 图标改为五角星）
+        this.patchDockIcon(DOCK_BOOKMARKS, "iconStar");
+
         // 加载持久化数据
         await Promise.all([
             this.bookmarksStore.load(),
@@ -680,6 +712,11 @@ export default class BrowserPlugin extends Plugin {
             tab.dispose();
         }
         this.tabInstances.clear();
+        // 断开 Dock 图标补丁监听
+        for (const observer of this.dockIconObservers) {
+            observer.disconnect();
+        }
+        this.dockIconObservers = [];
         delete (window as any).browserPlugin;
     }
 
