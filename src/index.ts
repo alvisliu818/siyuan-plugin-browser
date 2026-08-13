@@ -50,6 +50,10 @@ export default class BrowserPlugin extends Plugin {
     private originalWindowOpen: ((url?: string, target?: string, features?: string) => Window | null) | null = null;
 
     onload(): void {
+        // 全局引用，便于页签/Dock 的 init 回调中访问插件实例
+        // 必须在 addTab/addDock 之前设置：布局构建可能在任何时刻打开 Dock 并触发 init
+        (window as any).browserPlugin = this;
+
         // 初始化 stores
         this.bookmarksStore = new BookmarksStore(this);
         this.historyStore = new HistoryStore(this);
@@ -619,9 +623,6 @@ export default class BrowserPlugin extends Plugin {
     }
 
     async onLayoutReady(): Promise<void> {
-        // 全局引用，便于页签/Dock 的 init 回调中访问插件实例
-        (window as any).browserPlugin = this;
-
         // 加载持久化数据
         await Promise.all([
             this.bookmarksStore.load(),

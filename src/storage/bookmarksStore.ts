@@ -21,6 +21,8 @@ export class BookmarksStore {
         } catch {
             this.items = [];
         }
+        // 加载完成后通知：若 Dock 在数据就绪前已渲染出空列表，这里触发重渲染
+        this.notify();
     }
 
     /** 旧格式书签迁移为标签格式 */
