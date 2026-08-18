@@ -1,14 +1,11 @@
-import { Menu, showMessage } from "siyuan";
+import { showMessage } from "siyuan";
 import type { BrowserSettings, IWebviewTag } from "../types";
 import { Toolbar } from "./Toolbar";
 import { WebviewController } from "./WebviewController";
 import { el } from "../utils/dom";
-import { normalizeUrl } from "../utils/url";
 import type { HistoryStore } from "../storage/historyStore";
 import type { BookmarksStore } from "../storage/bookmarksStore";
 import type { SettingsStore } from "../storage/settingsStore";
-import { SettingsDialog } from "../settings/SettingsDialog";
-import { excerptToSiYuan } from "./excerpt";
 
 /** 浏览器页签实例依赖 */
 export interface BrowserTabDeps {
@@ -74,21 +71,8 @@ export class BrowserTab {
                     deps.onTabIconChange(favicon);
                 },
                 onOpenNewTab: (url) => deps.openUrlInNewTab(url),
-                onSaveAs: (url, name) => {
-                    deps.startDownload(url, name);
-                },
-                onToggleBookmark: () => this.toggleBookmark(),
-                onInspect: () => {
-                    try {
-                        this.webview.openDevTools?.();
-                    } catch {}
-                },
                 onFindResult: (active, total) => {
                     this.toolbar.setFindResult(active, total);
-                },
-                onExcerpt: () => {
-                    const nb = this.settings.excerptNotebook || "";
-                    excerptToSiYuan(this.webview, nb, this.deps.i18n);
                 },
             },
         });
@@ -306,9 +290,6 @@ export class BrowserTab {
             case "toggleBookmark":
                 await this.toggleBookmark();
                 break;
-            case "menu":
-                this.showMenu(payload?.x, payload?.y);
-                break;
             case "findInPage":
                 this.controller.findInPage(payload?.text ?? "", payload?.forward ?? true, true);
                 break;
@@ -351,76 +332,6 @@ export class BrowserTab {
     private updateBookmarkButton(url: string): void {
         const bookmarked = !!this.deps.bookmarks.find(url);
         this.toolbar.setBookmarked(bookmarked);
-    }
-
-    private showMenu(x?: number, y?: number): void {
-        try {
-            const menu = new Menu("sy-browser-menu");
-            if (!menu) {
-                console.warn("[browser-plugin] Menu constructor returned null");
-                return;
-            }
-            menu.addItem({
-                id: "settings",
-                iconHTML: "",
-                label: this.deps.i18n.settings,
-                click: () => {
-                    try {
-                        new SettingsDialog(this.deps.settings, this.deps.i18n).open();
-                    } catch (e) {
-                        console.error("[browser-plugin] open settings dialog failed:", e);
-                    }
-                },
-            });
-            menu.addItem({
-                id: "history",
-                iconHTML: "",
-                label: this.deps.i18n.history,
-                click: () => {
-                    document.dispatchEvent(new CustomEvent("sy-browser-open-dock", { detail: { type: "history" } }));
-                },
-            });
-            menu.addItem({
-                id: "bookmarks",
-                iconHTML: "",
-                label: this.deps.i18n.bookmarks,
-                click: () => {
-                    document.dispatchEvent(new CustomEvent("sy-browser-open-dock", { detail: { type: "bookmarks" } }));
-                },
-            });
-            menu.addItem({
-                id: "downloads",
-                iconHTML: "",
-                label: this.deps.i18n.downloads,
-                click: () => {
-                    document.dispatchEvent(new CustomEvent("sy-browser-open-dock", { detail: { type: "downloads" } }));
-                },
-            });
-            menu.addSeparator();
-            menu.addItem({
-                id: "inspect",
-                iconHTML: "",
-                label: this.deps.i18n.inspect,
-                click: () => {
-                    try {
-                        this.webview.openDevTools?.();
-                    } catch {}
-                },
-            });
-            // 优先使用传入的点击坐标，备选按钮位置
-            let px = x;
-            let py = y;
-            if (px == null || py == null) {
-                const btn = this.toolbar.element.querySelector('[data-act="menu"]') as HTMLElement;
-                const rect = btn.getBoundingClientRect();
-                px = rect.right;
-                py = rect.bottom;
-            }
-            console.log("[browser-plugin] showMenu at:", px, py);
-            menu.open({ x: px, y: py });
-        } catch (e) {
-            console.error("[browser-plugin] showMenu failed:", e);
-        }
     }
 
     /** 公共 API（供快捷键调用） */

@@ -137,12 +137,6 @@
     background-color: #fff;
 }
 
-/* 浏览器右键菜单不带图标：插件 Menu 的 id 参数会设置为 data-name 属性。
- * 兜底防御：若 Menu 渲染了空的 .b3-menu__icon 占位（18px + 左右 margin），将其隐藏 */
-.b3-menu[data-name="sy-browser-ctx-menu"] .b3-menu__icon {
-    display: none;
-}
-
 /* ===== Dock 通用样式 ===== */
 
 .sy-browser-dock {

@@ -32,7 +32,6 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     downloadTarget: "assets",
     userAgent: "",
     enablePreload: true,
-    excerptNotebook: "",
     interceptAllLinks: false,
     excludedSites: "github.com",
 };
