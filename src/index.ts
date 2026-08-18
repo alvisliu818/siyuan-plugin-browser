@@ -16,7 +16,6 @@ import type { IBrowserTabData, IWebviewTag, BrowserSettings } from "./types";
 import { BookmarksDock } from "./docks/BookmarksDock";
 import { HistoryDock } from "./docks/HistoryDock";
 import { DownloadsDock } from "./docks/DownloadsDock";
-import { SettingsDialog } from "./settings/SettingsDialog";
 import { registerShortcuts } from "./commands/shortcuts";
 import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
@@ -551,39 +550,6 @@ export default class BrowserPlugin extends Plugin {
             direction: "row",
             description: "拦截链接点击，在思源新标签页打开。如不需要可关闭。",
             createActionElement: () => makeCheckbox("enablePreload", s.enablePreload),
-        });
-
-        // 摘录保存笔记本
-        setting.addItem({
-            title: this.i18n.excerptNotebook,
-            direction: "row",
-            description: "摘录网页正文时保存到此笔记本。",
-            createActionElement: () => {
-                const sel = document.createElement("select");
-                sel.className = "b3-select";
-                const emptyOpt = document.createElement("option");
-                emptyOpt.value = "";
-                emptyOpt.textContent = "(" + this.i18n.excerptNotebook + ")";
-                if (!s.excerptNotebook) emptyOpt.selected = true;
-                sel.appendChild(emptyOpt);
-                refs.excerptNotebook = sel;
-                (async () => {
-                    try {
-                        const { listNotebooks } = await import("./browser/excerpt");
-                        const notebooks = await listNotebooks();
-                        for (const nb of notebooks) {
-                            const opt = document.createElement("option");
-                            opt.value = nb.id;
-                            opt.textContent = nb.name;
-                            if (nb.id === s.excerptNotebook) opt.selected = true;
-                            sel.appendChild(opt);
-                        }
-                    } catch (e) {
-                        console.warn("[browser-plugin] load notebooks failed:", e);
-                    }
-                })();
-                return sel;
-            },
         });
 
         // 所有链接用插件打开
