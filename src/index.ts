@@ -6,18 +6,16 @@ import {
     fetchSyncPost,
     Setting,
 } from "siyuan";
-import { TAB_TYPE, DOCK_BOOKMARKS, DOCK_HISTORY, DOCK_DOWNLOADS, DEFAULT_SETTINGS, SEARCH_ENGINES } from "./constants";
+import { TAB_TYPE, DOCK_BOOKMARKS, DOCK_HISTORY, DEFAULT_SETTINGS, SEARCH_ENGINES } from "./constants";
 import { BookmarksStore } from "./storage/bookmarksStore";
 import { HistoryStore } from "./storage/historyStore";
-import { DownloadsStore } from "./storage/downloadsStore";
 import { SettingsStore } from "./storage/settingsStore";
 import { BrowserTab } from "./browser/BrowserTab";
 import type { IBrowserTabData, IWebviewTag, BrowserSettings } from "./types";
 import { BookmarksDock } from "./docks/BookmarksDock";
 import { HistoryDock } from "./docks/HistoryDock";
-import { DownloadsDock } from "./docks/DownloadsDock";
 import { registerShortcuts } from "./commands/shortcuts";
-import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
+import { isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
 import "./index.scss";
 
@@ -28,13 +26,12 @@ import "./index.scss";
  * - 每个浏览器页签 = 一个 SiYuan 自定义页签（type=browser-tab），由思源原生页签系统管理
  * - 页签内嵌入 Electron <webview> 标签加载任意网站
  * - 顶栏按钮一键打开主页
- * - 三个 Dock：书签 / 历史 / 下载
- * - 内核插件通过 RPC 提供下载/抓取/HEAD 能力
+ * - 两个 Dock：书签 / 历史
+ * - 内核插件通过 RPC 提供抓取/HEAD 能力
  */
 export default class BrowserPlugin extends Plugin {
     bookmarksStore!: BookmarksStore;
     historyStore!: HistoryStore;
-    downloadsStore!: DownloadsStore;
     settingsStore!: SettingsStore;
     /** 浏览器页签实例表：tabId → BrowserTab */
     private tabInstances: Map<string, BrowserTab> = new Map();
@@ -58,7 +55,6 @@ export default class BrowserPlugin extends Plugin {
         // 初始化 stores
         this.bookmarksStore = new BookmarksStore(this);
         this.historyStore = new HistoryStore(this);
-        this.downloadsStore = new DownloadsStore(this);
         this.settingsStore = new SettingsStore(this);
 
         // 注册自定义页签类型
@@ -75,7 +71,6 @@ export default class BrowserPlugin extends Plugin {
                         history: plugin.historyStore,
                         bookmarks: plugin.bookmarksStore,
                         openUrlInNewTab: (url) => plugin.openUrl(url),
-                        startDownload: (url, name) => plugin.startDownload(url, name),
                         onTabTitleChange: (title) => {
                             try {
                                 const self: any = this;
@@ -188,46 +183,11 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
-        // 注册 Dock：下载
-        this.addDock({
-            config: {
-                position: "BottomRight",
-                size: { width: 0, height: 200 },
-                icon: "iconDownload",
-                title: this.i18n.downloads,
-                hotkey: "⌥⌘J",
-            },
-            data: {},
-            type: DOCK_DOWNLOADS,
-            init() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                const dock = new DownloadsDock(
-                    plugin.downloadsStore,
-                    plugin.i18n,
-                    (url) => plugin.openUrl(url),
-                    (url, name) => plugin.startDownload(url, name),
-                    (item) => plugin.openDownloadedFile(item)
-                );
-                dock.init();
-                plugin.dockInstances.set(DOCK_DOWNLOADS, dock);
-                this.element.appendChild(dock.element);
-            },
-            destroy() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                const dock = plugin.dockInstances.get(DOCK_DOWNLOADS);
-                if (dock) {
-                    dock.destroy();
-                    plugin.dockInstances.delete(DOCK_DOWNLOADS);
-                }
-            },
-        });
-
-        // 监听 Dock 打开事件（来自工具栏菜单和快捷键）
+        // 监听 Dock 打开事件（来自快捷键）
         document.addEventListener("sy-browser-open-dock", (e: Event) => {
             const detail = (e as CustomEvent).detail;
             if (detail?.type === "bookmarks") this.openDock(DOCK_BOOKMARKS);
             else if (detail?.type === "history") this.openDock(DOCK_HISTORY);
-            else if (detail?.type === "downloads") this.openDock(DOCK_DOWNLOADS);
         });
 
         // eventBus：在链接右键菜单加入"在浏览器插件中打开"
@@ -515,28 +475,6 @@ export default class BrowserPlugin extends Plugin {
             createActionElement: () => makeCheckbox("recordHistory", s.recordHistory),
         });
 
-        // 下载位置
-        setting.addItem({
-            title: this.i18n.downloadTarget,
-            direction: "row",
-            createActionElement: () => {
-                const sel = document.createElement("select");
-                sel.className = "b3-select";
-                const opt1 = document.createElement("option");
-                opt1.value = "assets";
-                opt1.textContent = this.i18n.downloadAssets;
-                if (s.downloadTarget === "assets") opt1.selected = true;
-                sel.appendChild(opt1);
-                const opt2 = document.createElement("option");
-                opt2.value = "storage";
-                opt2.textContent = this.i18n.downloadStorage;
-                if (s.downloadTarget === "storage") opt2.selected = true;
-                sel.appendChild(opt2);
-                refs.downloadTarget = sel;
-                return sel;
-            },
-        });
-
         // User-Agent
         setting.addItem({
             title: this.i18n.userAgent,
@@ -625,7 +563,6 @@ export default class BrowserPlugin extends Plugin {
         await Promise.all([
             this.bookmarksStore.load(),
             this.historyStore.load(),
-            this.downloadsStore.load(),
             this.settingsStore.load(),
         ]);
 
@@ -658,9 +595,6 @@ export default class BrowserPlugin extends Plugin {
                 this.openUrl(this.settingsStore.get().homepage);
             },
         });
-
-        // 监听内核 RPC 推送的下载进度
-        this.bindDownloadProgress();
     }
 
     onunload(): void {
@@ -797,98 +731,7 @@ export default class BrowserPlugin extends Plugin {
             // 兜底：直接显示 element
             const evt = new CustomEvent("sy-browser-toggle-dock", { detail: { type } });
             document.dispatchEvent(evt);
-            showMessage(this.i18n.bookmarks + " / " + this.i18n.history + " / " + this.i18n.downloads, 1500, "info");
-        }
-    }
-
-    /**
-     * 启动下载。通过内核 RPC 调用 forwardProxy 抓取二进制。
-     */
-    async startDownload(url: string, suggestedName?: string): Promise<void> {
-        const settings = this.settingsStore.get();
-        const filename = suggestedName || getFilenameFromUrl(url);
-        // 创建下载项
-        const item = await this.downloadsStore.create({ url, filename });
-
-        try {
-            // 检查内核插件是否可用
-            const kernel = (this as any).kernel;
-            if (!kernel?.rpc?.call?.download) {
-                // 兜底：用 webview 直接下载（仅前端，无法持久化大文件）
-                await this.fallbackDownload(url, filename);
-                await this.downloadsStore.setState(item.id, "completed");
-                return;
-            }
-
-            const result = await kernel.rpc.call.download(url, filename, settings.downloadTarget);
-            if (result?.ok) {
-                await this.downloadsStore.update(item.id, {
-                    savePath: result.data.savePath,
-                    received: result.data.size,
-                    total: result.data.size,
-                });
-                await this.downloadsStore.setState(item.id, "completed");
-                showMessage(this.i18n.downloadComplete + ": " + filename, 3000, "info");
-            } else {
-                await this.downloadsStore.setState(item.id, "interrupted", result?.error || "Unknown error");
-                showMessage(this.i18n.downloadFailed + ": " + (result?.error || ""), 5000, "error");
-            }
-        } catch (e: any) {
-            await this.downloadsStore.setState(item.id, "interrupted", String(e?.message || e));
-            showMessage(this.i18n.downloadFailed + ": " + (e?.message || e), 5000, "error");
-        }
-    }
-
-    /** 兜底下载：直接通过浏览器 a 标签触发（不存储到思源） */
-    private async fallbackDownload(url: string, filename: string): Promise<void> {
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        a.target = "_blank";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-    }
-
-    /** 打开已下载文件（在文件管理器/思源资源中显示） */
-    private async openDownloadedFile(item: { savePath: string; filename: string }): Promise<void> {
-        if (!item.savePath) {
-            showMessage("File path missing", 2000, "info");
-            return;
-        }
-        // 思源资源路径，通过 file:// 协议在新页签打开（或调用系统 shell）
-        try {
-            // 尝试在思源中通过 assets 路径打开
-            if (item.savePath.startsWith("assets/")) {
-                const a = document.createElement("a");
-                a.href = "/" + item.savePath;
-                a.target = "_blank";
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-            } else {
-                // 插件 storage 文件，无直接 URL，提示路径
-                showMessage("Saved to: " + item.savePath, 5000, "info");
-            }
-        } catch (e: any) {
-            showMessage("Open failed: " + (e?.message || e), 3000, "error");
-        }
-    }
-
-    /** 绑定内核插件推送的下载进度事件 */
-    private bindDownloadProgress(): void {
-        try {
-            const kernel = (this as any).kernel;
-            if (!kernel?.rpc?.bind) return;
-            kernel.rpc.bind("download-progress", (msg: any) => {
-                if (!msg?.id) return;
-                this.downloadsStore.update(msg.id, {
-                    received: msg.received,
-                    total: msg.total,
-                });
-            });
-        } catch (e) {
-            // 内核不可用时静默忽略
+            showMessage(this.i18n.bookmarks + " / " + this.i18n.history, 1500, "info");
         }
     }
 }

@@ -30,25 +30,6 @@ export interface HistoryEntry {
     visitTime: number;
 }
 
-/** 下载项状态 */
-export type DownloadState = "in_progress" | "completed" | "canceled" | "interrupted";
-
-/** 下载项 */
-export interface DownloadItem {
-    id: string;
-    url: string;
-    filename: string;
-    /** 保存路径（思源 assets 路径或插件 storage 相对路径） */
-    savePath: string;
-    total: number;
-    received: number;
-    state: DownloadState;
-    startedAt: number;
-    finishedAt?: number;
-    /** 错误信息 */
-    error?: string;
-}
-
 /** 默认搜索引擎 */
 export interface SearchEngine {
     id: string;
@@ -56,9 +37,6 @@ export interface SearchEngine {
     /** 搜索 URL 模板，使用 {q} 占位 */
     url: string;
 }
-
-/** 下载保存位置 */
-export type DownloadTarget = "assets" | "storage";
 
 /** 插件设置 */
 export interface BrowserSettings {
@@ -72,8 +50,6 @@ export interface BrowserSettings {
     historyLimit: number;
     /** 是否记录历史 */
     recordHistory: boolean;
-    /** 下载保存位置 */
-    downloadTarget: DownloadTarget;
     /** User-Agent 覆盖（空表示使用默认） */
     userAgent: string;
     /** 是否启用 webview preload 注入 */

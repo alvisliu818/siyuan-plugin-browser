@@ -14,8 +14,6 @@ export interface BrowserTabDeps {
     history: HistoryStore;
     bookmarks: BookmarksStore;
     openUrlInNewTab: (url: string) => void;
-    /** 触发下载（由 index.ts 注入，调用内核 RPC） */
-    startDownload: (url: string, suggestedName?: string) => Promise<void>;
     /** 通知页签标题更新（思源 tab 头部） */
     onTabTitleChange: (title: string) => void;
     /** 通知页签图标更新 */

@@ -101,32 +101,6 @@ export function isValidUrl(url: string): boolean {
     }
 }
 
-/** 从 URL 推断下载文件名 */
-export function getFilenameFromUrl(url: string): string {
-    try {
-        const u = new URL(url);
-        const pathname = u.pathname;
-        const last = pathname.split("/").filter(Boolean).pop();
-        if (last) return decodeURIComponent(last);
-        return u.hostname;
-    } catch {
-        return "download";
-    }
-}
-
-/** 格式化字节数 */
-export function formatBytes(bytes: number): string {
-    if (bytes < 0) return "0 B";
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let i = 0;
-    let v = bytes;
-    while (v >= 1024 && i < units.length - 1) {
-        v /= 1024;
-        i++;
-    }
-    return v.toFixed(i === 0 ? 0 : 1) + " " + units[i];
-}
-
 /** 格式化时间戳为可读字符串 */
 export function formatTime(ts: number): string {
     const d = new Date(ts);

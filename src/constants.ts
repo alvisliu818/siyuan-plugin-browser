@@ -4,13 +4,11 @@ import type { BrowserSettings, SearchEngine } from "./types";
 export const TAB_TYPE = "browser-tab";
 export const DOCK_BOOKMARKS = "browser-bookmarks";
 export const DOCK_HISTORY = "browser-history";
-export const DOCK_DOWNLOADS = "browser-downloads";
 
 /** Storage key */
 export const STORAGE_KEYS = {
     bookmarks: "bookmarks.json",
     history: "history.json",
-    downloads: "downloads.json",
     settings: "settings.json",
 } as const;
 
@@ -29,7 +27,6 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     customSearchUrl: "",
     historyLimit: 5000,
     recordHistory: true,
-    downloadTarget: "assets",
     userAgent: "",
     enablePreload: true,
     interceptAllLinks: false,
@@ -38,9 +35,6 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
 
 /** 历史上限硬上限 */
 export const HISTORY_HARD_LIMIT = 50000;
-
-/** 下载并发数 */
-export const MAX_CONCURRENT_DOWNLOADS = 3;
 
 /** Google s2 favicon 服务 */
 export const FAVICON_SERVICE = "https://www.google.com/s2/favicons?domain={domain}&sz=64";
