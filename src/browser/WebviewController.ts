@@ -1,9 +1,7 @@
-import type { BrowserSettings, HistoryEntry, IWebviewTag } from "../types";
+import type { BrowserSettings, IWebviewTag } from "../types";
 import type { HistoryStore } from "../storage/historyStore";
 import type { BookmarksStore } from "../storage/bookmarksStore";
 import { pickFavicon } from "../utils/favicon";
-import { showWebViewContextMenu } from "./contextMenu";
-import type { IContextMenuParams } from "../types";
 
 /**
  * Webview 事件路由与状态同步。
@@ -21,11 +19,7 @@ export class WebviewController {
         onLoadingChange: (loading: boolean) => void;
         onFaviconChange: (favicon: string) => void;
         onOpenNewTab: (url: string) => void;
-        onSaveAs: (url: string, suggestedName?: string) => void;
-        onToggleBookmark: () => void;
-        onInspect: () => void;
         onFindResult?: (activeMatch: number, matches: number) => void;
-        onExcerpt?: () => void;
     };
     private disposed = false;
     private listeners: Array<{ type: string; fn: (e: any) => void }> = [];
@@ -177,26 +171,8 @@ export class WebviewController {
             }
         });
         this.on("context-menu", (e) => {
-            const params: IContextMenuParams = {
-                x: e.params?.x ?? e.x,
-                y: e.params?.y ?? e.y,
-                linkURL: e.params?.linkURL ?? "",
-                srcURL: e.params?.srcURL ?? "",
-                pageURL: e.params?.pageURL ?? this.webview.getURL(),
-                selectionText: e.params?.selectionText ?? "",
-                mediaType: e.params?.mediaType ?? "none",
-                isEditable: e.params?.isEditable ?? false,
-            };
+            // 禁用网页默认右键菜单（原自定义右键菜单已移除，仅 preventDefault 抑制 Chromium 默认菜单）
             e.preventDefault?.();
-            showWebViewContextMenu(this.webview, params, this.i18n, {
-                openInNewTab: (url) => this.callbacks.onOpenNewTab(url),
-                saveAs: (url, name) => this.callbacks.onSaveAs(url, name),
-                copyImage: (src) => {
-                    // 图片复制用 webview 内 clipboard API
-                    this.webview.executeJavaScript(`fetch(${JSON.stringify(src)}).then(r=>r.blob()).then(b=>{const r=new FileReader();r.onload=()=>navigator.clipboard.write([new ClipboardItem({'image/png':b})]);r.readAsArrayBuffer(b);});`).catch(() => {});
-                },
-                excerpt: () => this.callbacks.onExcerpt?.(),
-            });
         });
     }
 
@@ -211,21 +187,6 @@ export class WebviewController {
     /** 加载 URL（编程导航，will-navigate 会放行） */
     async loadURL(url: string): Promise<void> {
         console.log("[browser-plugin] loadURL:", url);
-        if (url.startsWith("view-source:")) {
-            // view-source 协议：webview 不直接支持，改为抓取后用 srcdoc
-            const target = url.slice("view-source:".length);
-            try {
-                const resp = await fetch(target);
-                const text = await resp.text();
-                const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-                this.programmaticNav = true;
-                this.webview.src = "data:text/html;charset=utf-8," + encodeURIComponent(`<pre style="white-space:pre-wrap;word-wrap:break-word;font-family:monospace;">${escaped}</pre>`);
-            } catch {
-                this.programmaticNav = true;
-                this.webview.src = "data:text/html,<pre>Failed to load source</pre>";
-            }
-            return;
-        }
         if (url === "about:blank") {
             this.programmaticNav = true;
             this.webview.src = "about:blank";

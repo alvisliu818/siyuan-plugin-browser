@@ -315,34 +315,6 @@
     opacity: 0.6;
 }
 
-.sy-browser-dock-meta {
-    display: flex;
-    gap: 8px;
-    font-size: 10px;
-    color: var(--b3-theme-on-surface);
-    opacity: 0.7;
-}
-
-.sy-browser-dock-status {
-    color: var(--b3-theme-primary);
-}
-
-/* 下载进度条 */
-.sy-browser-dock-progress {
-    position: relative;
-    height: 4px;
-    background-color: var(--b3-border-color);
-    border-radius: 2px;
-    overflow: hidden;
-    margin-top: 2px;
-}
-
-.sy-browser-dock-progress-bar {
-    height: 100%;
-    background-color: var(--b3-theme-primary);
-    transition: width 0.2s;
-}
-
 /* 设置对话框 */
 .sb-settings .b3-form__row {
     display: flex;

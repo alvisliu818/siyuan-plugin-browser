@@ -13,8 +13,8 @@
     "zh-CN": "思源浏览器"
   },
   "description": {
-    "default": "A full-featured browser inside SiYuan, powered by Electron <webview>. Supports multi-tab, bookmarks, history, downloads.",
-    "zh-CN": "思源浏览器，基于 Electron <webview>，支持多页签、书签、历史、下载。"
+    "default": "A full-featured browser inside SiYuan, powered by Electron <webview>. Supports multi-tab, bookmarks, history.",
+    "zh-CN": "思源浏览器，基于 Electron <webview>，支持多页签、书签、历史。"
   },
   "readme": {
     "default": "README.md",

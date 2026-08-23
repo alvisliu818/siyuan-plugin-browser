@@ -86,11 +86,6 @@ export function registerShortcuts(plugin: Plugin, i18n: Record<string, string>):
             hotkey: "⌥⌘Y",
             fn: () => document.dispatchEvent(new CustomEvent("sy-browser-open-dock", { detail: { type: "history" } })),
         },
-        {
-            langKey: "downloads",
-            hotkey: "⌥⌘J",
-            fn: () => document.dispatchEvent(new CustomEvent("sy-browser-open-dock", { detail: { type: "downloads" } })),
-        },
     ];
 
     for (const c of commands) {
