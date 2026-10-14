@@ -1,4 +1,4 @@
-import type { BrowserSettings, SearchEngine } from "./types";
+import type { BrowserSettings, ProxyMode, SearchEngine } from "./types";
 
 /** Tab/Dock 类型常量 */
 export const TAB_TYPE = "browser-tab";
@@ -31,6 +31,8 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     recordHistory: true,
     downloadTarget: "assets",
     userAgent: "",
+    proxyMode: "system" as ProxyMode,
+    proxyCustomUrl: "",
     enablePreload: true,
     excerptNotebook: "",
     excerptParentPath: "/",

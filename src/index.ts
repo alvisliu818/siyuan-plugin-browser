@@ -13,7 +13,7 @@ import { HistoryStore } from "./storage/historyStore";
 import { DownloadsStore } from "./storage/downloadsStore";
 import { SettingsStore } from "./storage/settingsStore";
 import { BrowserTab } from "./browser/BrowserTab";
-import type { IBrowserTabData, IWebviewTag, BrowserSettings } from "./types";
+import type { IBrowserTabData, IWebviewTag, BrowserSettings, ProxyMode } from "./types";
 import { BookmarksDock } from "./docks/BookmarksDock";
 import { HistoryDock } from "./docks/HistoryDock";
 import { DownloadsDock } from "./docks/DownloadsDock";
@@ -24,6 +24,7 @@ import { buildEdgeStoreHelperScript, isEdgeAddonsSiteUrl } from "./extensions/ed
 import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
 import { buildAdBlockCss } from "./browser/adblock";
+import { applyProxyToSession } from "./browser/proxy";
 import BUILTIN_ADBLOCK_RULES from "./assets/adblock-rules.txt";
 import "./index.scss";
 
@@ -678,6 +679,39 @@ export default class BrowserPlugin extends Plugin {
             createActionElement: () => makeInput("userAgent", s.userAgent, { placeholder: "(default)" }),
         });
 
+        // 代理模式（跟随思源 / 系统代理 / 自定义）
+        setting.addItem({
+            title: this.i18n.proxyMode || "代理",
+            direction: "row",
+            description: this.i18n.proxyModeDesc || "浏览器页签使用的网络代理。「跟随思源代理」使用思源「设置 → 网络」中配置的代理（未配置时直连）；思源侧代理变更后需重新保存本设置生效。",
+            createActionElement: () => {
+                const sel = document.createElement("select");
+                sel.className = "b3-select";
+                const modes: Array<[ProxyMode, string]> = [
+                    ["siyuan", this.i18n.proxyModeSiyuan || "跟随思源代理"],
+                    ["system", this.i18n.proxyModeSystem || "系统代理"],
+                    ["custom", this.i18n.proxyModeCustom || "自定义代理"],
+                ];
+                for (const [value, label] of modes) {
+                    const opt = document.createElement("option");
+                    opt.value = value;
+                    opt.textContent = label;
+                    if ((s.proxyMode || "system") === value) opt.selected = true;
+                    sel.appendChild(opt);
+                }
+                refs.proxyMode = sel;
+                return sel;
+            },
+        });
+
+        // 自定义代理地址
+        setting.addItem({
+            title: this.i18n.proxyCustomUrl || "自定义代理地址",
+            direction: "row",
+            description: this.i18n.proxyCustomUrlDesc || "仅「自定义代理」模式使用。支持 http://host:port、https://、socks5://，或分号分隔的分流规则（如 http=host:port;https=host:port）。留空回退系统代理。",
+            createActionElement: () => makeInput("proxyCustomUrl", s.proxyCustomUrl || "", { placeholder: "http://127.0.0.1:7890 或 socks5://127.0.0.1:7891" }),
+        });
+
         // 启用 preload
         setting.addItem({
             title: this.i18n.enablePreload,
@@ -877,11 +911,16 @@ export default class BrowserPlugin extends Plugin {
         // （onload 中调用时设置尚未加载，interceptAllLinks 仍为默认值 false）
         this.updateGlobalLinkInterceptor();
 
+        // 应用代理设置到 webview 会话（persist:siyuan-browser 是独立 session，
+        // 不会继承思源默认 session 的代理，必须显式 setProxy）
+        void applyProxyToSession(s);
+
         // 监听设置变化
         this.settingsStore.onChange(() => {
             const ns = this.settingsStore.get();
             this.historyStore.setLimit(ns.historyLimit);
             this.historyStore.setEnabled(ns.recordHistory);
+            void applyProxyToSession(ns);
         });
 
         // 顶栏按钮（icon 支持 svg tag 字符串）

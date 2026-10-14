@@ -60,6 +60,9 @@ export interface SearchEngine {
 /** 下载保存位置 */
 export type DownloadTarget = "assets" | "storage";
 
+/** 代理模式：跟随思源代理 / 系统代理 / 自定义代理 */
+export type ProxyMode = "siyuan" | "system" | "custom";
+
 /** 插件设置 */
 export interface BrowserSettings {
     /** 主页 URL */
@@ -76,6 +79,10 @@ export interface BrowserSettings {
     downloadTarget: DownloadTarget;
     /** User-Agent 覆盖（空表示使用默认） */
     userAgent: string;
+    /** 代理模式（webview 独立 session，需显式 setProxy 才能吃到代理） */
+    proxyMode: ProxyMode;
+    /** 自定义代理地址（proxyMode === "custom" 时使用），如 http://127.0.0.1:7890、socks5://127.0.0.1:7891 */
+    proxyCustomUrl: string;
     /** 是否启用 webview preload 注入 */
     enablePreload: boolean;
     /** 摘录保存的笔记本 ID */

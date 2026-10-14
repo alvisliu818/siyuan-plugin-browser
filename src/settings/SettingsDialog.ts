@@ -1,6 +1,6 @@
 import { Dialog, showMessage } from "siyuan";
 import type { SettingsStore } from "../storage/settingsStore";
-import type { BrowserSettings, DownloadTarget } from "../types";
+import type { BrowserSettings, DownloadTarget, ProxyMode } from "../types";
 import { SEARCH_ENGINES } from "../constants";
 import { listNotebooks } from "../browser/excerpt";
 
@@ -96,6 +96,24 @@ export class SettingsDialog {
                 <input id="sb-useragent" type="text" value="${escapeAttr(s.userAgent)}" placeholder="(default)" />
             </div>
             <div class="b3-form__row">
+                <label>${this.i18n.proxyMode || "代理"}</label>
+                <select id="sb-proxy-mode">
+                    <option value="siyuan" ${(s.proxyMode || "system") === "siyuan" ? "selected" : ""}>${this.i18n.proxyModeSiyuan || "跟随思源代理"}</option>
+                    <option value="system" ${(s.proxyMode || "system") === "system" ? "selected" : ""}>${this.i18n.proxyModeSystem || "系统代理"}</option>
+                    <option value="custom" ${(s.proxyMode || "system") === "custom" ? "selected" : ""}>${this.i18n.proxyModeCustom || "自定义代理"}</option>
+                </select>
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.proxyModeDesc || "浏览器页签使用的网络代理。「跟随思源代理」使用思源「设置 → 网络」中配置的代理（未配置时直连）；思源侧代理变更后需重新保存本设置生效。"}
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.proxyCustomUrl || "自定义代理地址"}</label>
+                <input id="sb-proxy-url" type="text" value="${escapeAttr(s.proxyCustomUrl || "")}" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7891" />
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.proxyCustomUrlDesc || "仅「自定义代理」模式使用。支持 http://host:port、https://、socks5://，或分号分隔的分流规则（如 http=host:port;https=host:port）。留空回退系统代理。"}
+            </div>
+            <div class="b3-form__row">
                 <label>${this.i18n.enablePreload}</label>
                 <input id="sb-preload" type="checkbox" ${s.enablePreload ? "checked" : ""} />
             </div>
@@ -181,6 +199,8 @@ export class SettingsDialog {
                 recordHistory: (root.querySelector("#sb-record-history") as HTMLInputElement).checked,
                 downloadTarget: (root.querySelector("#sb-download-target") as HTMLSelectElement).value as DownloadTarget,
                 userAgent: (root.querySelector("#sb-useragent") as HTMLInputElement).value.trim(),
+                proxyMode: ((root.querySelector("#sb-proxy-mode") as HTMLSelectElement)?.value || "system") as ProxyMode,
+                proxyCustomUrl: (root.querySelector("#sb-proxy-url") as HTMLInputElement)?.value.trim() || "",
                 enablePreload: (root.querySelector("#sb-preload") as HTMLInputElement).checked,
                 excerptNotebook: (root.querySelector("#sb-excerpt-nb") as HTMLSelectElement).value,
                 excerptParentPath: (root.querySelector("#sb-excerpt-path") as HTMLInputElement).value.trim() || "/",
