@@ -158,14 +158,13 @@
             // 返回 stub 窗口而非 null，避免网页脚本访问 .location 等属性时崩溃
             return createFakeWindow(absUrl);
         };
-        // 防止页面通过 defineProperty 重新覆盖（非强制，保持兼容性）
-        try {
-            Object.defineProperty(window, "open", {
-                configurable: false,
-                writable: false,
-                value: window.open,
-            });
-        } catch {}
+        // 注意：这里**绝不能**把 window.open 锁成只读
+        // （Object.defineProperty(window, "open", {configurable:false, writable:false})）。
+        // 实测 SiYuan 伺服页面（/stage/build/desktop/）在启动链里会自己给 window.open 赋值，
+        // 锁定后该赋值抛 "Cannot assign to read only property 'open' of object '#<Window>'"，
+        // 异常落在 promise 里直接中断前端初始化 —— 表现为页面卡在思源 loading 图标、
+        // 控制台只有这一条异常、网络全部 200。
+        // 保持属性可写：页面想改就让它改，did-stop-loading 的兜底注入会再夺回拦截。
 
         // === 2. 链接点击拦截：行为与浏览器一致 ===
         // - 普通左键：放行，让 webview 在当前页导航（替换当前页）

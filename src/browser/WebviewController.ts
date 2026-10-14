@@ -594,7 +594,8 @@ export class WebviewController {
                     }
                     return null;
                 };
-                try { Object.defineProperty(window, 'open', { configurable: false, writable: false, value: window.open }); } catch(e) {}
+                // 不可锁成只读：页面（如 SiYuan 伺服）会在启动时给 window.open 赋值，
+                // 锁定会让赋值抛 TypeError 并中断其初始化（卡在 loading 图标）。
                 // 拦截 form submit 到 _blank
                 document.addEventListener('submit', function(e){
                     var form = e.target;

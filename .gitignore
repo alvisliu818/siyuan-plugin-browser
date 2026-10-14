@@ -12,6 +12,5 @@ dist/
 .workbuddy/
 .trae/
 
-# 调试探针（一次性诊断脚本，不入库）
-tools/_probe-*.mjs
-tools/_probe-*.js
+# 调试探针（一次性诊断脚本/截图，不入库）
+tools/_*
