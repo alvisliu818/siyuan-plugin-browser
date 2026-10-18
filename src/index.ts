@@ -57,7 +57,7 @@ export default class BrowserPlugin extends Plugin {
     /** 原始 window.open 引用（用于恢复） */
     private originalWindowOpen: typeof window.open | null = null;
 
-    onload(): void {
+    async onload(): Promise<void> {
         // 全局引用必须在 onload 最早建立：Dock/页签的 init() 在布局构建期执行，
         // 早于 onLayoutReady；若等到 onLayoutReady 才赋值，Dock init 时拿到 undefined
         // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
@@ -69,6 +69,11 @@ export default class BrowserPlugin extends Plugin {
         this.downloadsStore = new DownloadsStore(this);
         this.settingsStore = new SettingsStore(this);
         this.extensionHost = new ExtensionHost(this);
+
+        // 设置必须在 onload 内完成加载：顶栏图标与 Dock 的注册与否取决于
+        // showExtIcon/showXxxDock 开关，注册发生在 onload；onLayoutReady 才加载的话
+        // 注册时拿到的还是默认值，用户关掉的图标会先注册出来（思源会 await onload）。
+        await this.settingsStore.load();
 
         // 注册自定义页签类型
         this.addTab({
@@ -191,100 +196,12 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
-        // 注册 Dock：书签
-        // 图标用 iconStar（浏览器书签的星星样式）：iconBookmark 与思源原生书签面板图标重复
-        this.addDock({
-            config: {
-                position: "LeftBottom",
-                size: { width: 240, height: 0 },
-                icon: "iconStar",
-                title: this.i18n.bookmarks,
-                hotkey: "⌥⌘B",
-            },
-            data: {},
-            type: DOCK_BOOKMARKS,
-            init() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                if (!plugin?.bookmarksStore) return;
-                const dock = new BookmarksDock(plugin.bookmarksStore, plugin.i18n, (url) => plugin.openUrl(url));
-                dock.init();
-                plugin.dockInstances.set(DOCK_BOOKMARKS, dock);
-                this.element.appendChild(dock.element);
-            },
-            destroy() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                const dock = plugin.dockInstances.get(DOCK_BOOKMARKS);
-                if (dock) {
-                    dock.destroy();
-                    plugin.dockInstances.delete(DOCK_BOOKMARKS);
-                }
-            },
-        });
-
-        // 注册 Dock：历史
-        this.addDock({
-            config: {
-                position: "RightTop",
-                size: { width: 300, height: 0 },
-                icon: "iconHistory",
-                title: this.i18n.history,
-                hotkey: "⌥⌘Y",
-            },
-            data: {},
-            type: DOCK_HISTORY,
-            init() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                if (!plugin?.historyStore) return;
-                const dock = new HistoryDock(plugin.historyStore, plugin.i18n, (url) => plugin.openUrl(url));
-                dock.init();
-                plugin.dockInstances.set(DOCK_HISTORY, dock);
-                this.element.appendChild(dock.element);
-            },
-            destroy() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                const dock = plugin.dockInstances.get(DOCK_HISTORY);
-                if (dock) {
-                    dock.destroy();
-                    plugin.dockInstances.delete(DOCK_HISTORY);
-                }
-            },
-        });
-
-        // 注册 Dock：下载
-        this.addDock({
-            config: {
-                position: "BottomRight",
-                size: { width: 0, height: 200 },
-                icon: "iconDownload",
-                title: this.i18n.downloads,
-                hotkey: "⌥⌘J",
-            },
-            data: {},
-            type: DOCK_DOWNLOADS,
-            init() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                if (!plugin?.downloadsStore) return;
-                const dock = new DownloadsDock(
-                    plugin.downloadsStore,
-                    plugin.i18n,
-                    (url) => plugin.openUrl(url),
-                    (url, name) => plugin.startDownload(url, name),
-                    (item) => plugin.openDownloadedFile(item),
-                    (item) => plugin.showDownloadedInFolder(item)
-                );
-                dock.init();
-                plugin.dockInstances.set(DOCK_DOWNLOADS, dock);
-                this.element.appendChild(dock.element);
-            },
-            destroy() {
-                const plugin = (window as any).browserPlugin as BrowserPlugin;
-                const dock = plugin.dockInstances.get(DOCK_DOWNLOADS);
-                if (dock) {
-                    dock.destroy();
-                    plugin.dockInstances.delete(DOCK_DOWNLOADS);
-                }
-            },
-        });
+        // 注册 Dock：书签 / 历史 / 下载（无条件注册，显隐由 applyIconVisibility 的
+        // body class + CSS 控制——v3.8.7 removeDock 对 BottomRight 插件 Dock 有 NPE，
+        // 且 add/remove 会导致面板重建；CSS 方案下快捷键与页签菜单仍可打开面板）
+        this.registerBookmarksDock();
+        this.registerHistoryDock();
+        this.registerDownloadsDock();
 
         // 监听 Dock 打开事件（来自工具栏菜单和快捷键）
         document.addEventListener("sy-browser-open-dock", (e: Event) => {
@@ -350,7 +267,24 @@ export default class BrowserPlugin extends Plugin {
         // 扩展常驻入口：不依赖浏览器标签是否打开。
         // 点击列出有 popup 的扩展；在浏览器标签上时面板嵌进该标签内（tabs 语义正确），
         // 否则退化为新标签直接打开扩展设置页。
+        this.registerExtTopBar();
+
+        // 按设置显隐图标（body class + CSS，详见 applyIconVisibility 注释）
+        this.applyIconVisibility();
+
+        // 设置变化时同步图标显隐
+        this.settingsStore.onChange(() => {
+            this.applyIconVisibility();
+        });
+    }
+
+    /** 注册顶栏「Chrome 扩展」图标。带稳定 id：思源顶栏条目 key 由 legacy-index 变为
+     * plugin:...:ext-manager，原生「顶栏图标」对该图标的排序/显隐设置更稳定 */
+    private registerExtTopBar(): void {
+        // 带 id 后思源顶栏条目的 key 由 legacy-index 变为 plugin:...:ext-manager，
+        // 用户在思源「顶栏图标」里对该图标的原排序/显隐记忆会失效一次（重新排一次即可）
         this.addTopBar({
+            id: "ext-manager",
             icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5A2.5 2.5 0 0 0 10.5 1 2.5 2.5 0 0 0 8 3.5V5H4a2 2 0 0 0-2 2v3.8h1.5A2.7 2.7 0 0 1 6.2 13.5 2.7 2.7 0 0 1 3.5 16.2H2V20a2 2 0 0 0 2 2h3.8v-1.5A2.7 2.7 0 0 1 10.5 17.8a2.7 2.7 0 0 1 2.7 2.7V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-2.5-2.5z"/></svg>',
             title: this.i18n.extManager || "Chrome 扩展",
             position: "right",
@@ -358,6 +292,136 @@ export default class BrowserPlugin extends Plugin {
                 this.showExtensionTopMenu();
             },
         });
+    }
+
+    private registerBookmarksDock(): void {
+        // 图标用 iconStar（浏览器书签的星星样式）：iconBookmark 与思源原生书签面板图标重复
+        this.addDock({
+            config: {
+                position: "LeftBottom",
+                size: { width: 240, height: 0 },
+                icon: "iconStar",
+                title: this.i18n.bookmarks,
+                hotkey: "⌥⌘B",
+            },
+            data: {},
+            type: DOCK_BOOKMARKS,
+            init() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.bookmarksStore) return;
+                const dock = new BookmarksDock(plugin.bookmarksStore, plugin.i18n, (url) => plugin.openUrl(url));
+                dock.init();
+                plugin.dockInstances.set(DOCK_BOOKMARKS, dock);
+                this.element.appendChild(dock.element);
+            },
+            destroy() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                const dock = plugin.dockInstances.get(DOCK_BOOKMARKS);
+                if (dock) {
+                    dock.destroy();
+                    plugin.dockInstances.delete(DOCK_BOOKMARKS);
+                }
+            },
+        });
+    }
+
+    private registerHistoryDock(): void {
+        this.addDock({
+            config: {
+                position: "RightTop",
+                size: { width: 300, height: 0 },
+                icon: "iconHistory",
+                title: this.i18n.history,
+                hotkey: "⌥⌘Y",
+            },
+            data: {},
+            type: DOCK_HISTORY,
+            init() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.historyStore) return;
+                const dock = new HistoryDock(plugin.historyStore, plugin.i18n, (url) => plugin.openUrl(url));
+                dock.init();
+                plugin.dockInstances.set(DOCK_HISTORY, dock);
+                this.element.appendChild(dock.element);
+            },
+            destroy() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                const dock = plugin.dockInstances.get(DOCK_HISTORY);
+                if (dock) {
+                    dock.destroy();
+                    plugin.dockInstances.delete(DOCK_HISTORY);
+                }
+            },
+        });
+    }
+
+    private registerDownloadsDock(): void {
+        this.addDock({
+            config: {
+                position: "BottomRight",
+                size: { width: 0, height: 200 },
+                icon: "iconDownload",
+                title: this.i18n.downloads,
+                hotkey: "⌥⌘J",
+            },
+            data: {},
+            type: DOCK_DOWNLOADS,
+            init() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.downloadsStore) return;
+                const dock = new DownloadsDock(
+                    plugin.downloadsStore,
+                    plugin.i18n,
+                    (url) => plugin.openUrl(url),
+                    (url, name) => plugin.startDownload(url, name),
+                    (item) => plugin.openDownloadedFile(item),
+                    (item) => plugin.showDownloadedInFolder(item)
+                );
+                dock.init();
+                plugin.dockInstances.set(DOCK_DOWNLOADS, dock);
+                this.element.appendChild(dock.element);
+            },
+            destroy() {
+                const plugin = (window as any).browserPlugin as BrowserPlugin;
+                const dock = plugin.dockInstances.get(DOCK_DOWNLOADS);
+                if (dock) {
+                    dock.destroy();
+                    plugin.dockInstances.delete(DOCK_DOWNLOADS);
+                }
+            },
+        });
+    }
+
+    /**
+     * 按设置开关显隐顶栏「Chrome 扩展」图标与书签/历史/下载 Dock 图标。
+     * 由 onload 与 settingsStore.onChange 触发；「打开浏览器」图标不受这些开关控制。
+     *
+     * 实现为 body class + 注入 CSS 规则，而非 removeTopBar/removeDock：
+     * - v3.8.7 实测 removeDock 对 BottomRight 位置的插件 Dock 抛 NPE（Dock.remove 内
+     *   querySelector 得 null），且 add/remove 会引发 Dock 面板重建与布局重存；
+     * - 思源原生 applyDockEntryVisibility / applyTopBarEntryVisibility 会按其配置
+     *   反复切换 fn__none，直接改元素 class 会被覆盖；body class 的 display:none
+     *   与其正交，重算后依然生效；
+     * - 图标保持注册状态：快捷键、浏览器页签菜单仍可打开对应面板。
+     */
+    private applyIconVisibility(): void {
+        const s = this.settingsStore.get();
+        const body = document.body;
+        body.classList.toggle("sy-browser-hide-ext-icon", !s.showExtIcon);
+        body.classList.toggle("sy-browser-hide-bookmarks-dock", !s.showBookmarksDock);
+        body.classList.toggle("sy-browser-hide-history-dock", !s.showHistoryDock);
+        body.classList.toggle("sy-browser-hide-downloads-dock", !s.showDownloadsDock);
+        if (!document.getElementById("sy-browser-icon-visibility")) {
+            const style = document.createElement("style");
+            style.id = "sy-browser-icon-visibility";
+            style.textContent = [
+                `body.sy-browser-hide-ext-icon #toolbar [data-id="ext-manager"] { display: none !important; }`,
+                `body.sy-browser-hide-bookmarks-dock .dock__item[data-type="${this.name}${DOCK_BOOKMARKS}"] { display: none !important; }`,
+                `body.sy-browser-hide-history-dock .dock__item[data-type="${this.name}${DOCK_HISTORY}"] { display: none !important; }`,
+                `body.sy-browser-hide-downloads-dock .dock__item[data-type="${this.name}${DOCK_DOWNLOADS}"] { display: none !important; }`,
+            ].join("\n");
+            document.head.appendChild(style);
+        }
     }
 
     /** 内置广告过滤：dom-ready 时按当前 URL 命中的规则注入隐藏 CSS（动态插入的广告节点同样生效） */
@@ -902,6 +966,28 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
+        // 图标显示开关（顶栏 Chrome 扩展 / 书签 / 历史 / 下载）
+        setting.addItem({
+            title: this.i18n.showExtIcon || "显示顶栏「Chrome 扩展」图标",
+            direction: "row",
+            createActionElement: () => makeCheckbox("showExtIcon", s.showExtIcon),
+        });
+        setting.addItem({
+            title: this.i18n.showBookmarksDock || "显示「书签」面板图标",
+            direction: "row",
+            createActionElement: () => makeCheckbox("showBookmarksDock", s.showBookmarksDock),
+        });
+        setting.addItem({
+            title: this.i18n.showHistoryDock || "显示「历史」面板图标",
+            direction: "row",
+            createActionElement: () => makeCheckbox("showHistoryDock", s.showHistoryDock),
+        });
+        setting.addItem({
+            title: this.i18n.showDownloadsDock || "显示「下载」面板图标",
+            direction: "row",
+            createActionElement: () => makeCheckbox("showDownloadsDock", s.showDownloadsDock),
+        });
+
         this.setting = setting;
     }
 
@@ -916,12 +1002,11 @@ export default class BrowserPlugin extends Plugin {
         // 全局引用，便于页签/Dock 的 init 回调中访问插件实例
         (window as any).browserPlugin = this;
 
-        // 加载持久化数据
+        // 加载持久化数据（settingsStore 已在 onload 加载，供图标注册判定）
         await Promise.all([
             this.bookmarksStore.load(),
             this.historyStore.load(),
             this.downloadsStore.load(),
-            this.settingsStore.load(),
             this.extensionHost.load(),
         ]);
 
@@ -978,6 +1063,14 @@ export default class BrowserPlugin extends Plugin {
     }
 
     onunload(): void {
+        // 恢复图标显隐（移除注入样式与 body class）
+        document.body.classList.remove(
+            "sy-browser-hide-ext-icon",
+            "sy-browser-hide-bookmarks-dock",
+            "sy-browser-hide-history-dock",
+            "sy-browser-hide-downloads-dock"
+        );
+        document.getElementById("sy-browser-icon-visibility")?.remove();
         // 禁用全局链接拦截，恢复 window.open
         if (this.originalWindowOpen) {
             window.open = this.originalWindowOpen;

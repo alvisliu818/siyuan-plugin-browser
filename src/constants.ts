@@ -48,6 +48,10 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     excludedSites: "github.com",
     adBlockEnabled: true,
     adBlockRules: "",
+    showExtIcon: true,
+    showBookmarksDock: true,
+    showHistoryDock: true,
+    showDownloadsDock: true,
 };
 
 /** 历史上限硬上限 */

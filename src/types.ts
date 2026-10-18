@@ -113,6 +113,14 @@ export interface BrowserSettings {
     adBlockEnabled: boolean;
     /** 用户自定义广告隐藏规则（adblock ## 语法，每行一条） */
     adBlockRules: string;
+    /** 顶栏「Chrome 扩展」图标 */
+    showExtIcon: boolean;
+    /** 侧栏「书签」面板图标 */
+    showBookmarksDock: boolean;
+    /** 侧栏「历史」面板图标 */
+    showHistoryDock: boolean;
+    /** 底部「下载」面板图标 */
+    showDownloadsDock: boolean;
 }
 
 /** webview 元素的扩展类型（Electron webview tag） */
