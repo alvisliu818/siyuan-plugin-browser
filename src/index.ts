@@ -331,6 +331,33 @@ export default class BrowserPlugin extends Plugin {
         this.settingsStore.onChange(() => {
             this.updateGlobalLinkInterceptor();
         });
+
+        // 顶栏按钮（icon 支持 svg tag 字符串）。
+        // 必须在 onload 注册而非 onLayoutReady：开启「隐藏顶栏」（融合顶栏）时，
+        // 分屏页签栏融入顶栏，思源在布局恢复阶段按当时顶栏宽度计算页签切换图标
+        // 的避让边距；若图标在 onLayoutReady 才插入，布局期计算已结束且不再重算，
+        // 原生「页签切换」图标会与「Chrome 扩展」图标重叠（每次启动必现）。
+        // onload 注册可让布局期计算包含本插件图标（与虚拟文档树的扩展市场图标一致）。
+        this.addTopBar({
+            icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93C7.05 19.44 4 16.08 4 12c0-.61.08-1.21.21-1.78L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41C17.93 5.78 20 8.65 20 12c0 2.08-.81 3.98-2.1 5.39z"/></svg>',
+            title: this.i18n.openBrowser,
+            position: "right",
+            callback: () => {
+                this.openUrl(this.settingsStore.get().homepage);
+            },
+        });
+
+        // 扩展常驻入口：不依赖浏览器标签是否打开。
+        // 点击列出有 popup 的扩展；在浏览器标签上时面板嵌进该标签内（tabs 语义正确），
+        // 否则退化为新标签直接打开扩展设置页。
+        this.addTopBar({
+            icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5A2.5 2.5 0 0 0 10.5 1 2.5 2.5 0 0 0 8 3.5V5H4a2 2 0 0 0-2 2v3.8h1.5A2.7 2.7 0 0 1 6.2 13.5 2.7 2.7 0 0 1 3.5 16.2H2V20a2 2 0 0 0 2 2h3.8v-1.5A2.7 2.7 0 0 1 10.5 17.8a2.7 2.7 0 0 1 2.7 2.7V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-2.5-2.5z"/></svg>',
+            title: this.i18n.extManager || "Chrome 扩展",
+            position: "right",
+            callback: () => {
+                this.showExtensionTopMenu();
+            },
+        });
     }
 
     /** 内置广告过滤：dom-ready 时按当前 URL 命中的规则注入隐藏 CSS（动态插入的广告节点同样生效） */
@@ -923,30 +950,31 @@ export default class BrowserPlugin extends Plugin {
             void applyProxyToSession(ns);
         });
 
-        // 顶栏按钮（icon 支持 svg tag 字符串）
-        this.addTopBar({
-            icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93C7.05 19.44 4 16.08 4 12c0-.61.08-1.21.21-1.78L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41C17.93 5.78 20 8.65 20 12c0 2.08-.81 3.98-2.1 5.39z"/></svg>',
-            title: this.i18n.openBrowser,
-            position: "right",
-            callback: () => {
-                this.openUrl(this.settingsStore.get().homepage);
-            },
-        });
-
-        // 扩展常驻入口：不依赖浏览器标签是否打开。
-        // 点击列出有 popup 的扩展；在浏览器标签上时面板嵌进该标签内（tabs 语义正确），
-        // 否则退化为新标签直接打开扩展设置页。
-        this.addTopBar({
-            icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5A2.5 2.5 0 0 0 10.5 1 2.5 2.5 0 0 0 8 3.5V5H4a2 2 0 0 0-2 2v3.8h1.5A2.7 2.7 0 0 1 6.2 13.5 2.7 2.7 0 0 1 3.5 16.2H2V20a2 2 0 0 0 2 2h3.8v-1.5A2.7 2.7 0 0 1 10.5 17.8a2.7 2.7 0 0 1 2.7 2.7V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-2.5-2.5z"/></svg>',
-            title: this.i18n.extManager || "Chrome 扩展",
-            position: "right",
-            callback: () => {
-                this.showExtensionTopMenu();
-            },
-        });
+        // 注意：顶栏按钮已在 onload 注册，不能移到这里——
+        // onLayoutReady 时布局期的融合顶栏避让计算已结束且不再重算，
+        // 此刻插入的图标会与原生「页签切换」图标重叠（详见 onload 内注释）。
 
         // 监听内核 RPC 推送的下载进度
         this.bindDownloadProgress();
+
+        // 融合顶栏（开启「隐藏顶栏」时）避让补算：
+        // 思源在布局恢复期按“当时”的顶栏图标构成计算分屏页签栏「页签切换」图标的
+        // 避让边距，之后插入的图标不会触发重算（addTopBar 内部的 setTabPosition 因
+        // centerLayout 未就绪而提前返回），边距偏小 → 原生「页签切换」图标与插件
+        // 图标重叠，且偏差量随启动时序浮动。此处派发思源自己监听的顶栏变更事件，
+        // 让其用最终图标构成重算边距（实测 v3.8.7 有效）：500ms 一个 tick 派发，
+        // 共 20 次（centerLayout 就绪前派发无效，就绪后分屏头部也可能晚几拍挂载，
+        // 故就绪后继续派发兜底；重算是幂等操作，重复派发与非融合顶栏下均无副作用）。
+        const nudgeTopBar = (tries = 0) => {
+            if (tries >= 20) return;
+            window.setTimeout(() => {
+                if ((window as any).siyuan?.layout?.centerLayout) {
+                    window.dispatchEvent(new Event("siyuan-topbar-change"));
+                }
+                nudgeTopBar(tries + 1);
+            }, 500);
+        };
+        nudgeTopBar();
     }
 
     onunload(): void {
