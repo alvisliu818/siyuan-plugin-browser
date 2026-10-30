@@ -53,6 +53,23 @@ export class SettingsDialog {
             s.searchEngine === "custom"
                 ? `<div class="b3-form__row"><label>${this.i18n.custom}</label><input id="sb-custom-search" type="text" value="${escapeAttr(s.customSearchUrl)}" placeholder="https://example.com/search?q={q}"/></div>`
                 : "";
+        // 新标签页扩展下拉：列出声明了 chrome_url_overrides.newtab 的扩展
+        let newTabExtOptions = "";
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            for (const ext of host?.list?.() || []) {
+                if (!ext.newtabPath) continue;
+                newTabExtOptions += `<option value="${escapeAttr(ext.id)}" ${s.newTabExtId === ext.id ? "selected" : ""}>${escapeAttr(ext.name)}${ext.enabled ? "" : "（已停用）"}</option>`;
+            }
+        } catch {}
+        const newTabExtRow = newTabExtOptions
+            ? `<div class="b3-form__row"><label>${this.i18n.newTabExt || "新标签页扩展"}</label>
+               <select id="sb-newtab-ext">
+                   <option value="" ${!s.newTabExtId ? "selected" : ""}>${this.i18n.newTabExtNone || "（不使用，打开主页）"}</option>
+                   ${newTabExtOptions}
+               </select></div>
+               <div class="b3-form__row sb-settings-desc">${escapeAttr(this.i18n.newTabExtDesc || "把带「新标签页」的扩展设为新页签的默认页；不选则打开主页。")}</div>`
+            : "";
         // 异步加载笔记本列表
         const notebooks = await listNotebooks();
         const nbOptions = notebooks
@@ -125,6 +142,7 @@ export class SettingsDialog {
                     ${staleOption}
                 </select>
             </div>
+            ${newTabExtRow}
             <div class="b3-form__row">
                 <label>${this.i18n.excerptParentPath || "摘录保存路径"}</label>
                 <input id="sb-excerpt-path" type="text" value="${escapeAttr(s.excerptParentPath || "/")}" placeholder="/"/>
@@ -210,6 +228,7 @@ export class SettingsDialog {
                 excludedSites: (root.querySelector("#sb-excluded-sites") as HTMLTextAreaElement).value,
                 adBlockEnabled: (root.querySelector("#sb-adblock") as HTMLInputElement).checked,
                 adBlockRules: (root.querySelector("#sb-adblock-rules") as HTMLTextAreaElement).value,
+                newTabExtId: (root.querySelector("#sb-newtab-ext") as HTMLSelectElement)?.value || "",
             };
             await this.store.save(patch);
             showMessage(this.i18n.save + " ✓", 2000, "info");
@@ -226,6 +245,7 @@ export class SettingsDialog {
             this.dialog?.destroy();
             this.extensionOpener?.();
         });
+
     }
 }
 

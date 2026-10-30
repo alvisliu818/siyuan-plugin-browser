@@ -448,6 +448,19 @@
     border-color: var(--b3-border-color);
 }
 
+/* 设置对话框说明文字行（描述性小字，无控件） */
+.sb-settings .sb-settings-desc {
+    display: block;
+    font-size: 12px;
+    color: var(--b3-theme-on-surface-light);
+    line-height: 1.6;
+    padding: 0 12px;
+}
+
+.sy-ext-manager .b3-switch {
+    flex: 0 0 auto;
+}
+
 /* 暗色主题下 webview 默认背景（避免白闪） */
 body.body--dark .sy-browser-content webview {
     background-color: #1e1e1e;

@@ -52,6 +52,7 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     showBookmarksDock: true,
     showHistoryDock: true,
     showDownloadsDock: true,
+    newTabExtId: "",
 };
 
 /** 历史上限硬上限 */

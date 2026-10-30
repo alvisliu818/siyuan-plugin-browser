@@ -205,3 +205,44 @@ export async function downloadEdgeCrx(id: string, opts: IDownloadOptions = {}): 
     }
     return buffer;
 }
+
+/**
+ * 内核 RPC 通道的最小接口（gmFetch，见 kernel.ts）。
+ * 通过 any 引用避免前端 bundle 依赖内核类型。
+ */
+export interface IKernelGmFetch {
+    gmFetch(url: string, method: string, headersJson: string, data: string, encoding: string): Promise<any>;
+}
+
+/**
+ * 带内核兜底的 CRX 下载：渲染进程的 Node http/https 不走系统/插件代理，
+ * 直连微软商店被网络环境重置（ECONNRESET）时，改经内核 forwardProxy 下载
+ * （base64 回传；CDN 302 由内核 req 客户端自动跟随）。
+ */
+export async function downloadEdgeCrxWithFallback(
+    id: string,
+    kernelRpc: IKernelGmFetch | null | undefined,
+    opts: IDownloadOptions = {}
+): Promise<Buffer> {
+    try {
+        return await downloadEdgeCrx(id, opts);
+    } catch (directErr) {
+        if (!kernelRpc?.gmFetch) throw directErr;
+        const r = await kernelRpc.gmFetch(edgeCrxUrl(id), "GET", "{}", "", "base64");
+        if (!r?.ok) {
+            throw new Error(
+                `direct download failed (${String((directErr as Error)?.message || directErr)}), ` +
+                `kernel download failed: ${String(r?.error || "unknown")}`
+            );
+        }
+        const buf = Buffer.from(String(r.data?.body || ""), "base64");
+        if (buf.length < 8) {
+            throw new Error("kernel download returned an empty body");
+        }
+        const magic = buf.toString("latin1", 0, 4);
+        if (magic !== "Cr24" && magic !== "PK\x03\x04") {
+            throw new Error("kernel download is not a CRX/ZIP package (bad magic: " + JSON.stringify(magic) + ")");
+        }
+        return buf;
+    }
+}
