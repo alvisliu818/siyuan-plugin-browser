@@ -1,9 +1,10 @@
 import { Dialog, showMessage } from "siyuan";
 import type { IWebviewTag } from "../types";
 import { parseExtensionPackage } from "./crx";
-import { EDGE_ADDONS_HOME, downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
+import { EDGE_ADDONS_HOME, downloadEdgeCrxWithFallback, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
 import { disposeCsRuntime, ensureCsRuntime, initCsRuntime, seedExtensionKernelSettings } from "./cs-runtime";
 import { remoteSession } from "../utils/electron";
+import { UserscriptInjector } from "./userscriptInjector";
 
 /**
  * Chrome 扩展支持（模拟扩展宿主）。
@@ -53,9 +54,16 @@ export interface IInstalledExtension {
     actionTitle?: string;
     /** manifest.icons 里最大尺寸的图标相对路径（工具栏显示用） */
     iconPath?: string;
+    /** manifest.chrome_url_overrides.newtab（新标签页扩展：可设为新页签默认页） */
+    newtabPath?: string;
 }
 
 const EXTENSIONS_KEY = "extensions.json";
+
+/** 快速安装入口：Edge 加载项商店的常用扩展 id（油猴等） */
+const QUICK_INSTALL_EDGE: Array<{ id: string; label: string }> = [
+    { id: "iikmkjmpaadaobahmlepeloendndfphd", label: "油猴 (Tampermonkey)" },
+];
 
 /** 简易字符串哈希（扩展 id 生成用） */
 function strHash(s: string): string {
@@ -123,11 +131,28 @@ export class ExtensionHost {
     private loaded = false;
     /** 扩展文件内容缓存（key: path:file） */
     private fileCache: Map<string, string> = new Map();
+    /** chrome.userScripts 适配层（宿主侧：注册表副本 + 页面注入） */
+    usInjector = new UserscriptInjector();
 
     constructor(plugin: any) {
         this.plugin = plugin;
         // manager 与页面无关，构造即就绪（popup 可在 about:blank 等非 http 页上打开）
         this.initCsRuntimeOnce();
+        // 原生扩展信息的惰性供给（userScripts 注册表按扩展隔离、世界按需创建）
+        this.usInjector.setNativeIdProvider(() =>
+            this.extensions
+                .filter((e) => e.enabled && e.native && !!e.electronId)
+                .map((e) => ({
+                    electronId: e.electronId!,
+                    path: e.path,
+                    name: e.name,
+                    version: e.version,
+                    defaultLocale: e.defaultLocale,
+                    contentScripts: e.contentScripts,
+                    // 内容世界 tab 身份（真 Chrome sender.tab 语义，见 ICsExtInfo）
+                    senderTabId: 1,
+                }))
+        );
     }
 
     private readFileCached(extPath: string, rel: string): string {
@@ -179,7 +204,12 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v15 */";
+        // v18：tabs.query 过滤语义补全（TM popup 会话解析当前页签依赖）。
+        // 尾标记 sy-bg-shim-end 用于换版时从旧文件剥离旧垫片；无尾标记的旧文件
+        // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
+        // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
+        // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
+        const SHIM_VER = "v18";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -188,11 +218,13 @@ export class ExtensionHost {
                 if (!swPath) continue;
                 const abs = path.join(ext.path, swPath);
                 const src = fs.readFileSync(abs, "utf8");
-                if (src.startsWith(SHIM_MARK)) continue;
-                // 只在真的用到缺失 API 时才垫（省得污染没问题的扩展）
-                const needsShim = /chrome\.(contextMenus|commands|action|browserAction|notifications|cookies|downloads|webNavigation|alarms|omnibox)/.test(src);
+                // 只在真的用到缺失 API 时才垫（省得污染没问题的扩展）。
+                // 注意：商店扩展的 background 多为压缩代码，chrome 常被别名化
+                // （实测 TM：`C.contextMenus`，全文无 "chrome." 字样）—— 检测必须
+                // 用裸关键字，不能带 chrome. 前缀。
+                const needsShim = /contextMenus|userScripts|notifications|webNavigation|alarms|omnibox|declarativeNetRequest|cookies|browserAction|browser_action|chrome\.(commands|action|downloads)/.test(src);
                 if (!needsShim) continue;
-                const shim = SHIM_MARK + `
+                const shimBody = `
 ;(function () {
     try {
         if (typeof chrome === "undefined") return;
@@ -202,6 +234,23 @@ export class ExtensionHost {
         //    （此前数组在 onMessage 包装内创建，若包装条件不满足则数组缺失，
         //    宿主会误报 "垫片未运行" 且无重试依据。）
         self.__syOnMessageHandlers = self.__syOnMessageHandlers || [];
+        // 0b) 消息归一（垫片统一兼容点）：SW 侧部分扩展 handler 对可选字段无
+        //     保护（实测 TM loadTree：referrer 缺失 → pd.level(undefined) 抛
+        //     "Cannot read properties of undefined (reading 'replace')" →
+        //     options 页引导走 fail → 原生 confirm 同步阻塞 JS 线程，页面假死
+        //     并弹 "An internal error occurred"）。宿主的三条消息路由
+        //     （CS→SW sendMessage / port 派发 / storage onChanged 回程）都经
+        //     此归一，兼容逻辑只住这一处。
+        self.__syNormalizeMsg = function (msg) {
+            try {
+                if (msg && typeof msg === "object") {
+                    if (msg.method === "loadTree" && msg.referrer === undefined) {
+                        msg = Object.assign({}, msg, { referrer: (typeof msg.origin === "string" && msg.origin) || "options" });
+                    }
+                }
+            } catch (e) {}
+            return msg;
+        };
         // 1) 通用存在性垫片：background 里引用到的缺失命名空间统一补空壳，
         //    否则任何一处 undefined 访问都会让 SW 整个崩掉（实测 SiYuan Clip
         //    第一行 contextMenus、中段 commands 各崩一次）。
@@ -350,10 +399,12 @@ export class ExtensionHost {
                             var anySync = false;
                             omFns.forEach(function (fn) {
                                 try {
-                                    var r = fn(env.msg, env.sender || { id: "sy-host" }, sendResponse);
+                                    var r = fn(self.__syNormalizeMsg ? self.__syNormalizeMsg(env.msg) : env.msg, env.sender || { id: "sy-host" }, sendResponse);
                                     if (r === true) {
                                         // handler 返回 true 表示异步 sendResponse，等待其回调
-                                    } else if (r !== undefined) {
+                                    } else if (r !== undefined && r !== false) {
+                                        // r===false 是 Chrome 语义的"我不回包"，不作为回包值
+                                        //（与 cs-runtime routeSendMessage 的同语义修正一致）
                                         anySync = true;
                                         sendResponse(r);
                                     }
@@ -384,6 +435,69 @@ export class ExtensionHost {
                 self.__syOnConnectFns = ocFns;
                 self.__syPorts = self.__syPorts || {};
                 self.__syPortOutbox = self.__syPortOutbox || {};
+            }
+        } catch (e) {}
+        // 5-pre) tabs.query 过滤语义补全（独立节：不受 5 的 __syTabWrapped 守卫
+        //    影响，旧垫片文件换版堆叠时也能生效）。Electron 原生 query 不认
+        //    active/lastFocusedWindow 过滤（实测 {active,lastFocusedWindow} 恒 []），
+        //    TM 的 popup 会话靠它解析"面板所属活动页签"——查空则 loadTree 无
+        //    tab 上下文（面板显示 no access、脚本状态全丢）。宿主经 tabevent 喂
+        //    的 tab 存 __syLastFedTab，作为活动页签并入结果，再做简化过滤。
+        try {
+            if (chrome.tabs && !chrome.tabs.__syQueryPatched) {
+                self.__syLastFedTab = self.__syLastFedTab || null;
+                var origTabsQuery = typeof chrome.tabs.query === "function" ? chrome.tabs.query.bind(chrome.tabs) : null;
+                var syUrlMatch = function (pattern, url) {
+                    try {
+                        var m = /^(\\*|https?|file|ftp|urn):\\/\\/(\\*(?:\\.[^\\/ *]+)?|\\*|[^\\/ *]+)(\\/.*)$/.exec(pattern);
+                        if (!m) return false;
+                        if (!/^https?:\\/\\//i.test(url || "")) return false;
+                        var u = new URL(url);
+                        var scheme = u.protocol.replace(":", "");
+                        if (m[1] !== "*" && m[1] !== scheme) return false;
+                        var host = u.host, hostOk = m[2] === "*" || (m[2].indexOf("*.") === 0 ? host === m[2].slice(2) || host.indexOf("." + m[2].slice(2), host.length - ("." + m[2].slice(2)).length) >= 0 : host === m[2] || host === m[2].split(":")[0]);
+                        if (!hostOk) return false;
+                        var rx = new RegExp("^" + m[3].replace(/[.+?^{}()|[\]\\\\$]/g, "\\\\$&").replace(/\\*/g, ".*") + "$");
+                        return rx.test((u.pathname || "/") + (u.search || ""));
+                    } catch (e) { return false; }
+                };
+                chrome.tabs.query = function (props, cb) {
+                    // deferred 模式：原生可能是回调式（返回 undefined）也可能是 promise
+                    // 式 —— 两种都接住，promise 式调用方（await chrome.tabs.query）拿
+                    // 到的恒是数组。done 守卫防回调+promise 双触发。
+                    var done = false, resolveP = null;
+                    var finish = function (nativeList) {
+                        if (done) return;
+                        done = true;
+                        var list = (nativeList && nativeList.slice && nativeList.slice()) || [];
+                        var fed = self.__syLastFedTab;
+                        if (fed && !list.some(function (t) { return String(t.id) === String(fed.id); })) list = list.concat([fed]);
+                        var p = props || {};
+                        if (p.active || p.highlighted) list = list.filter(function (t) { return t.active; });
+                        if (p.windowId !== undefined && p.windowId !== -1 && p.windowId !== 1) list = list.filter(function (t) { return t.windowId === p.windowId; });
+                        if (p.url) {
+                            var pats = Array.isArray(p.url) ? p.url : [p.url];
+                            list = list.filter(function (t) { return pats.some(function (pt) { return syUrlMatch(pt, t.url || ""); }); });
+                        }
+                        if (typeof cb === "function") { try { cb(list); } catch (e) {} }
+                        if (resolveP) resolveP(list);
+                        return list;
+                    };
+                    var pending = new Promise(function (res) { resolveP = res; });
+                    if (origTabsQuery) {
+                        try {
+                            var qr = origTabsQuery(props || {}, function (v) { finish(v); });
+                            if (qr && typeof qr.then === "function") {
+                                return qr.then(function (v) { return finish(v); }, function () { return finish([]); });
+                            }
+                            // 原生纯回调式：回调已挂上，原生按契约必回调 → pending 必 resolve
+                            return pending;
+                        } catch (e) { /* 原生抛错走兜底 */ }
+                    }
+                    finish([]);
+                    return pending;
+                };
+                chrome.tabs.__syQueryPatched = true;
             }
         } catch (e) {}
         // 5) chrome.tabs 事件收集（AdGuard 等靠 onCreated/onUpdated 维护 tabContext，
@@ -484,10 +598,159 @@ export class ExtensionHost {
                 catch (e2) { chrome.storage.sync = syncArea; }
             }
         } catch (e) {}
+        // 6) chrome.userScripts 适配（Tampermonkey 等 MV3 用户脚本扩展）：
+        //    Electron 原生缺 userScripts API（probe 实测），TM 5.x 探测不到即
+        //    降级为"无法运行脚本"。按 Chrome 契约补一层：注册表存内存 +
+        //    chrome.storage.local 持久化（SW 重启后 getScripts 仍可答），并用
+        //    自增版本号标记变更 —— 宿主（userscriptInjector.ts）比对版本号，
+        //    变了就全量对账注册表，把脚本代码注入页面自建世界执行；GM API 由
+        //    扩展自身 bootstrap 经 chrome.runtime.sendMessage（v15 路由）与 SW
+        //    通信。注意 TM 幂等：GA() 每次启动 getScripts 后可能不再重复
+        //    register —— 全量对账 + 持久化 + 启动水合是唯一可靠的宿主同步通道。
+        try {
+            if (!chrome.userScripts) {
+                var US_KEY = "__syUserScriptsReg";
+                var US_VER_KEY = "__syUserScriptsRegVersion";
+                var usLoad = function () {
+                    return new Promise(function (resolve) {
+                        try {
+                            chrome.storage.local.get([US_KEY, US_VER_KEY], function (v) {
+                                resolve({ reg: (v && v[US_KEY]) || {}, ver: (v && v[US_VER_KEY]) || 0 });
+                            });
+                        } catch (e2) { resolve({ reg: {}, ver: 0 }); }
+                    });
+                };
+                var usSave = function (reg, ver) {
+                    try {
+                        var item = {};
+                        item[US_KEY] = reg;
+                        item[US_VER_KEY] = ver;
+                        chrome.storage.local.set(item);
+                    } catch (e2) {}
+                };
+                var usClone = function (x) { try { return JSON.parse(JSON.stringify(x)); } catch (e2) { return x; } };
+                var usCommit = function (reg, ver) {
+                    self.__syUserScriptsReg = reg;
+                    self.__syUserScriptsVersion = ver;
+                    usSave(reg, ver);
+                };
+                // SW 启动即异步水合内存注册表与版本号（宿主 drain 直接读内存，
+                // 不依赖扩展先调用过一次 API；TM 幂等跳过 register 时也拿得到）
+                self.__syUserScriptsReg = self.__syUserScriptsReg || {};
+                self.__syUserScriptsVersion = self.__syUserScriptsVersion || 0;
+                usLoad().then(function (loaded) {
+                    self.__syUserScriptsReg = loaded.reg;
+                    self.__syUserScriptsVersion = loaded.ver;
+                });
+                chrome.userScripts = {
+                    ExecutionWorld: { MAIN: "MAIN", USER_SCRIPT: "USER_SCRIPT" },
+                    register: function (scripts, cb) {
+                        return usLoad().then(function (loaded) {
+                            var reg = loaded.reg;
+                            scripts = Array.isArray(scripts) ? scripts : [scripts];
+                            for (var i = 0; i < scripts.length; i++) {
+                                var s = scripts[i];
+                                if (!s || !s.id) continue;
+                                reg[s.id] = usClone(s);
+                            }
+                            usCommit(reg, loaded.ver + 1);
+                            if (typeof cb === "function") { try { cb(); } catch (e3) {} }
+                        });
+                    },
+                    getScripts: function (filter, cb) {
+                        var cb2 = typeof filter === "function" ? filter : cb;
+                        return usLoad().then(function (loaded) {
+                            var reg = loaded.reg;
+                            var ids = (filter && typeof filter === "object" && filter.ids) || null;
+                            var list = [];
+                            for (var k in reg) { if (!ids || ids.indexOf(k) >= 0) list.push(reg[k]); }
+                            if (typeof cb2 === "function") { try { cb2(list); } catch (e3) {} }
+                            return list;
+                        });
+                    },
+                    unregister: function (filter, cb) {
+                        return usLoad().then(function (loaded) {
+                            var reg = loaded.reg;
+                            var ids = (filter && filter.ids) || null;
+                            for (var k in reg) { if (!ids || ids.indexOf(k) >= 0) delete reg[k]; }
+                            usCommit(reg, loaded.ver + 1);
+                            if (typeof cb === "function") { try { cb(); } catch (e3) {} }
+                        });
+                    },
+                    update: function (ids, props, cb) {
+                        return usLoad().then(function (loaded) {
+                            var reg = loaded.reg;
+                            ids = Array.isArray(ids) ? ids : [ids];
+                            props = Array.isArray(props) ? props : ids.map(function () { return props; });
+                            for (var i = 0; i < ids.length; i++) {
+                                if (reg[ids[i]] && props[i]) {
+                                    var merged = usClone(reg[ids[i]]);
+                                    for (var k2 in props[i]) merged[k2] = props[i][k2];
+                                    reg[ids[i]] = merged;
+                                }
+                            }
+                            usCommit(reg, loaded.ver + 1);
+                            if (typeof cb === "function") { try { cb(); } catch (e3) {} }
+                        });
+                    },
+                    reset: function (cb) {
+                        return usLoad().then(function (loaded) {
+                            usCommit({}, loaded.ver + 1);
+                            if (typeof cb === "function") { try { cb(); } catch (e3) {} }
+                        });
+                    },
+                    configureWorld: function (props, cb) {
+                        // messaging/csp：自建世界恒有消息桥，无需配置
+                        if (typeof cb === "function") { try { cb(); } catch (e3) {} }
+                        return Promise.resolve();
+                    },
+                };
+            }
+        } catch (e) {}
+        // 7) notifications / downloads 最小动作桩（v15 只补了事件壳，TM 的
+        //    GM_notification / GM_download 走这两个 API，缺 create/download 直接抛）
+        try {
+            if (chrome.notifications && !chrome.notifications.create) {
+                chrome.notifications.create = function (id, opts, cb) {
+                    if (typeof id === "object") { opts = id; id = "n" + Date.now(); }
+                    console.log("[sy-shim] notifications.create:", (opts && opts.title) || id);
+                    if (typeof cb === "function") { try { cb(id); } catch (e3) {} }
+                    return id;
+                };
+                chrome.notifications.clear = function (id, cb) { if (typeof cb === "function") { try { cb(true); } catch (e3) {} } return Promise.resolve(true); };
+                chrome.notifications.update = function (id, opts, cb) { if (typeof cb === "function") { try { cb(true); } catch (e3) {} } return Promise.resolve(true); };
+            }
+            if (chrome.downloads && !chrome.downloads.download) {
+                chrome.downloads.download = function (opts, cb) {
+                    console.warn("[sy-shim] chrome.downloads.download 未实现（改用页内下载）:", opts && opts.url);
+                    if (typeof cb === "function") { try { cb(undefined); } catch (e3) {} }
+                    return Promise.resolve(undefined);
+                };
+            }
+        } catch (e) {}
     } catch (e) {}
 })();
+/* sy-bg-shim-end */
 `;
-                fs.writeFileSync(abs, shim + src, "utf8");
+                // 内容哈希进标记：同版本号但内容变化（开发迭代）也能触发重注入
+                let shimHash = 0x811c9dc5;
+                for (let i = 0; i < shimBody.length; i++) {
+                    shimHash ^= shimBody.charCodeAt(i);
+                    shimHash = Math.imul(shimHash, 0x01000193);
+                }
+                const SHIM_MARK = "/* sy-bg-shim:" + SHIM_VER + ":" + (shimHash >>> 0).toString(36) + " */";
+                if (src.startsWith(SHIM_MARK)) continue;
+                const shim = SHIM_MARK + shimBody;
+                // 换版剥离：文件里带旧版垫片且含尾标记 → 截掉垫片段，只保留原源码再前置新垫片
+                //（lastIndexOf：多层堆叠时以最新一代的尾标记为准）
+                let original = src;
+                if (/^\/\* sy-bg-shim:v\d+[^*]*\*\//.test(original)) {
+                    const endMark = "/* sy-bg-shim-end */";
+                    const ei = original.lastIndexOf(endMark);
+                    if (ei >= 0) original = original.slice(ei + endMark.length).replace(/^\s*\n/, "");
+                    // 无尾标记的旧版（v17/v16）走守卫幂等堆叠：shim + (旧shim... + 原源码)
+                }
+                fs.writeFileSync(abs, shim + original, "utf8");
                 changedShimCount++;
             } catch (e) {
                 // 单个扩展垫片失败不影响其它 —— 但必须留痕：静默吞掉会让扩展
@@ -638,7 +901,7 @@ export class ExtensionHost {
         const { fs, path } = nodeModules();
         let changed = false;
         for (const ext of this.extensions) {
-            if (ext.popupPath !== undefined && ext.iconPath !== undefined) continue;
+            if (ext.popupPath !== undefined && ext.iconPath !== undefined && ext.newtabPath !== undefined) continue;
             try {
                 const manifest = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
                 if (ext.popupPath === undefined) {
@@ -655,6 +918,11 @@ export class ExtensionHost {
                 }
                 if (ext.iconPath === undefined) {
                     ext.iconPath = pickLargestIcon(manifest);
+                }
+                if (ext.newtabPath === undefined) {
+                    ext.newtabPath = manifest.chrome_url_overrides?.newtab
+                        || manifest.chrome_url_overrides?.homepage
+                        || undefined;
                 }
                 changed = true;
             } catch {
@@ -722,6 +990,12 @@ export class ExtensionHost {
 
     list(): IInstalledExtension[] {
         return [...this.extensions];
+    }
+
+    /** 宿主数据是否就绪（load() 已完成）。启动恢复页签可能早于本方法完成，
+     *  WebviewController 据此判断 chrome-extension:// 导航该放行还是保守改道。 */
+    isLoaded(): boolean {
+        return this.loaded;
     }
 
     /** 能弹出面板的扩展（有 action/browser_action 的 default_popup 且已启用） */
@@ -798,6 +1072,10 @@ export class ExtensionHost {
                     || undefined,
                 // 工具栏图标：取 manifest 里声明的最大尺寸
                 iconPath: pickLargestIcon(manifest),
+                // 新标签页扩展：chrome_url_overrides.newtab（可作为新页签默认页）
+                newtabPath: manifest.chrome_url_overrides?.newtab
+                    || manifest.chrome_url_overrides?.homepage
+                    || undefined,
             };
             // 同目录重复安装 → 更新
             const idx = this.extensions.findIndex((e) => e.path === ext.path);
@@ -933,7 +1211,10 @@ export class ExtensionHost {
         // 元数据仅用于错误提示增强与后续展示，获取失败不影响安装
         const meta = await fetchEdgeAddonMeta(id);
         try {
-            const buf = await downloadEdgeCrx(id);
+            // 直连微软 CDN 常被网络环境重置（Node http/https 不走系统代理），
+            // 失败时经内核 forwardProxy 兜底下载
+            const kernelRpc = (this.plugin as any)?.kernel?.rpc?.call;
+            const buf = await downloadEdgeCrxWithFallback(id, kernelRpc);
             const workspaceDir = (window as any).siyuan?.config?.system?.workspaceDir;
             if (!workspaceDir) {
                 return { ok: false, error: "workspaceDir unavailable" };
@@ -1100,9 +1381,25 @@ export class ExtensionHost {
     chrome_.i18n.getMessage = function(key, args) {
         var entry = MESSAGES[key];
         var msg = entry ? (entry.message || "") : "";
+        if (!msg) return "";
+        var arr = args == null ? [] : (Array.isArray(args) ? args : [args]);
+        // named placeholders（$name$ → placeholders[name].content，content 可为
+        // "$1" 引用或常量）—— 与 cs-runtime 页面世界垫片同实现
+        var ph = entry && entry.placeholders;
+        if (ph) {
+            msg = msg.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)\\$/g, function(m, name) {
+                var p = ph[name];
+                if (!p) return m;
+                var c = String(p.content == null ? "" : p.content);
+                return c.replace(/\\$(\\d+)/g, function(m2, i2) {
+                    var v = arr[Number(i2) - 1];
+                    return v != null ? String(v) : m2;
+                });
+            });
+        }
         if (msg && args != null) {
-            var arr = Array.isArray(args) ? args : [args];
-            msg = msg.replace(/\\$(\\d+)/g, function(m, i) { return arr[Number(i) - 1] != null ? arr[Number(i) - 1] : m; });
+            var arr2 = Array.isArray(args) ? args : [args];
+            msg = msg.replace(/\\$(\\d+)/g, function(m, i) { return arr2[Number(i) - 1] != null ? arr2[Number(i) - 1] : m; });
         }
         return msg;
     };
@@ -1231,6 +1528,8 @@ export class ExtensionHost {
                         version: e.version,
                         defaultLocale: e.defaultLocale,
                         contentScripts: e.contentScripts,
+                        // 内容世界 tab 身份（真 Chrome sender.tab 语义，见 ICsExtInfo）
+                        senderTabId: 1,
                     })),
             readFile: (extPath: string, rel: string) => {
                 const { fs, path } = nodeModules();
@@ -1269,6 +1568,66 @@ export class ExtensionHost {
             wakeSw: async (electronId: string) => {
                 await this.wakeSw(electronId);
             },
+            userData: async (kind: string, args: any) => {
+                const plugin = this.plugin;
+                // topSites：从历史库按 origin 聚合访问次数取 Top N
+                if (kind === "topSites") {
+                    const items: any[] = plugin?.historyStore?.list?.() || [];
+                    const byOrigin = new Map<string, { url: string; title: string; count: number }>();
+                    for (const it of items) {
+                        try {
+                            const u = new URL(it.url);
+                            // 扩展页/内部页不进 topSites（历史库可能有旧数据）
+                            if (!/^https?:$/.test(u.protocol)) continue;
+                            const cur = byOrigin.get(u.origin) || { url: it.url, title: it.title || u.hostname, count: 0 };
+                            cur.count++;
+                            byOrigin.set(u.origin, cur);
+                        } catch {}
+                    }
+                    return [...byOrigin.values()]
+                        .sort((a, b) => b.count - a.count)
+                        .slice(0, 20)
+                        .map((x) => ({ url: x.url, title: x.title }));
+                }
+                if (kind === "bookmarkTree") {
+                    const bms: any[] = plugin?.bookmarksStore?.list?.() || [];
+                    return [{
+                        id: "0",
+                        title: "",
+                        children: [{
+                            id: "1",
+                            title: "书签栏",
+                            children: bms.map((b, i) => ({ id: "1." + i, title: b.title || b.url, url: b.url })),
+                        }],
+                    }];
+                }
+                if (kind === "bookmarkRecent") {
+                    const bms: any[] = plugin?.bookmarksStore?.list?.() || [];
+                    return bms.slice(0, Number(args?.n) || 10).map((b, i) => ({ id: "r" + i, title: b.title || b.url, url: b.url }));
+                }
+                if (kind === "bookmarkSearch") {
+                    const bms: any[] = plugin?.bookmarksStore?.search?.(String(args?.query || "")) || [];
+                    return bms.map((b, i) => ({ id: "s" + i, title: b.title || b.url, url: b.url }));
+                }
+                if (kind === "historySearch") {
+                    const q = args?.query || {};
+                    const text = String(q.text || "").toLowerCase();
+                    const max = Number(q.maxResults) > 0 ? Number(q.maxResults) : 100;
+                    let items: any[] = plugin?.historyStore?.list?.() || [];
+                    if (text) {
+                        items = items.filter((it) => String(it.title || "").toLowerCase().includes(text) || String(it.url || "").toLowerCase().includes(text));
+                    }
+                    return items.slice(0, max).map((it, i) => ({
+                        id: "h" + i,
+                        url: it.url,
+                        title: it.title || it.url,
+                        lastVisitTime: Number(it.visitTime) || 0,
+                        visitCount: 1,
+                        typedCount: 0,
+                    }));
+                }
+                return null;
+            },
         });
         this.csRuntimeInited = true;
     }
@@ -1296,6 +1655,20 @@ export class ExtensionHost {
             ensureCsRuntime(webview);
         } catch (e) {
             console.warn("[browser-plugin] ensureCsRuntime failed:", e);
+        }
+    }
+
+    /**
+     * dom-ready 时调用（ensureCsRuntime 之后）：把 chrome.userScripts 注册的
+     * 用户脚本（Tampermonkey 的引导包与用户脚本）注入本页的扩展自建世界。
+     * 见 userscriptInjector.ts 的分工说明。
+     */
+    injectNativeUserScripts(webview: IWebviewTag, url: string): void {
+        try {
+            if (!this.loaded) return;
+            void this.usInjector.injectForPage(webview, url);
+        } catch (e) {
+            console.warn("[browser-plugin] injectNativeUserScripts failed:", e);
         }
     }
 
@@ -1428,6 +1801,49 @@ export class ExtensionHost {
             openStoreBtn.addEventListener("click", () => this.openEdgeStore());
             edgeToolbar.appendChild(openStoreBtn);
             container.appendChild(edgeToolbar);
+
+            // 快速安装行：常用扩展一键从 Edge 加载项商店下载安装（直连失败自动走内核代理兜底）
+            const quickToolbar = document.createElement("div");
+            quickToolbar.style.cssText = "display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center;";
+            const quickLabel = document.createElement("span");
+            quickLabel.style.cssText = "font-size:12px;color:var(--b3-theme-on-surface-light);";
+            quickLabel.textContent = i18n.extQuickInstall || "快速安装：";
+            quickToolbar.appendChild(quickLabel);
+            for (const q of QUICK_INSTALL_EDGE) {
+                const qBtn = document.createElement("button");
+                qBtn.className = "b3-button";
+                qBtn.textContent = q.label;
+                qBtn.addEventListener("click", async () => {
+                    qBtn.disabled = true;
+                    const originalText = qBtn.textContent;
+                    qBtn.textContent = i18n.extEdgeDownloading || "下载中...";
+                    try {
+                        const r = await this.installFromEdgeAddons(q.id);
+                        if (r.ok) {
+                            showMessage((i18n.extInstalled || "已安装扩展") + ": " + r.ext!.name, 3000, "info");
+                            render();
+                        } else {
+                            showMessage((i18n.extInstallFailed || "安装扩展失败") + ": " + r.error, 6000, "error");
+                        }
+                    } finally {
+                        qBtn.disabled = false;
+                        qBtn.textContent = originalText;
+                    }
+                });
+                quickToolbar.appendChild(qBtn);
+            }
+            // 新标签页类扩展：商店搜索页（详情页点"安装到思源"即可安装，装完在插件设置里启用）
+            const newTabBtn = document.createElement("button");
+            newTabBtn.className = "b3-button b3-button--cancel";
+            newTabBtn.textContent = i18n.extQuickNewTab || "新标签页扩展（商店搜索）";
+            newTabBtn.title = i18n.newTabExtDesc || "安装带新标签页的扩展（如 Momentum）后，在插件设置「新标签页扩展」里启用";
+            newTabBtn.addEventListener("click", () => {
+                const plugin = (window as any).browserPlugin;
+                if (plugin?.openUrl) plugin.openUrl("https://microsoftedge.microsoft.com/addons/search/new%20tab");
+                else window.open("https://microsoftedge.microsoft.com/addons/search/new%20tab", "_blank");
+            });
+            quickToolbar.appendChild(newTabBtn);
+            container.appendChild(quickToolbar);
 
             const list = this.list();
             if (list.length === 0) {
