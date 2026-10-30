@@ -56,6 +56,8 @@ export default class BrowserPlugin extends Plugin {
     private globalLinkHandler: ((e: MouseEvent) => void) | null = null;
     /** 原始 window.open 引用（用于恢复） */
     private originalWindowOpen: typeof window.open | null = null;
+    /** 原始 shell.openExternal 引用（patch 思源直调的系统浏览器打开路径，用于恢复） */
+    private originalShellOpenExternal: ((url: string, opts?: any) => Promise<void>) | null = null;
 
     async onload(): Promise<void> {
         // 全局引用必须在 onload 最早建立：Dock/页签的 init() 在布局构建期执行，
@@ -147,7 +149,14 @@ export default class BrowserPlugin extends Plugin {
                             } catch (e) {
                                 console.warn("[browser-plugin] ensure cs-runtime failed:", e);
                             }
+                            try {
+                                // chrome.userScripts 注册的用户脚本（油猴扩展）注入
+                                plugin.extensionHost?.injectNativeUserScripts?.(webview, url);
+                            } catch (e) {
+                                console.warn("[browser-plugin] userScript inject failed:", e);
+                            }
                         },
+                        resolveStartUrl: () => plugin.resolveStartUrl(),
                         installEdgeExtension: (id: string, source: string) => {
                             return plugin.extensionHost.installFromEdgeAddons(id).then((r) => {
                                 if (r.ok) {
@@ -260,7 +269,7 @@ export default class BrowserPlugin extends Plugin {
             title: this.i18n.openBrowser,
             position: "right",
             callback: () => {
-                this.openUrl(this.settingsStore.get().homepage);
+                this.openUrl(this.resolveStartUrl());
             },
         });
 
@@ -452,38 +461,48 @@ export default class BrowserPlugin extends Plugin {
      * 全局链接拦截器：当 interceptAllLinks=true 时，
      * 拦截思源内所有 http(s) 链接点击，用浏览器插件打开而非系统浏览器。
      *
+     * 三层拦截（思源打开外链有多条路径，缺一层就会"点链接还是进系统浏览器"）：
+     * 1. shell.openExternal patch —— 思源 protyle 点击链接的最终落点
+     *    （app/src/editor/openLink.ts）是渲染进程直调 electron.shell.openExternal，
+     *    完全不经过 window.open；不 patch 它，笔记里的链接永远拦不住。
+     * 2. window.open monkey-patch —— 部分界面/插件代码走 window.open。
+     * 3. document 捕获阶段 click/auxclick —— 直接拦 <a> 与 protyle 链接 span
+     *    （思源 wysiwyg 判定链接元素用 data-type 按空格分词包含匹配
+     *    hasClosestByAttribute，选择器必须用 [data-type~="a"] 而非全等）。
+     *
      * 点击行为与浏览器一致：
      * - 普通左键：在当前激活的浏览器标签页中替换 URL（不开新标签）
      * - Ctrl/Cmd+左键、中键、target=_blank、window.open(_blank)：开新标签页
      * - 如当前激活页签不是浏览器标签页，则开新标签页
-     *
-     * 思源中链接的两种形式：
-     * 1. protyle 编辑器内的链接：<span data-type="a" data-href="http://...">text</span>
-     *    点击时思源 JS 调用 window.open(url) → 触发 Electron setWindowOpenHandler → shell.openExternal
-     * 2. HTML <a> 标签：<a href="http://..." target="_blank"> → 触发 setWindowOpenHandler
      */
     private updateGlobalLinkInterceptor(): void {
         const enabled = this.settingsStore.get().interceptAllLinks;
         if (enabled && !this.globalLinkHandler) {
             // 1. Monkey-patch window.open：按 target 参数决定开新标签还是替换当前页
-            this.originalWindowOpen = window.open.bind(window);
-            window.open = (url?: string | URL, target?: string, features?: string): Window | null => {
-                const urlStr = url == null ? "" : String(url);
-                if (urlStr && /^https?:\/\//i.test(urlStr)) {
-                    // 排除网站：不拦截，回退到原始 window.open（触发思源系统浏览器打开）
-                    if (this.isUrlExcluded(urlStr)) {
-                        return this.originalWindowOpen!(urlStr, target, features);
+            if (!this.originalWindowOpen) {
+                this.originalWindowOpen = window.open.bind(window);
+                window.open = (url?: string | URL, target?: string, features?: string): Window | null => {
+                    const urlStr = url == null ? "" : String(url);
+                    if (urlStr && /^https?:\/\//i.test(urlStr)) {
+                        // 排除网站：不拦截，回退到原始 window.open（触发思源系统浏览器打开）
+                        if (this.isUrlExcluded(urlStr)) {
+                            return this.originalWindowOpen!(urlStr, target, features);
+                        }
+                        const newTab = target === "_blank" || !this.getActiveBrowserTab();
+                        console.log("[browser-plugin] window.open intercept:", urlStr, "newTab:", newTab);
+                        if (newTab) this.openUrl(urlStr);
+                        else this.openUrlInCurrent(urlStr);
+                        return null;
                     }
-                    const newTab = target === "_blank" || !this.getActiveBrowserTab();
-                    console.log("[browser-plugin] window.open intercept:", urlStr, "newTab:", newTab);
-                    if (newTab) this.openUrl(urlStr);
-                    else this.openUrlInCurrent(urlStr);
-                    return null;
-                }
-                return this.originalWindowOpen!(url, target, features);
-            };
+                    return this.originalWindowOpen!(url, target, features);
+                };
+            }
 
-            // 2. DOM click 拦截：按修饰键和 target 判断开新标签还是替换当前页
+            // 2. Monkey-patch shell.openExternal：思源 protyle 链接（openLink.ts）
+            //    与键盘打开链接等路径的最终落点，直调 electron shell，不经 window.open
+            this.patchShellOpenExternal();
+
+            // 3. DOM click 拦截：按修饰键和 target 判断开新标签还是替换当前页
             this.globalLinkHandler = (e: MouseEvent) => {
                 // 中键（button=1）也处理，交给浏览器新标签逻辑
                 if (e.button !== 0 && e.button !== 1) return;
@@ -501,10 +520,12 @@ export default class BrowserPlugin extends Plugin {
                     href = anchor.href;
                     anchorTarget = anchor.target || "";
                 } else {
-                    // 检查思源 protyle 的 span 链接
-                    const span = target.closest('span[data-type="a"]') as HTMLElement | null;
-                    if (span) {
-                        href = span.getAttribute("data-href") || "";
+                    // 思源 protyle 链接 span：data-type 是空格分词的 token 列表
+                    // （如 "a"、"a inline-mem"），思源 hasClosestByAttribute 用
+                    // split(" ").includes("a") 判定 —— 选择器必须用 ~=（token 匹配）。
+                    const el = target.closest('[data-type~="a"], [data-href]') as HTMLElement | null;
+                    if (el) {
+                        href = el.getAttribute("data-href") || "";
                     }
                 }
 
@@ -530,18 +551,62 @@ export default class BrowserPlugin extends Plugin {
             document.addEventListener("click", this.globalLinkHandler, true);
             // 中键 auxclick 也拦截（部分浏览器 click 不触发中键）
             document.addEventListener("auxclick", this.globalLinkHandler as any, true);
-            console.log("[browser-plugin] global link interceptor enabled (window.open + click)");
+            console.log("[browser-plugin] global link interceptor enabled (shell.openExternal + window.open + click)");
         } else if (!enabled && this.globalLinkHandler) {
             // 恢复 window.open
             if (this.originalWindowOpen) {
                 window.open = this.originalWindowOpen;
                 this.originalWindowOpen = null;
             }
+            // 恢复 shell.openExternal
+            this.unpatchShellOpenExternal();
             document.removeEventListener("click", this.globalLinkHandler, true);
             document.removeEventListener("auxclick", this.globalLinkHandler as any, true);
             this.globalLinkHandler = null;
             console.log("[browser-plugin] global link interceptor disabled");
         }
+    }
+
+    /**
+     * patch 渲染进程的 electron.shell.openExternal：http(s) 且非排除网站的 URL
+     * 改走插件页签；其余（排除网站、siyuan://、assets/ 本地路径等）原样放行。
+     * 思源代码 `import { shell } from "electron"` 拿到的是同一个 shell 单例对象，
+     * 这里替换其 openExternal 方法后思源侧的调用也会走 patch（call 时属性查找）。
+     */
+    private patchShellOpenExternal(): void {
+        if (this.originalShellOpenExternal) return;
+        try {
+            const shell = (window as any).require?.("electron")?.shell;
+            if (!shell?.openExternal) return;
+            const original = shell.openExternal.bind(shell);
+            this.originalShellOpenExternal = original;
+            const plugin = this;
+            shell.openExternal = function (url: string, ...rest: any[]) {
+                try {
+                    if (typeof url === "string" && /^https?:\/\//i.test(url) && !plugin.isUrlExcluded(url)) {
+                        const newTab = !plugin.getActiveBrowserTab();
+                        console.log("[browser-plugin] shell.openExternal intercept:", url, "newTab:", newTab);
+                        if (newTab) plugin.openUrl(url);
+                        else plugin.openUrlInCurrent(url);
+                        return Promise.resolve();
+                    }
+                } catch {}
+                return original(url, ...rest);
+            };
+            console.log("[browser-plugin] shell.openExternal patched");
+        } catch (e) {
+            console.warn("[browser-plugin] patch shell.openExternal failed:", e);
+        }
+    }
+
+    private unpatchShellOpenExternal(): void {
+        if (!this.originalShellOpenExternal) return;
+        try {
+            const shell = (window as any).require?.("electron")?.shell;
+            if (shell) shell.openExternal = this.originalShellOpenExternal;
+        } catch {}
+        this.originalShellOpenExternal = null;
+        console.log("[browser-plugin] shell.openExternal restored");
     }
 
     /**
@@ -627,19 +692,45 @@ export default class BrowserPlugin extends Plugin {
         return isUrlExcluded(url, this.settingsStore.get().excludedSites);
     }
 
-    /** 在系统默认浏览器中打开 URL */
+    /** 在系统默认浏览器中打开 URL（排除网站命中、工具栏「在默认浏览器打开」都走这里） */
     openInSystemBrowser(url: string): void {
         try {
             const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
             const shell = electron?.shell;
-            if (shell?.openExternal) {
-                shell.openExternal(url);
+            // 链接拦截启用时 shell.openExternal 已被 patch，这里必须用保存的原始实现，
+            // 否则"系统浏览器打开"会被拦回插件页签
+            const opener = this.originalShellOpenExternal || (shell?.openExternal ? shell.openExternal.bind(shell) : null);
+            if (opener) {
+                opener(url);
             } else {
-                window.open(url, "_blank");
+                (this.originalWindowOpen || window.open).call(window, url, "_blank");
             }
         } catch (e) {
             console.warn("[browser-plugin] openInSystemBrowser failed:", e);
-            window.open(url, "_blank");
+            (this.originalWindowOpen || window.open).call(window, url, "_blank");
+        }
+    }
+
+    /**
+     * 解析新页签的起始 URL：
+     * - 配置了「新标签页扩展」（newTabExtId）且该扩展已启用、以原生模式加载、
+     *   manifest 声明了 chrome_url_overrides.newtab → 返回其扩展页面 URL；
+     * - 否则回退主页设置。
+     * 工具栏「打开浏览器」与 BrowserTab.init（无显式 URL 时）都经由这里。
+     */
+    resolveStartUrl(): string {
+        const s = this.settingsStore.get();
+        const homepage = s.homepage || "about:blank";
+        const extId = s.newTabExtId;
+        if (!extId) return homepage;
+        try {
+            const ext = this.extensionHost?.list().find(
+                (e) => e.id === extId && e.enabled && e.native && !!e.electronId && !!e.newtabPath
+            );
+            if (!ext) return homepage;
+            return `chrome-extension://${ext.electronId}/${String(ext.newtabPath).replace(/^\.\//, "")}`;
+        } catch {
+            return homepage;
         }
     }
 
@@ -689,10 +780,14 @@ export default class BrowserPlugin extends Plugin {
             return input;
         };
 
+        const esc = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const desc = (s: string) => this.i18n[s] || "";
+
         // 主页
         setting.addItem({
             title: this.i18n.homepage,
             direction: "row",
+            description: desc("homepageDesc"),
             createActionElement: () => makeInput("homepage", s.homepage),
         });
 
@@ -700,6 +795,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.searchEngine,
             direction: "row",
+            description: desc("searchEngineDesc"),
             createActionElement: () => {
                 const sel = document.createElement("select");
                 sel.className = "b3-select";
@@ -724,6 +820,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.custom,
             direction: "row",
+            description: "带 {q} 占位符的搜索 URL，如 https://example.com/search?q={q}。仅搜索引擎选「自定义」时使用。",
             createActionElement: () => makeInput("customSearchUrl", s.customSearchUrl, { placeholder: "https://example.com/search?q={q}" }),
         });
 
@@ -731,6 +828,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.historyLimit,
             direction: "row",
+            description: desc("historyLimitDesc"),
             createActionElement: () => makeInput("historyLimit", String(s.historyLimit), { type: "number", min: "0", max: "50000" }),
         });
 
@@ -738,6 +836,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.recordHistory,
             direction: "row",
+            description: desc("recordHistoryDesc"),
             createActionElement: () => makeCheckbox("recordHistory", s.recordHistory),
         });
 
@@ -745,6 +844,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.downloadTarget,
             direction: "row",
+            description: desc("downloadTargetDesc"),
             createActionElement: () => {
                 const sel = document.createElement("select");
                 sel.className = "b3-select";
@@ -767,6 +867,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.userAgent,
             direction: "row",
+            description: desc("userAgentDesc"),
             createActionElement: () => makeInput("userAgent", s.userAgent, { placeholder: "(default)" }),
         });
 
@@ -807,7 +908,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.enablePreload,
             direction: "row",
-            description: "拦截链接点击，在思源新标签页打开。如不需要可关闭。",
+            description: desc("preloadDesc"),
             createActionElement: () => makeCheckbox("enablePreload", s.enablePreload),
         });
 
@@ -876,20 +977,23 @@ export default class BrowserPlugin extends Plugin {
             createActionElement: () => makeCheckbox("excerptAssets", s.excerptAssets !== false),
         });
 
-        // 摘录前处理选项（与官方扩展 exp 选项一致，默认关闭）
-        const expOptions: Array<[keyof BrowserSettings, string]> = [
-            ["excerptExpBold", "粗体样式转 <b>"],
-            ["excerptExpItalic", "斜体样式转 <i>"],
-            ["excerptExpUnderline", "下划线样式转 <u>"],
-            ["excerptExpRemoveImgLink", "移除图片外层链接"],
-            ["excerptExpSpan", "span 换行转 <br>"],
-            ["excerptExpSvgToImg", "内嵌 SVG 转图片"],
+        // 摘录前处理选项（与官方剪藏扩展 exp 选项一致，默认关闭）。
+        // 每项用独立的标题（选项名），说明文案统一放 description；
+        // 标题/描述里的 <b> 等 HTML 记号必须转义 —— 思源 Setting 的 title/description
+        // 按 innerHTML 渲染，不转义会真的加粗/下划线（设置面板混乱的根源）。
+        const expOptions: Array<[keyof BrowserSettings, string, string]> = [
+            ["excerptExpBold", "excerptExpBoldTitle", "excerptExpBoldDesc"],
+            ["excerptExpItalic", "excerptExpItalicTitle", "excerptExpItalicDesc"],
+            ["excerptExpUnderline", "excerptExpUnderlineTitle", "excerptExpUnderlineDesc"],
+            ["excerptExpRemoveImgLink", "excerptExpRemoveImgLinkTitle", "excerptExpRemoveImgLinkDesc"],
+            ["excerptExpSpan", "excerptExpSpanTitle", "excerptExpSpanDesc"],
+            ["excerptExpSvgToImg", "excerptExpSvgToImgTitle", "excerptExpSvgToImgDesc"],
         ];
-        for (const [key, desc] of expOptions) {
+        for (const [key, titleKey, descKey] of expOptions) {
             setting.addItem({
-                title: this.i18n.excerptExp || "摘录前处理",
+                title: esc(this.i18n[titleKey] || "摘录前处理"),
                 direction: "row",
-                description: desc + "（与官方剪藏扩展高级选项一致，默认关闭）",
+                description: esc(desc(descKey)),
                 createActionElement: () => makeCheckbox(key, (s as any)[key] === true),
             });
         }
@@ -898,7 +1002,7 @@ export default class BrowserPlugin extends Plugin {
         setting.addItem({
             title: this.i18n.extManager || "Chrome 扩展",
             direction: "row",
-            description: "安装未打包扩展目录或 CRX / ZIP 扩展包，内容脚本会注入到浏览器页签中的网页。",
+            description: desc("extManagerDesc"),
             createActionElement: () => {
                 const btn = document.createElement("button");
                 btn.className = "b3-button";
@@ -910,11 +1014,40 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
+        // 新标签页扩展（chrome_url_overrides.newtab 页作为新页签默认页）
+        setting.addItem({
+            title: this.i18n.newTabExt || "新标签页扩展",
+            direction: "row",
+            description: desc("newTabExtDesc"),
+            createActionElement: () => {
+                const sel = document.createElement("select");
+                sel.className = "b3-select";
+                const noneOpt = document.createElement("option");
+                noneOpt.value = "";
+                noneOpt.textContent = this.i18n.newTabExtNone || "（不使用，打开主页）";
+                if (!s.newTabExtId) noneOpt.selected = true;
+                sel.appendChild(noneOpt);
+                // 列出声明了 newtab 覆盖页的已装扩展（设置页打开时扩展宿主通常已就绪）
+                try {
+                    for (const ext of this.extensionHost?.list() || []) {
+                        if (!ext.newtabPath) continue;
+                        const opt = document.createElement("option");
+                        opt.value = ext.id;
+                        opt.textContent = `${ext.name}${ext.enabled ? "" : "（已停用）"}`;
+                        if (s.newTabExtId === ext.id) opt.selected = true;
+                        sel.appendChild(opt);
+                    }
+                } catch {}
+                refs.newTabExtId = sel;
+                return sel;
+            },
+        });
+
         // 所有链接用插件打开
         setting.addItem({
             title: this.i18n.interceptAllLinks,
             direction: "row",
-            description: "拦截思源内所有 http(s) 链接点击，用浏览器插件打开而非系统浏览器。",
+            description: desc("interceptAllLinksDesc"),
             createActionElement: () => makeCheckbox("interceptAllLinks", s.interceptAllLinks),
         });
 
@@ -1071,11 +1204,12 @@ export default class BrowserPlugin extends Plugin {
             "sy-browser-hide-downloads-dock"
         );
         document.getElementById("sy-browser-icon-visibility")?.remove();
-        // 禁用全局链接拦截，恢复 window.open
+        // 禁用全局链接拦截，恢复 window.open 与 shell.openExternal
         if (this.originalWindowOpen) {
             window.open = this.originalWindowOpen;
             this.originalWindowOpen = null;
         }
+        this.unpatchShellOpenExternal();
         if (this.globalLinkHandler) {
             document.removeEventListener("click", this.globalLinkHandler, true);
             this.globalLinkHandler = null;

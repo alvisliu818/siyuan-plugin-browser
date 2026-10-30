@@ -121,7 +121,10 @@ export interface BrowserSettings {
     showHistoryDock: boolean;
     /** 底部「下载」面板图标 */
     showDownloadsDock: boolean;
+    /** 新标签页扩展（扩展的 chrome_url_overrides.newtab 页作为新页签默认页；空 = 主页） */
+    newTabExtId: string;
 }
+
 
 /** webview 元素的扩展类型（Electron webview tag） */
 export interface IWebviewTag extends HTMLElement {
