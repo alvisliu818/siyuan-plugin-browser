@@ -14,6 +14,52 @@
     try {
         const { ipcRenderer, webFrame } = require("electron");
 
+        // === -1. 扩展页面（chrome-extension://）：抑制原生 confirm/alert/prompt + 收集未捕获异常 ===
+        // Electron 下 window.confirm 是**原生同步对话框**（标题=主窗口标题），扩展
+        // JS 的全局 onerror 兜底一弹，整个页面 JS 线程假死（实测 TM Dashboard 的
+        // "An internal error occurred" 弹框，CDP evaluate/Debugger 全部超时）。
+        // preload 与页面共享 window（webpreferences contextIsolation=no）且先于
+        // 页面脚本执行 —— 主世界从这里就挂上抑制；隔离世界的重放脚本由
+        // ext-popup.ts 的 POPUP_JS_PRELUDE 另行挂钩（本段不覆盖那个世界）。
+        // 与 PRELUDE 语义一致：吞掉对话框、返回"取消"，记录到 __syBlockedDialogs
+        // 供诊断；异常进 __syErrors（window.onerror 只留一行日志，栈拿不到）。
+        if (/^chrome-extension:\/\//i.test(location.href)) {
+            window.__syBlockedDialogs = [];
+            window.__syErrors = [];
+            window.confirm = function (msg) {
+                try { window.__syBlockedDialogs.push("confirm: " + String(msg).slice(0, 500)); } catch (e) {}
+                return false;
+            };
+            window.alert = function (msg) {
+                try { window.__syBlockedDialogs.push("alert: " + String(msg).slice(0, 500)); } catch (e) {}
+            };
+            window.prompt = function (msg, dflt) {
+                try { window.__syBlockedDialogs.push("prompt: " + String(msg).slice(0, 500)); } catch (e) {}
+                return dflt === undefined ? null : dflt;
+            };
+            self.addEventListener("error", function (e) {
+                try {
+                    window.__syErrors.push({
+                        msg: String((e && e.message) || e).slice(0, 300),
+                        stack: String((e && e.error && e.error.stack) || "").slice(0, 3000),
+                        file: e && e.filename,
+                        line: e && e.lineno,
+                        col: e && e.colno,
+                        ts: Date.now(),
+                    });
+                } catch (e2) {}
+            });
+            self.addEventListener("unhandledrejection", function (e) {
+                try {
+                    var r = e && e.reason;
+                    window.__syErrors.push({
+                        msg: "unhandledrejection: " + String((r && (r.stack || r.message)) || r).slice(0, 800),
+                        ts: Date.now(),
+                    });
+                } catch (e2) {}
+            });
+        }
+
         // === 0. Ctrl+滚轮 / Ctrl+0 页面缩放（Chromium page zoom，webFrame 渲染进程标准 API）===
         // 缩放后固定宽度站点会横向溢出并出现滚动条（与真浏览器行为一致）。
         try {
@@ -244,6 +290,7 @@
         // === 4. 页面 → 宿主事件桥（白名单通道） ===
         // 注入脚本（executeJavaScript，页面主世界）通过 CustomEvent("sy-browser-host")
         // 把白名单内的动作转给宿主，页面本身拿不到 ipcRenderer。
+        // 白名单：browser-open-new-tab（新页签）/ browser-edge-install（商店安装）
         window.addEventListener("sy-browser-host", function (ev) {
             try {
                 const d = ev && ev.detail;

@@ -56,6 +56,22 @@ export interface ICsExtInfo {
     version: string;
     defaultLocale: string;
     contentScripts: Array<{ matches: string[]; js: string[]; css: string[] }>;
+    /**
+     * 该世界的 sender 身份 URL（port.sender.url / sendMessage sender）。
+     * popup/扩展页面世界必须传 chrome-extension://<id>/<page>：真 Chrome 里
+     * 弹出面板是真实扩展文档（location.href 即扩展 URL），而我们的 popup
+     * 世界寄生在宿主页面里 —— TM/AdGuard 的 SW 端按 sender.url 判
+     * extpage 白名单（不以 chrome-extension:// 开头即静默丢弃消息，面板
+     * 永远等不到回包）。缺省回退 location.href（内容脚本世界语义正确）。
+     */
+    senderPageUrl?: string;
+    /**
+     * 内容世界（content/用户脚本世界）的 tab 身份：真 Chrome 里内容脚本的
+     * port.sender / message.sender 带 tab: {id}，TM 等 SW 端靠它把连接归属到
+     * 页签（无 tab → 页签永远"无脚本状态"）。与垫片 tabs.query 的固定 id=1
+     * 对齐。popup/扩展页面世界不设（真 Chrome 里 popup 的 sender 无 tab）。
+     */
+    senderTabId?: number;
 }
 
 /** 宿主能力提供者（extensionHost 实现），避免模块循环依赖 */
@@ -69,6 +85,8 @@ export interface ICsRuntimeHost {
      *  面板世界会随 removeExtension 被销毁（binding 失效 → hostCall 永挂），
      *  面板/存储路径的唤醒必须用这个 */
     wakeSw?(electronId: string): Promise<void>;
+    /** 新标签页扩展数据适配：topSites/bookmarks/history 由插件历史/书签库代答 */
+    userData?(kind: string, args: any): Promise<any>;
 }
 
 let manager: CsRuntimeManager | null = null;
@@ -85,6 +103,28 @@ export function ensureCsRuntime(webview: IWebviewTag): void {
 
 export function disposeCsRuntime(webview: IWebviewTag): void {
     manager?.disposeFor(webview);
+}
+
+/**
+ * 面板打开时把"当前页签"喂给扩展 SW（tabevent 通道）。
+ * TM 的 popup 自己不调 chrome.tabs.query —— 它的 loadTree 靠 SW 侧
+ * getSelected()（tabs.query({active,lastFocusedWindow})）解析当前页签；
+ * Electron 原生 query 查不到（垫片 5-pre 以 __syLastFedTab 兜底），而
+ * tabevent 此前只在 popup 世界调 tabs.query 时才喂 —— TM 不调就永远喂不进，
+ * loadTree 无 tab 上下文（面板显示 no access、脚本状态全丢）。AdGuard 的
+ * popup 自己会调 tabs.query，所以只有 TM 需要 host 主动喂。
+ */
+export async function feedTabEventForPopup(webview: IWebviewTag, ext: ICsExtInfo, url: string, title: string): Promise<void> {
+    if (!manager) {
+        console.warn("[browser-plugin] feedTab: cs-runtime manager 未初始化");
+        return;
+    }
+    try {
+        await manager.feedTabEvent(webview, ext, url, title);
+        console.log("[browser-plugin] feedTab ok:", String(url).slice(0, 60), "ext:", ext.electronId.slice(0, 8));
+    } catch (e) {
+        console.warn("[browser-plugin] feedTab FAILED:", String((e as any)?.message || e).slice(0, 160));
+    }
 }
 
 /** 把当前内核地址与 API token 播种到 SiYuan Clip 扩展配置（SW storage.local 的 ip/token）：
@@ -230,8 +270,13 @@ class CsRuntimeManager {
     }
 
     /** 开始一次 popup 会话：为该扩展新建专属世界（每次调用都新建，防跨打开声明冲突） */
-    async beginPopup(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {
-        const dbg = (msg: any) => {
+    /** 面板打开时主动喂 tabevent（TM 不调 tabs.query，见 feedTabEventForPopup） */
+    async feedTabEvent(webview: IWebviewTag, ext: ICsExtInfo, url: string, title: string): Promise<void> {
+        const s = await this.sessionFor(webview);
+        await s.feedTabEventToSw(ext, { url, title });
+    }
+
+    async beginPopup(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {        const dbg = (msg: any) => {
             try {
                 (window as any).__syPopupDbg = { ts: Date.now(), ext: ext.name, ...(typeof msg === "object" ? msg : { msg }) };
             } catch (e) {}
@@ -345,6 +390,12 @@ class CsRuntimeManager {
     async evalExtensionWorldAny(webview: IWebviewTag, electronId: string, expr: string): Promise<{ ok: boolean; value?: any; error?: string; contextId?: number }> {
         const s = await this.sessionFor(webview);
         return await s.evalInExtensionWorldFlat(electronId, expr);
+    }
+
+    /** 确保扩展自建世界存在（userScripts 注入前置），见 CsPageSession.ensureExtWorld */
+    async ensureExtensionWorld(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {
+        const s = await this.sessionFor(webview);
+        return s.ensureExtWorld(ext);
     }
 }
 
@@ -570,6 +621,38 @@ class CsPageSession {
             } catch (e) {
                 console.warn(`[browser-plugin] cs-runtime: "${ext.name}" 世界安装失败:`, e);
             }
+        }
+    }
+
+    /**
+     * 确保扩展的自建世界存在（不执行 content script）。
+     * chrome.userScripts 适配（userscriptInjector.ts）用：油猴类扩展没有静态
+     * content script，installExt 会跳过建世界 —— 宿主注入注册脚本前先经这里
+     * 把世界（含 chrome.* 垫片与消息桥）建出来。
+     */
+    async ensureExtWorld(ext: ICsExtInfo): Promise<void> {
+        if (!this.alive || !this.frameId) throw new Error("CDP 会话未就绪");
+        if (this.contentWorlds.has(ext.electronId)) return;
+        const r: any = await this.send("Page.createIsolatedWorld", {
+            frameId: this.frameId,
+            worldName: CS_WORLD_PREFIX + ext.electronId,
+            grantUniversalAccess: true,
+            allowCommandLineAPI: false,
+        });
+        const ctxId = r?.executionContextId;
+        if (!ctxId) throw new Error("createIsolatedWorld 未返回 contextId");
+        this.contentWorlds.set(ext.electronId, ctxId);
+        await this.send("Runtime.addBinding", { name: BRIDGE_NAME, executionContextId: ctxId });
+        const shim = buildShim(ext, this.host.messages(ext.path, ext.defaultLocale));
+        const sr: any = await this.send("Runtime.evaluate", {
+            expression: shim,
+            contextId: ctxId,
+            returnByValue: false,
+        });
+        if (sr?.exceptionDetails) {
+            throw new Error(
+                "垫片执行异常: " + String(sr.exceptionDetails?.exception?.description || sr.exceptionDetails?.text).slice(0, 200)
+            );
         }
     }
 
@@ -829,6 +912,10 @@ class CsPageSession {
             // 走 SW 垫片 v5 的 onConnect 端口语义（建连/复用 + outbox 回包）
             return await this.routePortMessage(ext, args);
         }
+        if (req.type === "portpoll") {
+            // 端口常驻泵拉取：世界侧定期取走滞留回包（见 portPoll 注释）
+            return await this.portPoll(ext, args);
+        }
         if (req.type === "tabevent") {
             // popup 世界 tabs.query 时同步喂 SW 的 tab 注册表
             // （AdGuard 的 tabsApi 靠 tabs 事件建 tabContext，Electron 下事件缺失）
@@ -837,6 +924,17 @@ class CsPageSession {
         if (req.type === "tabs-sendmessage") {
             // popup 世界 → content 世界的 onMessage 监听器（SW↔CS 路由缺失的替代）
             return await this.dispatchToContentWorld(ext, args);
+        }
+        if (req.type === "usdata") {
+            // 新标签页扩展数据适配：topSites/bookmarks/history 查询由宿主
+            // 用插件自己的历史/书签库代答（Electron 无这些 API）
+            if (!this.host.userData) return { err: "userData provider missing" };
+            try {
+                const data = await this.host.userData(String(args.kind || ""), args);
+                return { data: data === undefined ? null : data };
+            } catch (e: any) {
+                return { err: String(e?.message || e) };
+            }
         }
         return { err: "unknown bridge type: " + req.type };
     }
@@ -1129,7 +1227,11 @@ class CsPageSession {
         // 消息派发后 SW 侧可能经 tabs.sendMessage 回程（剪藏 tip/结果等）—— 开监听窗口
         this.noteSwReplyWindow(ext.electronId);
         const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
-        const senderJson = JSON.stringify({ id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) });
+        const sendSenderObj: any = { id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) };
+        if (args.tabId !== null && args.tabId !== undefined) {
+            sendSenderObj.tab = { id: Number(args.tabId), url: sendSenderObj.url };
+        }
+        const senderJson = JSON.stringify(sendSenderObj);
         const expr = `(async () => {
             const fns = self.__syOnMessageHandlers || [];
             if (!fns.length) return JSON.stringify({ __noHandlers: true });
@@ -1168,10 +1270,16 @@ class CsPageSession {
                 const useValue = (v) => { if (v !== undefined) finish(v); };
                 for (const fn of fns) {
                     try {
-                        const r = fn(${msgJson}, ${senderJson}, sendResponse);
+                        // __syNormalizeMsg：垫片统一消息归一（TM loadTree referrer 等，
+                        // 见 extensionHost 垫片 0b 节）
+                        const r = fn(self.__syNormalizeMsg ? self.__syNormalizeMsg(${msgJson}) : ${msgJson}, ${senderJson}, sendResponse);
                         if (r === true) {
                             asyncWait = true;
-                        } else if (r !== undefined) {
+                        } else if (r !== undefined && r !== false) {
+                            // r===false 是 Chrome 语义的"我不回包"（真 Chrome 下回包
+                            // 只能经 sendResponse），此前被当成回包值送达（实测 TM
+                            // 门禁拒绝 loadTree 返回 false → 应用收到布尔 false 走
+                            // fail 分支）—— 改为忽略，与真 Chrome 对齐
                             if (typeof r.then === "function") {
                                 asyncWait = true;
                                 // async handler resolve undefined（fire-and-forget 型，
@@ -1221,15 +1329,25 @@ class CsPageSession {
     /**
      * popup 世界 port 消息 → SW onConnect 端口语义（SW 垫片 v5）。
      * 首条消息建连：构造 port 对象派发给 __syOnConnectFns（扩展 handler 同步
-     * 注册 port.onMessage listeners）；随后 dispatch 消息并等待 outbox
-     * （handler 异步 port.postMessage 回包）带回响应。同一 portId 复用端口，
-     * 与真 Chrome 的 connect → postMessage 往返语义对齐。
+     * 注册 port.onMessage listeners）；随后 dispatch 消息。回包（handler 异步
+     * port.postMessage 进 outbox）由宿主侧分次小求值轮询取走 —— 单次求值内
+     * 轮询会饿死慢回包（实测 TM tabInfo 要跨 storage 异步读，冷启动 >10s，
+     * 10s 内轮询放弃后回包滞留 outbox，引导握手全饿死 → 面板"no access"）。
+     * 宿主轮询每次求值独立 <12s，总窗口 24s；同端口滞留的旧回包一并取走
+     * （端口消息按序到达，扩展按 messageId 配对，语义无损）。同一 portId
+     * 复用端口，与真 Chrome 的 connect → postMessage 往返语义对齐。
      */
     private async routePortMessage(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
         const portId = String(args.portId || "p" + Date.now().toString(36));
         const portName = String(args.portName || "");
         const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
-        const senderJson = JSON.stringify({ id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) });
+        // 内容世界的连接带 tab 归属（真 Chrome sender.tab 语义，TM 靠它把
+        // bootstrap 连接归属到页签）；popup 世界无 tab。
+        const senderObj: any = { id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) };
+        if (args.tabId !== null && args.tabId !== undefined) {
+            senderObj.tab = { id: Number(args.tabId), url: senderObj.url };
+        }
+        const senderJson = JSON.stringify(senderObj);
         const pidJson = JSON.stringify(portId);
         const expr = `(async () => {
             try {
@@ -1237,6 +1355,7 @@ class CsPageSession {
                 self.__syPortOutbox = self.__syPortOutbox || {};
                 var outbox = self.__syPortOutbox[${pidJson}];
                 var listeners = null;
+                var created = false;
                 var port = self.__syPorts[${pidJson}];
                 if (!port) {
                     var fns = self.__syOnConnectFns || [];
@@ -1259,31 +1378,18 @@ class CsPageSession {
                     };
                     self.__syPorts[${pidJson}] = port;
                     for (var i = 0; i < fns.length; i++) { try { fns[i](port); } catch (e) {} }
+                    created = true;
                     if (!listeners.length) return JSON.stringify({ __noPortListeners: true });
                 } else {
                     // 复用端口：从 port 对象恢复 listeners（垫片闭包不可达，存 port 上）
                     listeners = port.__syListeners || [];
                 }
                 if (!port.__syListeners) port.__syListeners = listeners;
-                var m = ${msgJson};
+                // __syNormalizeMsg：垫片统一消息归一（见 extensionHost 垫片 0b 节）
+                var m = self.__syNormalizeMsg ? self.__syNormalizeMsg(${msgJson}) : ${msgJson};
                 var ls = listeners.slice();
                 for (var j = 0; j < ls.length; j++) { try { ls[j](m, port); } catch (e) {} }
-                // 等 handler 异步 postMessage 回包（同步回包在 dispatch 后立即就在 outbox）
-                var resp = await new Promise(function (resolve) {
-                    var n = 0;
-                    var t = setInterval(function () {
-                        if (outbox.length) {
-                            clearInterval(t);
-                            var arr = outbox.slice();
-                            outbox.length = 0;
-                            resolve(arr);
-                        } else if (++n > 200) {
-                            clearInterval(t);
-                            resolve([]);
-                        }
-                    }, 50);
-                });
-                return JSON.stringify(resp);
+                return JSON.stringify({ dispatched: true, created: created });
             } catch (e) {
                 return JSON.stringify({ __portErr: String(e && e.message || e).slice(0, 200) });
             }
@@ -1304,14 +1410,63 @@ class CsPageSession {
             if (parsed && parsed.__noConnectHandlers) return { err: "扩展 SW 无 onConnect 处理器（垫片 v5 未生效？）" };
             if (parsed && parsed.__noPortListeners) return { err: "扩展 SW onConnect 处理器未注册 port.onMessage 监听" };
             if (parsed && parsed.__portErr) return { err: "port 路由异常: " + parsed.__portErr };
-            // parsed = 响应数组（可能多条）；空数组按无响应处理
-            if (Array.isArray(parsed)) {
-                return { data: parsed.length ? parsed : undefined };
-            }
-            return { data: parsed === null ? undefined : parsed };
         } catch {
             return { data: undefined };
         }
+        // 回包轮询：宿主侧分次小求值（每次 <12s），总窗口 24s
+        const pollExpr = `(function () {
+            try {
+                var ob = self.__syPortOutbox && self.__syPortOutbox[${pidJson}];
+                if (!ob || !ob.length) return "[]";
+                var arr = ob.slice();
+                ob.length = 0;
+                return JSON.stringify(arr);
+            } catch (e) { return "[]"; }
+        })()`;
+        const deadline = Date.now() + 24000;
+        while (Date.now() < deadline) {
+            await new Promise((res) => setTimeout(res, 400));
+            let pr: { value?: any; err?: string };
+            try {
+                pr = await this.evalInSw(ext, pollExpr);
+            } catch {
+                continue;
+            }
+            if (pr.err || pr.value === undefined) continue;
+            try {
+                const arr = JSON.parse(String(pr.value));
+                if (Array.isArray(arr) && arr.length) return { data: arr };
+            } catch {}
+        }
+        return { data: undefined };
+    }
+
+    /**
+     * 端口常驻泵（宿主侧）：routePortMessage 的 outbox 轮询窗口有限且取到首批
+     * 即返回 —— GM_xmlhttpRequest 的真实响应晚数百 ms 到达时无人再取，永远滞留
+     * __syPortOutbox（实测 xhr 响应数据滞留、onerror/ontimeout 全部饿死）。
+     * 世界侧 connect 后由泵每 600ms 调 portpoll，这里单次原子取走指定端口的
+     * 全部滞留回包交回世界派发。排空是 splice 原子操作，与 routePortMessage
+     * 的轮询竞争也不会重复投递。
+     */
+    private async portPoll(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+        const ids = Array.isArray(args?.ids) ? args.ids.map(String).slice(0, 64) : [];
+        if (!ids.length) return { data: [] };
+        const expr = `(function () {
+            var ids = ${JSON.stringify(ids)};
+            var out = [];
+            try {
+                var box = self.__syPortOutbox || {};
+                for (var i = 0; i < ids.length; i++) {
+                    var arr = box[ids[i]];
+                    if (arr && arr.length) out.push({ portId: ids[i], msgs: arr.splice(0, arr.length) });
+                }
+            } catch (e) {}
+            return JSON.stringify(out);
+        })()`;
+        const r = await this.evalInSw(ext, expr);
+        if (r.err) return { err: r.err };
+        try { return { data: JSON.parse(String(r.value)) }; } catch { return { data: [] }; }
     }
 
     /**
@@ -1328,6 +1483,9 @@ class CsPageSession {
         const expr = `(function () {
             try {
                 var tab = ${tabJson};
+                // SW 侧 tabs.query 的"活动页签"兜底（垫片 5a-2）：Electron 原生 query
+                // 不认 active/lastFocusedWindow，TM 的 popup 会话解析当前页签全靠它
+                self.__syLastFedTab = tab;
                 var cfns = self.__syTabCreatedFns || [];
                 for (var i = 0; i < cfns.length; i++) { try { cfns[i](tab); } catch (e) {} }
                 var afns = self.__syTabActivatedFns || [];
@@ -1429,25 +1587,98 @@ class CsPageSession {
     async evaluateInWorld(ctxId: number, expr: string, timeoutMs = 30000): Promise<{ ok: boolean; value?: any; error?: string }> {
         try {
             if (expr.length > 150_000) {
-                await this.send("Runtime.evaluate", { expression: "self.__syBigSrc = []", contextId: ctxId }, timeoutMs);
-                const CHUNK = 100_000;
-                for (let i = 0; i < expr.length; i += CHUNK) {
-                    const piece = expr.slice(i, i + CHUNK);
-                    await this.send(
-                        "Runtime.evaluate",
-                        { expression: "self.__syBigSrc.push(" + JSON.stringify(piece) + ")", contextId: ctxId },
-                        timeoutMs
-                    );
-                }
-                const r: any = await this.send(
+                // 直发一次 + 落地标记：大 expression 的"静默无效"（返回 ok 但未执行）
+                // 用标记求值检测；生效则免去整个分块传输
+                const bigMark = "syBig" + Date.now().toString(36);
+                const r0: any = await this.send(
                     "Runtime.evaluate",
-                    { expression: "(0, eval)(self.__syBigSrc.join(''))", contextId: ctxId, returnByValue: false, awaitPromise: false },
+                    { expression: expr + `;self["${bigMark}"]=1;`, contextId: ctxId, returnByValue: false },
                     timeoutMs
                 );
+                const c0: any = await this.send(
+                    "Runtime.evaluate",
+                    { expression: `self["${bigMark}"]===1`, contextId: ctxId, returnByValue: true },
+                    timeoutMs
+                );
+                if (c0?.result?.value === true) {
+                    return { ok: true, value: r0?.result?.value };
+                }
+                const CHUNK = 100_000;
+                const totalChunks = Math.ceil(expr.length / CHUNK);
+                const djb2 = (str: string): number => {
+                    let h = 5381;
+                    for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+                    return h >>> 0;
+                };
+                // 逐块推送 + 校验和回执：回执只证"到了几块"不证"内容没坏"
+                // （实测 TM extension.js 各块全到、join 后却语法错误 → 内容级损坏）。
+                // 校验和不匹配时二分降级重发，直到该块的全部碎片校验通过。
+                const pushVerified = async (piece: string, depth: number): Promise<boolean> => {
+                    const exprPush =
+                        "(() => { try {" +
+                        " if (!self.__syBigSrc) self.__syBigSrc = [];" +
+                        " const s = " + JSON.stringify(piece) + ";" +
+                        " self.__syBigSrc.push(s);" +
+                        " let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;" +
+                        " return { len: s.length, sum: h >>> 0, total: self.__syBigSrc.length };" +
+                        " } catch (e) { return { error: String(e && e.message || e) }; } })()";
+                    const r: any = await this.send(
+                        "Runtime.evaluate",
+                        { expression: exprPush, contextId: ctxId, returnByValue: true },
+                        timeoutMs
+                    );
+                    if (r?.exceptionDetails) return false;
+                    const v = r?.result?.value;
+                    if (!v || v.error) return false;
+                    if (v.len === piece.length && v.sum === djb2(piece)) return true;
+                    if (depth >= 6 || piece.length <= 4096) return false;
+                    // 二分降级：坏的尺寸段拆两半分别推（推前清掉这条坏块）
+                    await this.send("Runtime.evaluate", { expression: "self.__syBigSrc.pop()", contextId: ctxId }, timeoutMs);
+                    const mid = Math.floor(piece.length / 2);
+                    return (
+                        (await pushVerified(piece.slice(0, mid), depth + 1)) &&
+                        (await pushVerified(piece.slice(mid), depth + 1))
+                    );
+                };
+                // debugger 通道的大 expression 会"静默无效"（返回 ok 但未执行，实测
+                // TM extension.js 534KB 分 6 块时丢 1 块 → join 后 unterminated 语法
+                // 错误）—— 每块推送后回读 __syBigSrc.length 校验，失败重发。
+                for (let i = 0; i < expr.length; i += CHUNK) {
+                    const piece = expr.slice(i, i + CHUNK);
+                    if (!(await pushVerified(piece, 0))) {
+                        return { ok: false, error: `分块传输失败：chunk ${Math.floor(i / CHUNK) + 1}/${totalChunks} 校验未通过` };
+                    }
+                }
+                // 自包含组合执行器：join → 内容哈希 → eval，失败落 new Function，
+                // 全败时带回内容哈希与首尾样本（一次求值拿全所有诊断，避免跨求值
+                // 的间歇性静默失效干扰定位）
+                const runExpr =
+                    "(() => { try {" +
+                    " const j = self.__syBigSrc.join('');" +
+                    " let h = 5381; for (let i = 0; i < j.length; i++) h = ((h << 5) + h + j.charCodeAt(i)) | 0;" +
+                    " const r = { len: j.length, sum: h >>> 0 };" +
+                    " try { (0, eval)(j); r.viaEval = true; } catch (e1) { r.evalErr = String(e1 && e1.message || e1).slice(0, 160); }" +
+                    " if (!r.viaEval) { try { new Function(j)(); r.viaFn = true; } catch (e2) { r.fnErr = String(e2 && e2.message || e2).slice(0, 160); } }" +
+                    " r.head = j.slice(0, 60); r.tail = j.slice(-60);" +
+                    " return JSON.stringify(r);" +
+                    " } catch (e) { return JSON.stringify({ fatal: String(e && e.message || e).slice(0, 160) }); } })()";
+                const r: any = await this.send(
+                    "Runtime.evaluate",
+                    { expression: runExpr, contextId: ctxId, returnByValue: true, awaitPromise: false },
+                    timeoutMs
+                );
+                let runState: any = null;
+                try { runState = r?.result?.value ? JSON.parse(String(r.result.value)) : null; } catch {}
+                if (!runState || runState.fatal) {
+                    return { ok: false, error: "分块执行器未生效: " + JSON.stringify(runState).slice(0, 200) };
+                }
+                if (runState.viaEval || runState.viaFn) {
+                    return { ok: true, value: undefined };
+                }
                 if (r?.exceptionDetails) {
                     return {
                         ok: false,
-                        error: String(r.exceptionDetails?.exception?.description || r.exceptionDetails?.text || "执行异常").slice(0, 300),
+                        error: `分块 eval 失败: evalErr=${runState.evalErr || "-"} fnErr=${runState.fnErr || "-"} len=${runState.len}/${expr.length} sum=${runState.sum}/${djb2(expr)} head=${runState.head} tail=${runState.tail}`,
                     };
                 }
                 return { ok: true };
@@ -1531,11 +1762,25 @@ class CsPageSession {
         let sid: string | null = null;
         let handler: ((_e: any, method: string, params: any, evtSid?: string) => void) | null = null;
         try {
-            const r = await this.send("Target.getTargets");
-            const infos: any[] = (r && r.targetInfos) || [];
-            const pages = infos.filter((t) => t.type === "webview" || t.type === "page" || t.type === "iframe");
-            const page = pages.find((t) => norm(t.url) === norm(pageUrl))
-                || pages.find((t) => pageUrl && norm(t.url) === norm(pageUrl.split("?")[0]));
+            // 优先用会话自身的 target（Target.getTargetInfo 无参 = 当前 attach 的
+            // target）—— 多个同 URL webview 并存时按 URL 匹配会选错（陈旧目标），
+            // 实测 flat 注入 usInjected=false 假象的根源之一。
+            let page: { targetId: string; url?: string; type?: string } | null = null;
+            try {
+                const own: any = await this.send("Target.getTargetInfo");
+                const ti = own?.targetInfo;
+                if (ti && ti.targetId && (ti.type === "webview" || ti.type === "page" || ti.type === "iframe")) {
+                    page = { targetId: ti.targetId, url: ti.url, type: ti.type };
+                }
+            } catch {}
+            if (!page) {
+                const r = await this.send("Target.getTargets");
+                const infos: any[] = (r && r.targetInfos) || [];
+                const pages = infos.filter((t) => t.type === "webview" || t.type === "page" || t.type === "iframe");
+                page = pages.find((t) => norm(t.url) === norm(pageUrl))
+                    || pages.find((t) => pageUrl && norm(t.url) === norm(pageUrl.split("?")[0]))
+                    || null;
+            }
             if (!page) return { ok: false, error: "未找到页面 CDP target" };
             const a: any = await this.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
             sid = a && a.sessionId;
@@ -1686,6 +1931,12 @@ export function evalInExtensionWorldBridge(webview: IWebviewTag, electronId: str
     return manager.evalExtensionWorldAny(webview, electronId, expr);
 }
 
+/** 确保扩展自建世界存在（chrome.userScripts 注册脚本注入的前置） */
+export async function ensureExtensionWorld(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {
+    if (!manager) throw new Error("cs-runtime 未初始化");
+    return manager.ensureExtensionWorld(webview, ext);
+}
+
 function safeUrl(webview: IWebviewTag): string {
     try {
         return webview.getURL?.() || "";
@@ -1697,7 +1948,13 @@ function safeUrl(webview: IWebviewTag): string {
 // ===== 注入到自建世界的 chrome.* 垫片 =====
 
 function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
-    const extData = JSON.stringify({ id: ext.electronId, name: ext.name, version: ext.version });
+    const extData = JSON.stringify({
+        id: ext.electronId,
+        name: ext.name,
+        version: ext.version,
+        senderPageUrl: ext.senderPageUrl || "",
+        senderTabId: typeof ext.senderTabId === "number" ? ext.senderTabId : null,
+    });
     const messagesJson = JSON.stringify(messages || {});
     return `
 (function () {
@@ -1758,8 +2015,16 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     // storage 本身就走 binding（同一条会挂死的通道，旧方案此处即 25s 桥超时）。
     // 根源方案：把大 JSON 切成 <400KB 的小块逐次过 binding（单块实测安全），
     // 宿主内存拼装后走常规路由（见宿主 route 的 bigmsg-chunk / sendmessage-big）。
+    // sender 身份：popup/扩展页面世界用宿主传入的扩展页 URL（真 Chrome 里
+    // 弹出面板就是 chrome-extension:// 文档）；内容脚本世界回退本页 URL。
+    // senderTabId：内容世界的 tab 归属（真 Chrome 的 sender.tab）。
+    function senderUrl() {
+        try { return EXT.senderPageUrl || String(location.href).slice(0, 300); } catch (e) { return ""; }
+    }
+    function senderTabId() {
+        return (EXT.senderTabId === null || EXT.senderTabId === undefined) ? null : EXT.senderTabId;
+    }
     function sendMessageShim(msg, cb) {
-        var senderUrl = String(location.href).slice(0, 300);
         var json = null;
         try { json = JSON.stringify(msg === undefined ? null : msg); } catch (e) {}
         if (json && json.length > 600000) {
@@ -1775,10 +2040,38 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                 })(i, json.slice(i * CHUNK, (i + 1) * CHUNK));
             }
             return cbStyle(p.then(function () {
-                return hostCall("sendmessage-big", { id: bid, senderUrl: senderUrl });
+                return hostCall("sendmessage-big", { id: bid, senderUrl: senderUrl(), tabId: senderTabId() });
             }), cb);
         }
-        return cbStyle(hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: senderUrl }), cb);
+        return cbStyle(hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: senderUrl(), tabId: senderTabId() }), cb);
+    }
+    // 端口常驻泵（世界侧）：长活端口的回包随时可能到达，而 portmessage 只在发送时
+    // 捎带一轮 outbox 拉取（取到首批即返回）—— GM_xmlhttpRequest 这类"发完就等"的
+    // 端口，真实响应晚数百 ms 到达后无人再取，永久滞留 SW outbox（实测 xhr 回包
+    // 饿死：onload/onerror/ontimeout 全不触发）。泵每 600ms 统一拉取所有开放端口，
+    // busy 标志防 SW 冷启动期求值堆积；无开放端口自动停摆。
+    if (!self.__syEnsurePortPump) {
+        self.__syOpenPorts = {};
+        self.__syEnsurePortPump = function () {
+            if (self.__syPortPump) return;
+            self.__syPortPump = setInterval(function () {
+                if (self.__syPumpBusy) return;
+                var ids = Object.keys(self.__syOpenPorts || {});
+                if (!ids.length) { clearInterval(self.__syPortPump); self.__syPortPump = 0; return; }
+                self.__syPumpBusy = true;
+                hostCall("portpoll", { ids: ids }).then(function (groups) {
+                    if (Array.isArray(groups)) {
+                        for (var i = 0; i < groups.length; i++) {
+                            var g = groups[i];
+                            var p = (self.__syOpenPorts || {})[g && g.portId];
+                            if (p && Array.isArray(g.msgs)) {
+                                for (var j = 0; j < g.msgs.length; j++) p.onMessage.dispatch(g.msgs[j]);
+                            }
+                        }
+                    }
+                }).catch(function () {}).then(function () { self.__syPumpBusy = false; });
+            }, 600);
+        };
     }
     // 内核请求代理：https 页面的隔离世界 fetch http://127.0.0.1/<localhost> 是
     // mixed content，直接 "Failed to fetch"（实测 Clip 发送/笔记本列表全挂）。
@@ -1888,7 +2181,8 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                         portId: portId,
                         portName: (info && info.name) || "",
                         msg: msg === undefined ? null : msg,
-                        senderUrl: String(location.href).slice(0, 300),
+                        senderUrl: senderUrl(),
+                        tabId: senderTabId(),
                     }).then(function (resp) {
                         if (Array.isArray(resp)) {
                             resp.forEach(function (item) { port.onMessage.dispatch(item); });
@@ -1897,8 +2191,13 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                         }
                     }).catch(function () {});
                 },
-                disconnect: function () {},
+                disconnect: function () { delete (self.__syOpenPorts || {})[portId]; },
             };
+            // 注册进常驻泵：xhr/values 这类端口的响应到达时间与发送解耦，
+            // 只靠 portmessage 捎带轮询会滞留 outbox（见 __syEnsurePortPump 注释）
+            self.__syOpenPorts = self.__syOpenPorts || {};
+            self.__syOpenPorts[portId] = port;
+            self.__syEnsurePortPump();
             return port;
         }),
         // 长连接/生命周期事件（AdGuard 的 MessengerCommon.connect 直接用 onConnect）
@@ -1934,14 +2233,91 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         getMessage: function (key, args) {
             var entry = MESSAGES[key];
             var msg = entry ? (entry.message || "") : "";
+            if (!msg) return "";
+            var arr = args == null ? [] : (Array.isArray(args) ? args : [args]);
+            // named placeholders（$name$）：按 entry.placeholders[name].content 解析，
+            // content 自身可为 "$1" 数字引用或常量文本（实测 TM options 页头
+            // "Tampermonkey® by $name$" —— 缺这段占位符原文直接进 DOM）
+            var ph = entry && entry.placeholders;
+            if (ph) {
+                msg = msg.replace(/\\$([A-Za-z_][A-Za-z0-9_]*)\\$/g, function (m, name) {
+                    var p = ph[name];
+                    if (!p) return m;
+                    var c = String(p.content == null ? "" : p.content);
+                    return c.replace(/\\$(\\d+)/g, function (m2, i2) {
+                        var v = arr[Number(i2) - 1];
+                        return v != null ? String(v) : m2;
+                    });
+                });
+            }
             if (msg && args != null) {
-                var arr = Array.isArray(args) ? args : [args];
-                msg = msg.replace(/\\$(\\d+)/g, function (m, i) { return arr[Number(i) - 1] != null ? arr[Number(i) - 1] : m; });
+                var arr2 = Array.isArray(args) ? args : [args];
+                msg = msg.replace(/\\$(\\d+)/g, function (m, i) { return arr2[Number(i) - 1] != null ? arr2[Number(i) - 1] : m; });
             }
             return msg;
         },
         getUILanguage: function () { return navigator.language; },
+        // TM popup 初始化会调它并把 undefined 视为错误分支（"getAcceptLanguages
+        // returned undefined"）—— 返回浏览器语言列表即可
+        getAcceptLanguages: function (cb) {
+            var langs = (navigator.languages && navigator.languages.length) ? navigator.languages.slice() : [navigator.language || "en"];
+            return cbStyle(Promise.resolve(langs), cb);
+        },
     };
+    // 新标签页扩展数据适配：Electron 无 topSites/bookmarks/history API，
+    // Momentum/Infinity 类新标签页扩展靠它们渲染起始页内容 —— 由宿主用
+    // 插件自己的历史/书签库代答（hostCall "usdata"，见宿主路由）。
+    chrome_.topSites = {
+        get: traced("topSites.get", function (cb) {
+            var p = hostCall("usdata", { kind: "topSites" }).then(function (v) { return Array.isArray(v) ? v : []; });
+            return cbStyle(p, cb);
+        }),
+    };
+    chrome_.bookmarks = (function () {
+        var ev = { onChanged: eventHub(), onCreated: eventHub(), onRemoved: eventHub(), onMoved: eventHub(), onChildrenReordered: eventHub(), onImportBegan: eventHub(), onImportEnded: eventHub() };
+        var api = {
+            getTree: traced("bookmarks.getTree", function (cb) { return cbStyle(hostCall("usdata", { kind: "bookmarkTree" }), cb); }),
+            getChildren: function (id, cb) {
+                return cbStyle(hostCall("usdata", { kind: "bookmarkTree" }).then(function (t) {
+                    function find(nodes) {
+                        for (var i = 0; i < (nodes || []).length; i++) {
+                            if (String(nodes[i].id) === String(id)) return nodes[i].children || [];
+                            if (nodes[i].children) { var r = find(nodes[i].children); if (r) return r; }
+                        }
+                        return null;
+                    }
+                    return Promise.resolve(find(t) || []);
+                }), cb);
+            },
+            getRecent: function (n, cb) {
+                return cbStyle(hostCall("usdata", { kind: "bookmarkRecent", n: Number(n) || 10 }).then(function (list) { return Array.isArray(list) ? list : []; }), cb);
+            },
+            search: function (q, cb) {
+                return cbStyle(hostCall("usdata", { kind: "bookmarkSearch", query: typeof q === "string" ? q : String((q && q.query) || "") }).then(function (list) { return Array.isArray(list) ? list : []; }), cb);
+            },
+            create: function (bm, cb) { return cbStyle(Promise.reject(new Error("bookmarks.create 未适配（只读）")), cb); },
+            remove: function (id, cb) { return cbStyle(Promise.resolve(), cb); },
+            update: function (id, chg, cb) { return cbStyle(Promise.resolve(), cb); },
+            move: function (id, dest, cb) { return cbStyle(Promise.resolve(), cb); },
+        };
+        for (var k in ev) api[k] = ev[k];
+        return api;
+    })();
+    chrome_.history = (function () {
+        var ev = { onVisited: eventHub(), onVisitRemoved: eventHub(), onChanged: eventHub(), onDeleteUrls: eventHub(), onDeleteRange: eventHub(), onDeleteAll: eventHub() };
+        var api = {
+            search: traced("history.search", function (query, cb) {
+                return cbStyle(hostCall("usdata", { kind: "historySearch", query: query === undefined ? null : query }).then(function (list) { return Array.isArray(list) ? list : []; }), cb);
+            }),
+            getVisits: function (q, cb) { return cbStyle(Promise.resolve([]), cb); },
+            addUrl: function (q, cb) { return cbStyle(Promise.resolve(), cb); },
+            deleteUrl: function (q, cb) { return cbStyle(Promise.resolve(), cb); },
+            deleteRange: function (q, cb) { return cbStyle(Promise.resolve(), cb); },
+            deleteAll: function (cb) { return cbStyle(Promise.resolve(), cb); },
+        };
+        for (var k2 in ev) api[k2] = ev[k2];
+        return api;
+    })();
     // 通用桩工厂：任意层级的缺失成员都能继续访问/调用（方法返回 Promise<undefined>），
     // 防止 undefined.addListener 之类在扩展初始化期直接崩掉
     var PROMISE_UNDEF = function () { return Promise.resolve(undefined); };
@@ -1987,7 +2363,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             },
             // 派发到本扩展 content 世界的 onMessage 监听器（宿主中转；SW↔CS 路由缺失的替代）
             sendMessage: function (tabId, msg, cb) {
-                var p = hostCall("tabs-sendmessage", { tabId: typeof tabId === "number" ? tabId : null, msg: msg === undefined ? null : msg, senderUrl: String(location.href).slice(0, 300) });
+                var p = hostCall("tabs-sendmessage", { tabId: typeof tabId === "number" ? tabId : null, msg: msg === undefined ? null : msg, senderUrl: senderUrl() });
                 return cbStyle(p, typeof cb === "function" ? cb : undefined);
             },
         };
