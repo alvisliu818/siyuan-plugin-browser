@@ -330,7 +330,7 @@ export class BrowserTab {
                 cb({});
             }
         });
-        // 2. 请求头：为出站请求注入 Referer，绕过 CDN 防盗链
+        // 2. 请求头：商店域名 UA 伪装 + Referer 注入（绕过 CDN 防盗链）
         //    站点 CDN 检测到空 Referer 会返回 403（X-Error-Info: EmptyReferer）
         session.webRequest.onBeforeSendHeaders((details: any, cb: (r: any) => void) => {
             const reqUrl = details.url || "";
@@ -339,23 +339,6 @@ export class BrowserTab {
                 return;
             }
             try {
-                const referrer = details.referrer || "";
-                // 已有合法 http(s) referer → 不改
-                if (referrer && /^https?:\/\//i.test(referrer)) {
-                    cb({});
-                    return;
-                }
-                // 用当前 webview URL 作为 Referer
-                const current = this.webview.getURL?.() || "";
-                let refUrl = "";
-                if (current && /^https?:\/\//i.test(current)) {
-                    refUrl = current;
-                }
-                if (!refUrl) {
-                    const target = new URL(reqUrl);
-                    refUrl = target.origin + "/";
-                }
-                // requestHeaders 应为 Record<string, string>，值一律归一为字符串
                 const headers: Record<string, string> = {};
                 if (details?.requestHeaders) {
                     for (const k of Object.keys(details.requestHeaders)) {
@@ -363,7 +346,25 @@ export class BrowserTab {
                         headers[k] = Array.isArray(v) ? String(v[0]) : String(v);
                     }
                 }
-                headers["Referer"] = refUrl;
+                // 2a) UA：商店域名伪装 Edge（webview 的 setUserAgent 需要 attach+dom-ready，
+                //     首导航请求的 UA 头只能在这里改 —— 不依赖 webview 就绪状态）
+                const ua = this.uaForRequest(reqUrl);
+                if (ua) headers["User-Agent"] = ua;
+                // 2b) Referer：已有合法 http(s) referer → 不改
+                const referrer = details.referrer || "";
+                if (!(referrer && /^https?:\/\//i.test(referrer))) {
+                    // 用当前 webview URL 作为 Referer
+                    const current = this.webview.getURL?.() || "";
+                    let refUrl = "";
+                    if (current && /^https?:\/\//i.test(current)) {
+                        refUrl = current;
+                    }
+                    if (!refUrl) {
+                        const target = new URL(reqUrl);
+                        refUrl = target.origin + "/";
+                    }
+                    headers["Referer"] = refUrl;
+                }
                 cb({ requestHeaders: headers });
             } catch {
                 cb({});
@@ -388,6 +389,18 @@ export class BrowserTab {
         this.applyPreload();
     }
 
+    /** 请求级 UA（webRequest 层用，不依赖 webview 就绪状态）：
+     *  商店域名恒伪装 Edge；其余仅在用户自定义 UA 时注入（无自定义时不动 UA，
+     *  让 Chromium 自带默认 —— 此时 defaultUserAgent 可能尚未捕获，注入会污染）。 */
+    private uaForRequest(reqUrl: string): string | null {
+        try {
+            if (isEdgeAddonsSiteUrl(reqUrl)) return EDGE_UA;
+            return this.settings.userAgent || null;
+        } catch {
+            return null;
+        }
+    }
+
     /**
      * 按目标 URL 切换 webview UA。
      * Edge 加载项商店会 UA 嗅探：非 Edge 浏览器直接禁用「获取」按钮并提示
@@ -404,6 +417,13 @@ export class BrowserTab {
         try {
             const isStore = isEdgeAddonsSiteUrl(url);
             if (!isStore && !this.edgeUaActive) return;
+            // webview 未入 DOM 或尚未 dom-ready 时所有 webview 方法都抛
+            // "The WebView must be attached to the DOM and the dom-ready event
+            // emitted..."（构造期由思源 addTab 同步路径调到这里必中）。
+            // 此时无法也不需要设置：首次导航完成触发 onUrlChange 会再调本方法补上，
+            // 首请求的 UA 头由 webRequest 拦截器（stripSiteSecurityHeaders）兜底。
+            if (!this.webview.isConnected || typeof (this.webview as any).getWebContentsId !== "function") return;
+            if (typeof (this.webview as any).getWebContentsId?.() !== "number") return;
             if (!this.defaultUserAgent) {
                 this.defaultUserAgent =
                     (this.webview as any).getUserAgent?.() ||

@@ -489,8 +489,36 @@ export class ExtensionHost {
 `;
                 fs.writeFileSync(abs, shim + src, "utf8");
                 changedShimCount++;
-            } catch {
-                // 单个扩展垫片失败不影响其它
+            } catch (e) {
+                // 单个扩展垫片失败不影响其它 —— 但必须留痕：静默吞掉会让扩展
+                // 以无垫片状态长期运行（实测 TM 2026-10-09 起三周无垫片、SW
+                // handlers 恒空、油猴消息全挂，因每次启动注入都失败而无感知）。
+                console.warn("[browser-plugin] injectBackgroundShims failed for",
+                    ext.name || ext.path, ":", e instanceof Error ? e.message : e);
+                // 大文件瞬时锁（Defender/索引服务）常亚秒级消失：延迟重试一次
+                try {
+                    await new Promise((r) => setTimeout(r, 500));
+                    const manifest2 = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
+                    const swPath2 = manifest2.background?.service_worker;
+                    const abs2 = swPath2 ? path.join(ext.path, swPath2) : "";
+                    const src2 = abs2 ? fs.readFileSync(abs2, "utf8") : "";
+                    const needsShim2 = !!src2 && /contextMenus|userScripts|notifications|webNavigation|alarms|omnibox|declarativeNetRequest|cookies|browserAction|browser_action|chrome\.(commands|action|downloads)/.test(src2);
+                    if (src2 && needsShim2 && !src2.startsWith(SHIM_MARK)) {
+                        const shim2 = SHIM_MARK + shimBody;
+                        let original2 = src2;
+                        if (/^\/\* sy-bg-shim:v\d+[^*]*\*\//.test(original2)) {
+                            const endMark2 = "/* sy-bg-shim-end */";
+                            const ei2 = original2.lastIndexOf(endMark2);
+                            if (ei2 >= 0) original2 = original2.slice(ei2 + endMark2.length).replace(/^\s*\n/, "");
+                        }
+                        fs.writeFileSync(abs2, shim2 + original2, "utf8");
+                        changedShimCount++;
+                        console.warn("[browser-plugin] injectBackgroundShims retry ok:", ext.name || ext.path);
+                    }
+                } catch (e2) {
+                    console.warn("[browser-plugin] injectBackgroundShims retry failed for",
+                        ext.name || ext.path, ":", e2 instanceof Error ? e2.message : e2);
+                }
             }
         }
         if (changedShimCount > 0) {
@@ -782,6 +810,13 @@ export class ExtensionHost {
             ext.native = false;
             ext.nativeError = undefined;
             try {
+                // 装前先把垫片写进磁盘（新扩展目录已在 this.extensions 中）：
+                // loadExtension 后 SW 从磁盘文件启动，无垫片的 SW 一起来就缺
+                // handlers 收集数组（实测：会话中途安装的扩展要等下次重启注入
+                // 成功才能用，期间消息全挂）。注入幂等，顺带修复其它缺失项；
+                // 若触发了换版重写（changedShim>0 会 unload 全部原生扩展），
+                // 由随后的 reconcileNative 统一恢复。
+                await this.injectBackgroundShims();
                 const ses = remoteSession();
                 if (ses) {
                     const existing = (ses.getAllExtensions?.() || []).find((x: any) => x.path === ext.path);
@@ -793,6 +828,7 @@ export class ExtensionHost {
             } catch (e: any) {
                 ext.nativeError = String(e?.message || e);
             }
+            await this.reconcileNative();
             await this.persist();
             return { ok: true, ext };
         } catch (e: any) {
