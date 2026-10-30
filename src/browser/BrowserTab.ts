@@ -15,7 +15,7 @@ import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage, injectExtensionPageRuntime } from "./ext-popup";
 import { evalInExtensionWorld } from "../extensions/sw-bridge";
-import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
@@ -36,6 +36,8 @@ export interface BrowserTabDeps {
     injectExtensions?: (webview: IWebviewTag, url: string) => void;
     /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发） */
     installEdgeExtension?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
+    /** 解析新页签起始 URL（主页 vs 新标签页扩展页面），由插件主实例提供 */
+    resolveStartUrl?: () => string;
 }
 
 /**
@@ -52,6 +54,11 @@ export class BrowserTab {
     private disposed = false;
     /** webview 重建中标记（防止重复重建） */
     private rebuilding = false;
+    /** 扩展整页垫片注入中（maybeInjectExtensionPage）：重建式注入是受控的重活
+     *  （几百 KB DOM/CSS 写入 + 巨型 background 重放，主线程秒级繁忙），
+     *  健康监测的 800ms executeJavaScript 探测必超时 —— 不挂起会误判 broken
+     *  触发 rebuild 循环（实测 TM options 页打开即洗白）。 */
+    private extPageInjecting = false;
     /** webview 健康监测定时器 */
     private healthTimer: any = null;
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
@@ -135,6 +142,11 @@ export class BrowserTab {
                 },
                 onEdgeInstall: (id: string, source: string) =>
                     this.deps.installEdgeExtension?.(id, source) ?? Promise.resolve(),
+                onProcessGone: (reason: string) => {
+                    if (this.disposed || this.rebuilding) return;
+                    console.warn("[browser-plugin] webview crashed (" + reason + "), rebuilding webview");
+                    void this.rebuildWebview();
+                },
             },
         });
 
@@ -375,7 +387,9 @@ export class BrowserTab {
 
     private async init(initialUrl?: string): Promise<void> {
         console.log("[browser-plugin] BrowserTab.init, initialUrl:", initialUrl);
-        const start = initialUrl || this.settings.homepage;
+        // 显式 URL（含恢复的页签 data.url）优先；无 URL 时按「新标签页扩展」设置解析
+        // （配置了新标签页扩展则加载其 newtab 页，否则主页）
+        const start = initialUrl || this.deps.resolveStartUrl?.() || this.settings.homepage || "about:blank";
         if (start && start !== "about:blank") {
             // 先切好 UA 再发首次请求（商店域名需伪装 Edge，否则页内禁用「获取」按钮）
             this.syncUserAgent(start);
@@ -507,13 +521,37 @@ export class BrowserTab {
             version: ext.version,
             defaultLocale: ext.defaultLocale,
             contentScripts: ext.contentScripts,
+            // popup 世界寄生在宿主页面里（location.href 是页面 URL），但真 Chrome
+            // 的弹出面板 sender 是扩展文档 —— SW 侧按 sender.url 判 extpage 白名单
+            //（TM 的 hints/syncInfo/tabWatch 等 allow:{extpage:!0}，不符即静默丢弃
+            // → 面板空等不渲染），必须以扩展页 URL 身份发包。
+            senderPageUrl: "chrome-extension://" + ext.electronId + "/" + String(ext.popupPath).replace(/^\.\//, ""),
         };
+        // TM 的 popup 自己不调 chrome.tabs.query，靠 SW 侧 getSelected 解析当前
+        // 页签 —— 宿主主动喂一次 tabevent（喂的是"面板锚定的页签"，即本页）。
+        // 必须等喂完再放行面板：loadTree 会在面板 JS 启动后立刻发出，抢跑的话
+        // SW 侧活动页签还是空 → 面板无 tab 上下文（no access）。限时防挂。
+        // （★ 此块必须位于 extInfo 声明之后 —— 初版放在前面踩了 TDZ，
+        //   "Cannot access 's' before initialization" 被 catch 吞成静默失败。）
+        try {
+            const curUrl = String(this.webview.getURL?.() || "");
+            const curTitle = String((this.webview as any).getTitle?.() || document.title || "");
+            if (/^https?:\/\//i.test(curUrl)) {
+                await Promise.race([
+                    feedTabEventForPopup(this.webview, extInfo, curUrl, curTitle),
+                    new Promise((r2) => setTimeout(r2, 3000)),
+                ]);
+            }
+        } catch {}
         const out = await showExtensionPopupInPage({
             webview: this.webview,
             extPath: ext.path,
             electronId: ext.electronId,
             popupPath: ext.popupPath,
             anchorRect: { right: r.right, bottom: r.bottom },
+            // 引导分支伪装：TM 等扩展的 popup 按 location.pathname 分派（/action →
+            // popup 分支），宿主页面路径不对则引导整段跳过、UI 只有壳
+            spoofLocationUrl: "chrome-extension://" + ext.electronId + "/" + String(ext.popupPath).replace(/^\.\//, ""),
             begin: () => beginPopupWorld(this.webview, extInfo),
             evalJs: (src, relPath) => {
                 const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
@@ -538,6 +576,12 @@ export class BrowserTab {
      */
     private async maybeInjectExtensionPage(url: string): Promise<void> {
         try {
+            // loadURL 改道（chrome-extension:// 不原生加载）落地的 about:blank：
+            // 换成改道目标 URL 继续注入（pendingExtPageUrl 由 WebviewController.loadURL
+            // 设置，离开扩展页时清空）
+            if ((!url || /^about:blank$/i.test(url)) && this.controller.pendingExtPageUrl) {
+                url = this.controller.pendingExtPageUrl;
+            }
             if (!url || !/^chrome-extension:\/\//i.test(url)) return;
             const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)(\/[^?#]*)?/i);
             if (!m) return;
@@ -554,23 +598,50 @@ export class BrowserTab {
                 version: ext.version,
                 defaultLocale: ext.defaultLocale,
                 contentScripts: ext.contentScripts,
+                // 与 popup 路径同理由：SW 侧按 sender.url 判 extpage 白名单
+                //（TM loadTree 等 allow 门禁 `mp(t)&&("options"==t.extpage||…)`，
+                // 改道重建场景页面真实 URL 是 about:blank → sender 塌成 about:blank
+                // → 门禁拒绝 → sendMessage 回布尔 false → TM 引导走 fail → confirm）。
+                // 必须以扩展页 URL 身份发包（含 hash 保留深链语义）。
+                senderPageUrl: url,
             };
-            const out = await injectExtensionPageRuntime({
-                webview: this.webview,
-                extPath: ext.path,
-                electronId: ext.electronId,
-                pagePath,
-                begin: () => beginPopupWorld(this.webview, extInfo),
-                evalJs: (src, relPath) => {
-                    const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
-                    const prefixed =
-                        "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
-                    return evalPopupJs(this.webview, extInfo, prefixed).then((rr) => {
-                        if (!rr.ok) throw new Error(rr.error);
-                        return rr.value;
+            const out = await (async () => {
+                this.extPageInjecting = true;
+                try {
+                    return await injectExtensionPageRuntime({
+                        webview: this.webview,
+                        extPath: ext.path,
+                        electronId: ext.electronId,
+                        pagePath,
+                        // 改道重建场景页面真实 location 是 about:blank，TM 等按
+                        // pathname 分派引导分支会静默空转 —— 伪装成目标 URL
+                        spoofLocationUrl: url,
+                        // Electron 44 实测 webview 加载 chrome-extension:// 被拒（退
+                        // about:blank），页面 DOM/CSS 不会原生存在。不能按当前 URL 判断
+                        // —— dom-ready 触发时 getURL() 可能还是目标 URL（随后才被洗成
+                        // about:blank，注入全被冲掉）。直接探页面实际 DOM：空页即重建。
+                        rebuildDom: await (async () => {
+                            try {
+                                const len = await this.webview.executeJavaScript(
+                                    "(document.body ? document.body.innerHTML.length : -1)", false);
+                                return typeof len !== "number" || len < 10;
+                            } catch { return true; }
+                        })(),
+                        begin: () => beginPopupWorld(this.webview, extInfo),
+                        evalJs: (src, relPath) => {
+                            const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
+                            const prefixed =
+                                "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
+                            return evalPopupJs(this.webview, extInfo, prefixed).then((rr) => {
+                                if (!rr.ok) throw new Error(rr.error);
+                                return rr.value;
+                            });
+                        },
                     });
-                },
-            });
+                } finally {
+                    this.extPageInjecting = false;
+                }
+            })();
             if (!out.ok) {
                 console.warn("[browser-plugin] 扩展页面垫片注入失败(" + pagePath + "):", out.error);
             } else {
@@ -650,12 +721,29 @@ export class BrowserTab {
     private startHealthMonitor(): void {
         if (this.healthTimer) return;
         this.healthTimer = setInterval(async () => {
-            if (this.disposed || this.rebuilding) return;
+            if (this.disposed || this.rebuilding || this.extPageInjecting) return;
             // 首次加载完成前、以及任何导航进行中都不探测：
             // 加载期间页面主线程繁忙/进程切换会让 executeJavaScript 探测超时，
             // 新页签初始 src 是 about:blank，此时误判重建会让页签永远停在空白页
-            if (!this.controller.hasCompletedInitialLoad() || this.controller.isLoading()) return;
+            if (!this.controller.hasCompletedInitialLoad() || this.controller.isLoading()) {
+                // 卡死看门狗：加载中时 did-stop-loading 丢失（如加载中途渲染进程
+                // 崩溃且未收到 render-process-gone、或站点 JS 对话框卡死主线程），
+                // isLoading() 永远为 true，健康监测被永久跳过 —— 页面停在空白且
+                // 永不恢复。超过 90s 仍处于 loading 视为卡死，强制重建恢复。
+                if (this.controller.loadingDurationMs() > 90_000 && !this.disposed && !this.rebuilding) {
+                    console.warn("[browser-plugin] webview loading stuck >90s, rebuilding");
+                    await this.rebuildWebview();
+                }
+                return;
+            }
             try {
+                // 垫片页（chrome-extension://，加载被 Electron 拒绝、内容全靠
+                // maybeInjectExtensionPage 重建）跳过自动 rebuild：rebuild 恢复
+                // 不了"加载被拒"——重建后 loadURL 依旧失败，还得重注入，唯一
+                // 效果是把刚渲染好的页面洗成空白（实测 TM options 打开即循环洗白）。
+                // 这类页真损坏时的恢复手段是重开页签（或后续做重注入）。
+                const curUrl = this.controller.getCurrentUrl?.() || "";
+                if (/^chrome-extension:\/\//i.test(curUrl)) return;
                 const healthy = await this.controller.isHealthy();
                 if (!healthy && !this.disposed && !this.rebuilding) {
                     // 连续两次失败才判定损坏，避免偶发超时误判
@@ -750,7 +838,7 @@ export class BrowserTab {
         this.updateBookmarkButton(url);
     }
 
-    /** 在系统默认浏览器中打开当前页面 URL */
+    /** 在系统默认浏览器中打开当前页面 URL（走插件主实例，绕过链接拦截 patch） */
     private async openInDefaultBrowser(): Promise<void> {
         const url = this.controller.getCurrentUrl();
         if (!url || !/^https?:\/\//i.test(url)) {
@@ -758,13 +846,18 @@ export class BrowserTab {
             return;
         }
         try {
-            const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
-            const shell = electron?.shell;
-            if (shell?.openExternal) {
-                await shell.openExternal(url);
+            const plugin = (window as any).browserPlugin;
+            if (plugin?.openInSystemBrowser) {
+                plugin.openInSystemBrowser(url);
             } else {
-                // 回退：用思源的方式打开
-                window.open(url, "_blank");
+                const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
+                const shell = electron?.shell;
+                if (shell?.openExternal) {
+                    await shell.openExternal(url);
+                } else {
+                    // 回退：用思源的方式打开
+                    window.open(url, "_blank");
+                }
             }
         } catch (e) {
             console.warn("[browser-plugin] openInDefaultBrowser failed:", e);

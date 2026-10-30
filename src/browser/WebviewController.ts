@@ -29,6 +29,8 @@ export class WebviewController {
         onExcerpt?: (mode: "article" | "part") => void;
         /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
+        /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
+        onProcessGone?: (reason: string) => void;
     };
     private disposed = false;
     private listeners: Array<{ type: string; fn: (e: any) => void }> = [];
@@ -44,17 +46,57 @@ export class WebviewController {
     private lastKnownUrl = "";
     /** 是否有导航正在进行（健康监测在加载期间跳过，避免误判） */
     private loading = false;
+    /** 本次 loading 的开始时间（卡死看门狗用：did-stop-loading 丢失时判定卡死） */
+    private loadingSince = 0;
     /** 首次加载是否已完成（完成前不做健康监测，新页签初始 src 是 about:blank） */
     private hasLoadedOnce = false;
     /** 扩展内容脚本注入回调（dom-ready 时触发） */
     onDomReady?: (webview: IWebviewTag, url: string) => void;
+    /**
+     * 改道待注入的扩展整页 URL。chrome-extension:// 页**不原生加载**（见 loadURL
+     * 注释），落 about:blank 后由 dom-ready → maybeInjectExtensionPage 用此 URL
+     * 重建。不为 null 时 about:blank 的导航事件按目标 URL 语义上报。
+     */
+    pendingExtPageUrl: string | null = null;
 
     isLoading(): boolean {
         return this.loading;
     }
 
+    /**
+     * 是否本插件管理的扩展的整页 URL。只有管理的扩展才改道 —— 非管理的
+     * （宿主未注册或非原生加载）交给 Electron 原生行为，改道只会让页面空白。
+     */
+    private isManagedExtPage(url: string): boolean {
+        if (!url || !/^chrome-extension:\/\//i.test(url)) return false;
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            const list = host?.list?.() || [];
+            // ★ 启动竞态防御：宿主数据未就绪（页签恢复早于 extensionHost.load()
+            // 完成，list 为空 / electronId 未回填）时**保守按管理页处理**。
+            // 本 webview partition 的扩展全部由本插件装入，不存在第三方
+            // chrome-extension:// —— 放行只会撞上 Electron 的非确定性原生加载：
+            // 主世界跑扩展脚本、preload 在扩展页不生效（实测），引导失败即弹
+            // 原生 confirm 同步阻塞（实测 4 连框假死）。误拦的代价只是垫片
+            // 未就绪时短暂空白，可接受。
+            if (!host || (typeof host.isLoaded === "function" ? !host.isLoaded() : list.length === 0)) {
+                return true;
+            }
+            const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)/i);
+            if (!m) return false;
+            return list.some((e: any) => e.electronId === m[1] && e.native);
+        } catch {
+            return true;
+        }
+    }
+
     hasCompletedInitialLoad(): boolean {
         return this.hasLoadedOnce;
+    }
+
+    /** 当前 loading 已持续毫秒数（未在加载时返回 0） */
+    loadingDurationMs(): number {
+        return this.loading && this.loadingSince > 0 ? Date.now() - this.loadingSince : 0;
     }
 
     constructor(
@@ -136,11 +178,13 @@ export class WebviewController {
     attach(): void {
         this.on("did-start-loading", () => {
             this.loading = true;
+            this.loadingSince = Date.now();
             this.callbacks.onLoadingChange(true);
             this.faviconEverSet = false;
         });
         this.on("did-stop-loading", () => {
             this.loading = false;
+            this.loadingSince = 0;
             this.hasLoadedOnce = true;
             this.callbacks.onLoadingChange(false);
             // 兜底：通过 executeJavaScript 注入链接拦截器（即使 preload 失效也能工作）
@@ -148,9 +192,37 @@ export class WebviewController {
             // 兜底：若 page-favicon-updated 未触发，尝试用站点 favicon.ico
             this.maybeFallbackFavicon();
         });
+        this.on("render-process-gone", (e) => {
+            // 渲染进程崩溃（站点 bug / 内存压力被系统杀掉 / GPU 异常）后 guest 变成
+            // 空白页；若此时处于加载中，did-stop-loading 不会再触发，健康监测会因
+            // isLoading() 永久跳过 —— 页面永远停在空白。这里立即复位加载状态并
+            // 通知宿主重建 webview（BrowserTab 用 lastKnownUrl 恢复）。
+            const reason = e?.reason || "unknown";
+            const exitCode = e?.exitCode;
+            console.warn("[browser-plugin] webview render process gone:", reason, "exitCode:", exitCode);
+            this.loading = false;
+            this.loadingSince = 0;
+            this.callbacks.onLoadingChange(false);
+            this.callbacks.onProcessGone?.(reason);
+        });
         this.on("did-navigate", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            // 改道落地的 about:blank（含 hash 后缀 —— 伪装 location 的 hash 写穿透
+            // 会改真实 URL）：lastKnownUrl 保持目标 URL，地址栏也按目标 URL 语义上报
+            //（健康监测 skip 条件与 rebuildWebview 恢复都依赖它）
+            if (this.pendingExtPageUrl && /^about:blank/i.test(url)) {
+                this.callbacks.onUrlChange(this.pendingExtPageUrl + (url.includes("#") ? url.slice(url.indexOf("#")) : ""));
+                return;
+            }
+            // ★ 漏网回收：无论哪条路径（src 直赋 / 未拦截导航）让 guest 真落地了
+            // chrome-extension://，立即改道走垫片路径 —— 不给主世界扩展脚本跑
+            // 引导的机会（原生 confirm 无 hook 会同步阻塞整页，见 loadURL 注释）。
+            if (/^chrome-extension:\/\//i.test(url)) {
+                console.warn("[browser-plugin] native ext page load leaked, redirecting:", url);
+                void this.loadURL(url);
+                return;
+            }
             if (url && !url.startsWith("data:")) this.lastKnownUrl = url;
             this.callbacks.onUrlChange(url);
             this.maybeRecordHistory(url);
@@ -158,6 +230,10 @@ export class WebviewController {
         this.on("did-navigate-in-page", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            if (this.pendingExtPageUrl && /^about:blank/i.test(url)) {
+                this.callbacks.onUrlChange(this.pendingExtPageUrl);
+                return;
+            }
             if (url && !url.startsWith("data:")) this.lastKnownUrl = url;
             this.callbacks.onUrlChange(url);
             this.maybeRecordHistory(url);
@@ -171,6 +247,10 @@ export class WebviewController {
                 const url = this.webview.getURL?.() || "";
                 if (/^(https?:|chrome-extension:)\/\//i.test(url)) {
                     this.onDomReady?.(this.webview, url);
+                } else if (/^about:blank/i.test(url) && this.pendingExtPageUrl) {
+                    // loadURL 改道落地的 about:blank：换成改道目标 URL 通知宿主，
+                    // 由 maybeInjectExtensionPage 走磁盘重建 + 隔离世界重放
+                    this.onDomReady?.(this.webview, this.pendingExtPageUrl);
                 }
             } catch {}
         });
@@ -219,6 +299,15 @@ export class WebviewController {
             if (!url) return;
             // Edge 商店"获取"按钮落点（microsoft-edge: 协议 / CRX 直链）→ 安装而非导航
             if (this.tryEdgeInstall(url, "will-navigate", () => e.preventDefault?.())) return;
+            // 本插件管理的扩展整页：页内导航（location.href / 链接点击）同样改道，
+            // 与 loadURL 同一机制 —— 不让主世界原生跑扩展脚本
+            if (this.isManagedExtPage(url)) {
+                console.log("[browser-plugin] will-navigate redirect ext page:", url);
+                e.preventDefault?.();
+                this.programmaticNav = false; // 复位，让 loadURL 的改道自己置位
+                void this.loadURL(url);
+                return;
+            }
             // 编程导航（loadURL 发起）直接放行，不拦截
             if (this.programmaticNav) {
                 this.callbacks.onUrlChange(url);
@@ -323,6 +412,40 @@ export class WebviewController {
     /** 加载 URL（编程导航，will-navigate 会放行） */
     async loadURL(url: string): Promise<void> {
         console.log("[browser-plugin] loadURL:", url);
+        // ★ chrome-extension:// 整页改道（本插件管理的扩展）：**不原生加载**。
+        // Electron 44 的 webview 对该协议"有时"能原生加载成功（非确定性！实测
+        // 同一 URL 反复开关结果不同），一旦成功，页面脚本跑在主世界 —— 那里
+        // chrome.* 是 Electron 原生受限版（sendMessage 报 Receiving end does not
+        // exist / SW 冷启动窗口内拿到无 items 无 error 的空回包），扩展引导或
+        // loadTree 走 fail 分支时 window.confirm 会弹**原生同步对话框**阻塞渲染
+        // 线程（实测 TM Dashboard："An internal error occurred" 弹框整页假死，
+        // CDP evaluate/Debugger 全部超时）。改道后统一走确定性路径：
+        // about:blank → dom-ready → maybeInjectExtensionPage 磁盘重建 + 隔离
+        // 世界重放（PRELUDE 已 hook confirm，主世界从此没有扩展脚本）。
+        if (this.isManagedExtPage(url)) {
+            this.pendingExtPageUrl = url;
+            this.lastKnownUrl = url;
+            this.callbacks.onUrlChange(url);
+            let cur = "";
+            try { cur = this.webview.getURL?.() || ""; } catch {}
+            if (cur && cur !== "about:blank") {
+                // 正在别的页面：导航去 about:blank，dom-ready 后由宿主重建
+                this.programmaticNav = true;
+                this.webview.src = "about:blank";
+            } else if (this.hasLoadedOnce) {
+                // 已在 about:blank 且首载完成：src 重指派不保证触发新 dom-ready，
+                // 直接调注入回调（未 dom-ready 时 executeJavaScript 会被
+                // maybeInjectExtensionPage 的 try/catch 吸收，不产生副作用）
+                this.onDomReady?.(this.webview, url);
+            }
+            // 未 attach / 首载未完成：初始 src=about:blank 加载完成后 dom-ready
+            // 自带 pendingExtPageUrl 走注入，无需额外动作
+            return;
+        }
+        if (this.pendingExtPageUrl && !/^about:blank$/i.test(url)) {
+            // 离开扩展整页：清掉改道状态（否则后续任意 about:blank 都会被误重建）
+            this.pendingExtPageUrl = null;
+        }
         if (url.startsWith("view-source:")) {
             // view-source 协议：webview 不直接支持，改为抓取后用 srcdoc
             const target = url.slice("view-source:".length);
@@ -455,6 +578,7 @@ export class WebviewController {
         this.webview = webview;
         this.programmaticNav = false;
         this.loading = false;
+        this.loadingSince = 0;
         this.lastNewTabUrl = "";
         this.lastNewTabTime = 0;
         this.lastEdgeInstallId = "";
@@ -482,7 +606,8 @@ export class WebviewController {
     }
 
     private async maybeRecordHistory(url: string): Promise<void> {
-        if (!url || url === "about:blank" || url.startsWith("data:")) return;
+        // 只记 http(s)：chrome-extension:// 页面（扩展 newtab/popup）、data:、about: 等不入历史
+        if (!url || !/^https?:\/\//i.test(url)) return;
         const title = this.webview.getTitle?.() || url;
         const favicon = pickFavicon(url, []);
         await this.history.record({ url, title, favicon });
