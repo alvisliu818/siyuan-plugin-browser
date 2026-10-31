@@ -664,6 +664,13 @@ export class WebviewController {
     private pendingNewTabCheckTimer: any = null;
     private injectLinkInterceptor(): void {
         if (this.disposed) return;
+        // guest 失效（重建竞态）时跳过本轮：旧句柄的 invoke 会报
+        // Invalid guestInstanceId，刷屏且无意义
+        try {
+            const wv: any = this.webview;
+            if (!wv || typeof wv.getWebContentsId !== "function") return;
+            wv.getWebContentsId();
+        } catch { return; }
         // 注入拦截脚本（幂等：检查 __browserInterceptorInjected 标记）
         const script = `
             (function(){

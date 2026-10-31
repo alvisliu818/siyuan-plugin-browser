@@ -156,7 +156,52 @@ export class UserscriptInjector {
                     .filter(Boolean)
                     .join("\n;\n");
                 if (!code) continue;
-                const wrapped = "(function(){\n" + code + "\n})()";
+                // GM_* 垫片层：宿主直装的脚本不在 TM 自己的管理体系里，TM 不会
+                // 为它们提供 GM API —— 注入前在同一函数作用域先铺一层
+                // （同步存储走页面 localStorage 按脚本隔离；GM_xmlhttpRequest 走
+                // hostCall gmxhr 路由到分区网络，无 CORS）。裸标识符词法解析到
+                // 本层变量，脚本零改动可用。
+                const gmName = (code.match(/\/\/\s*@name\s+([^\r\n]+)/i) || [])[1]?.trim() || entry.id;
+                const gmVersion = (code.match(/\/\/\s*@version\s+([^\r\n]+)/i) || [])[1]?.trim() || "";
+                const gmNamespace = (code.match(/\/\/\s*@namespace\s+([^\r\n]+)/i) || [])[1]?.trim() || "";
+                const gmPrelude = `
+    var unsafeWindow = window;
+    var __gmKey = "__syGM::" + ${JSON.stringify(entry.id)} + "::";
+    var GM_info = { script: { name: ${JSON.stringify(gmName)}, version: ${JSON.stringify(gmVersion)}, namespace: ${JSON.stringify(gmNamespace)} }, version: "4.18", handler: "SiYuanBrowser" };
+    var GM_getValue = function (k, d) { try { var v = localStorage.getItem(__gmKey + String(k)); return v === null ? (d === undefined ? undefined : d) : v; } catch (e) { return d; } };
+    var GM_setValue = function (k, v) { try { localStorage.setItem(__gmKey + String(k), String(v)); } catch (e) {} };
+    var GM_deleteValue = function (k) { try { localStorage.removeItem(__gmKey + String(k)); } catch (e) {} };
+    var GM_listValues = function () { try { var out = []; for (var i = 0; i < localStorage.length; i++) { var k = localStorage.key(i); if (k && k.indexOf(__gmKey) === 0) out.push(k.slice(__gmKey.length)); } return out; } catch (e) { return []; } };
+    var GM_addStyle = function (css) { try { var s = document.createElement("style"); s.textContent = String(css); (document.head || document.documentElement).appendChild(s); return s; } catch (e) { return null; } };
+    var GM_registerMenuCommand = function (caption, fn) { try { window.__syGmMenus = window.__syGmMenus || []; window.__syGmMenus.push({ caption: String(caption), fn: fn }); } catch (e) {} return { id: window.__syGmMenus ? window.__syGmMenus.length : 0 }; };
+    var GM_unregisterMenuCommand = function () {};
+    var GM_setClipboard = function (text) { try { navigator.clipboard && navigator.clipboard.writeText(String(text)); } catch (e) {} };
+    var GM_notification = function (details, ondone) { try { console.info("[GM notification]", details && (details.title || details.text)); } catch (e) {} if (typeof ondone === "function") { try { ondone(); } catch (e2) {} } };
+    var GM_openInTab = function (url, opts) { try { window.open(String(url), "_blank"); } catch (e) {} return { closed: false }; };
+    var GM_getResourceText = function () { return ""; };
+    var GM_getResourceURL = function () { return ""; };
+    var GM_addValueChangeListener = function () { return 0; };
+    var GM_removeValueChangeListener = function () {};
+    var GM_download = function (details, name) { try { var a = document.createElement("a"); a.href = typeof details === "string" ? details : details.url; a.download = name || ""; document.body.appendChild(a); a.click(); a.remove(); } catch (e) {} };
+    var GM_xmlhttpRequest = function (details) {
+        details = details || {};
+        var ctrl = { aborted: false };
+        var ac = new AbortController();
+        ctrl.abort = function () { if (ctrl.aborted) return; ctrl.aborted = true; try { ac.abort(); } catch (e) {} if (typeof details.onabort === "function") { try { details.onabort(); } catch (e2) {} } };
+        var headers = {};
+        try { if (details.headers && typeof details.headers === "object") { for (var hk in details.headers) { if (/^cookie$|^origin$|^referer$/i.test(hk)) continue; headers[hk] = String(details.headers[hk]); } } } catch (e3) {}
+        hostCall("gmxhr", { url: String(details.url || ""), method: String(details.method || "GET"), headers: headers, data: details.data === undefined ? null : String(details.data) }).then(function (v) {
+            if (ctrl.aborted) return;
+            var resp = (v && typeof v === "object") ? v : { status: 0, body: "" };
+            if (typeof details.onload === "function") { try { details.onload({ status: resp.status || 0, readyState: 4, responseText: resp.body || "", response: resp.body || "", responseHeaders: resp.headers || "", finalUrl: resp.finalUrl || details.url }); } catch (e4) {} }
+        }).catch(function (e5) {
+            if (ctrl.aborted) return;
+            if (typeof details.onerror === "function") { try { details.onerror({ error: String(e5 && e5.message || e5) }); } catch (e6) {} }
+        });
+        return { abort: ctrl.abort };
+    };
+`;
+                const wrapped = "(function(){\n" + gmPrelude + "\n" + code + "\n})()";
                 let r = await evalInExtensionWorldBridge(webview, electronId, wrapped).catch(
                     () => ({ ok: false, error: "bridge failed" }) as { ok: boolean; error?: string }
                 );

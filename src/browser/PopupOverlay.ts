@@ -121,10 +121,16 @@ export class ExtensionPopupOverlay {
     /** 打开/关闭 overlay webview guest 的 DevTools（DT 按钮与 F12 共用）。
      *  首选 @electron/remote 拿 webContents 调 openDevTools({mode:"detach"})——
      *  独立窗口醒目可见（webview 方法默认停靠形态曾疑似开在主窗后不可见）；
-     *  remote 不可用再退 webview 元素方法。失败弹 toast（"没反应"不可接受）。 */
+     *  remote 不可用再退 webview 元素方法。guest 失效（重建竞态）时静默跳过
+     *  本轮——下一次点击自然用新 guest，不弹误导性错误。 */
     private openGuestDevTools(): void {
         const vw = this.vw;
         if (!vw) return;
+        try {
+            (vw as any).getWebContentsId?.(); // guest 失效时抛 → 静默跳过本轮
+        } catch {
+            return;
+        }
         try {
             const remote = (window as any).require?.("@electron/remote");
             const id = (vw as any).getWebContentsId?.();

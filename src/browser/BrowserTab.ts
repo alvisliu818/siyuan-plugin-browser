@@ -1118,10 +1118,24 @@ export class BrowserTab {
     }
 
     /** 启动 webview 健康监测（损坏自动重建） */
+    /** guest 存活判定：webview 重建/未挂载/旧 guest 失效时为 false（防 Invalid
+     *  guestInstanceId 刷屏——重建竞态里旧句柄的 executeJavaScript 全是空响） */
+    private guestAlive(): boolean {
+        try {
+            const wv: any = this.webview;
+            if (!wv || typeof wv.getWebContentsId !== "function") return false;
+            wv.getWebContentsId(); // 未 attach / guest 失效时抛
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     private startHealthMonitor(): void {
         if (this.healthTimer) return;
         this.healthTimer = setInterval(async () => {
             if (this.disposed || this.rebuilding || this.extPageInjecting) return;
+            if (!this.guestAlive()) return;
             // 首次加载完成前、以及任何导航进行中都不探测：
             // 加载期间页面主线程繁忙/进程切换会让 executeJavaScript 探测超时，
             // 新页签初始 src 是 about:blank，此时误判重建会让页签永远停在空白页

@@ -33,6 +33,8 @@ import type { IWebviewTag } from "../types";
 import { fetchSyncPost } from "siyuan";
 import { CLIP_DEFAULT_TEMPLATE, renderClipTemplate, getDefaultClipMarkdown, formatClipExcerpt } from "../browser/excerpt";
 import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSwFlatCached, findSwFlatSession, findSwTarget, FlatCommandSender, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
+import { remoteSession } from "../utils/electron";
+import { BROWSER_PARTITION } from "../constants";
 
 const BRIDGE_NAME = "__syExtHost";
 /** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
@@ -988,6 +990,29 @@ class CsPageSession {
                 }
             }
             return { data: null };
+        }
+        if (req.type === "gmxhr") {
+            // GM_xmlhttpRequest 宿主代理：分区 session.fetch（代理/cookie 与页面
+            // 一致）+ 网络层直连无 CORS。文本响应 v1（binary 场景后续按需加）。
+            try {
+                const ses = remoteSession(BROWSER_PARTITION);
+                if (!ses || typeof ses.fetch !== "function") return { err: "分区 session.fetch 不可用" };
+                const ac = new AbortController();
+                const timer = setTimeout(() => ac.abort(), 30000);
+                try {
+                    const r = await ses.fetch(String(args.url || ""), {
+                        method: String(args.method || "GET"),
+                        headers: args.headers && typeof args.headers === "object" ? args.headers : undefined,
+                        body: args.data == null ? undefined : String(args.data),
+                    });
+                    const body = await r.text();
+                    const hs: Record<string, string> = {};
+                    try { r.headers.forEach((v: string, k: string) => { hs[k] = v; }); } catch {}
+                    return { data: { status: r.status, body, headers: hs, finalUrl: r.url || String(args.url || "") } };
+                } finally { clearTimeout(timer); }
+            } catch (e: any) {
+                return { err: String(e?.message || e) };
+            }
         }
         if (req.type === "usdata") {
             // 新标签页扩展数据适配：topSites/bookmarks/history 查询由宿主
