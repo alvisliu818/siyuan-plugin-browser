@@ -108,6 +108,11 @@ export class BrowserTab {
                     this.syncUserAgent(url);
                     // 页面跳转后旧面板挂在已废弃的 DOM 上，直接关掉
                     void closeExtensionPopupInPage(this.webview);
+                    // TM 安装中转页出现 = TM 已接管 .user.js 安装（原生链条）——
+                    // 12s 宿主弹窗回落不再触发
+                    if (url && url.includes("script_installation.php") && this.pendingUserJs) {
+                        this.pendingUserJs.askOpened = true;
+                    }
                     // webNavigation.onCommitted 合成派发（TM 安装检测等导航观察；
                     // chrome-extension/data 页不派发）
                     if (url && /^https?:\/\//i.test(url)) void this.emitWebNavCommitted(url);
@@ -709,24 +714,29 @@ export class BrowserTab {
                 if (/^chrome-extension:/i.test(url) || /^data:/i.test(url)) { cb({}); return; }
                 const RT_MAP: Record<string, string> = { mainFrame: "main_frame", subFrame: "sub_frame", xhr: "xmlhttprequest", cspReport: "csp_report", webSocket: "websocket" };
                 const rtDnr = RT_MAP[String(details?.resourceType || "")] || String(details?.resourceType || "") || null;
-                // ★ .user.js 最优先且立即放行（绝不持阻塞回调——挂起超时会被
-                //   Chromium 以 ERR_ABORTED 中止，实测 -3）。导航继续渲染文本页；
-                //   桥派发与 onCommitted 派发异步进行（TM 若接管自行开 ask 页）；
-                //   12s 未接管 → 回落宿主确认弹窗直装（interceptUserScriptInstall）。
-                if (/\.user\.js(?:[?#]|$)/i.test(url)) {
-                    cb({});
+                // ★ .user.js 最优先：取消导航（留在 greasyfork 页上）+ 桥派发给
+                //   TM 自己的 onBeforeRequest handler（其异步安装流：自己 fetch
+                //   脚本 → tabs.create 开 ask.html?aid → 出箱多点排空）。
+                //   TM 链条 20s 未走出 ask → 回落宿主确认弹窗（GM 层已支持）。
+                if (/\.user\.js(?:[?#]|$)/i.test(url) && details?.resourceType === "mainFrame" && !/^chrome-extension:/i.test(url) && !/script_installation\.php/i.test(url)) {
+                    cb({ cancel: true });
                     this.pendingUserJs = { url, askOpened: false };
                     void (async () => {
-                        try { await this.dispatchWrCollect(url, rtDnr, details); await this.drainWrOutbox(); } catch {}
+                        try { await this.dispatchWrCollect(url, rtDnr, details); } catch {}
+                        for (const delay of [1500, 2500, 4000]) {
+                            await new Promise((r) => setTimeout(r, delay));
+                            await this.drainWrOutbox();
+                        }
                     })();
+                    // TM 链条 20s 未走出 ask → 回落宿主确认弹窗
                     setTimeout(() => {
                         const pj = this.pendingUserJs;
                         if (pj && pj.url === url && !pj.askOpened) {
-                            console.info("[browser-plugin] .user.js TM 未接管，回落宿主确认安装:", url.slice(0, 80));
+                            console.info("[browser-plugin] .user.js TM 链条未完成，回落宿主确认安装:", url.slice(0, 80));
                             void this.interceptUserScriptInstall(url, "mainFrame", () => {});
                         }
                         if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
-                    }, 12000);
+                    }, 20000);
                     return;
                 }
                 if (this.maybeDispatchWr(url, rtDnr, details, cb)) return;

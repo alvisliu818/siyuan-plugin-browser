@@ -746,18 +746,27 @@ export class WebviewController {
                 this.pendingNewTabCheckTimer = null;
                 return;
             }
-            this.webview
-                .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null})")
-                .then((r: any) => {
-                    if (r && r.t) {
-                        this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
-                        this.openNewTabDedup(r.t, "inject-poll");
-                    } else if (r && r.e) {
-                        this.webview.executeJavaScript("window.__syEdgeInstall = null").catch(() => {});
-                        this.triggerEdgeInstall(String(r.e), "inject-poll");
-                    }
-                })
-                .catch(() => {});
+            // guest 失效（重建竞态）守卫：executeJavaScript 在未挂载/旧 guest 上
+            // 会**同步**抛出（.catch 挂不上），必须 try 包住整个调用
+            try {
+                const wv: any = this.webview;
+                if (!wv || typeof wv.getWebContentsId !== "function") return;
+                wv.getWebContentsId();
+            } catch { return; }
+            try {
+                this.webview
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null})")
+                    .then((r: any) => {
+                        if (r && r.t) {
+                            this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
+                            this.openNewTabDedup(r.t, "inject-poll");
+                        } else if (r && r.e) {
+                            this.webview.executeJavaScript("window.__syEdgeInstall = null").catch(() => {});
+                            this.triggerEdgeInstall(String(r.e), "inject-poll");
+                        }
+                    })
+                    .catch(() => {});
+            } catch {}
         }, 300);
     }
 
