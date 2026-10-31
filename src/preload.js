@@ -79,9 +79,19 @@
             window.addEventListener(
                 "keydown",
                 (e) => {
-                    if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "0" || e.code === "Digit0")) {
+                    if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return;
+                    // Ctrl+0 重置；Ctrl+= / Ctrl+- 步进缩放（对齐 Chrome 快捷键）
+                    if (e.key === "0" || e.code === "Digit0") {
                         e.preventDefault();
                         webFrame.setZoomLevel(0); // 0 = 100%
+                    } else if (e.key === "=" || e.key === "+") {
+                        e.preventDefault();
+                        const next = Math.min(ZOOM_MAX, webFrame.getZoomFactor() * 1.1);
+                        if (Math.abs(next - webFrame.getZoomFactor()) > 1e-6) webFrame.setZoomFactor(next);
+                    } else if (e.key === "-") {
+                        e.preventDefault();
+                        const next2 = Math.max(ZOOM_MIN, webFrame.getZoomFactor() / 1.1);
+                        if (Math.abs(next2 - webFrame.getZoomFactor()) > 1e-6) webFrame.setZoomFactor(next2);
                     }
                 },
                 { passive: false }

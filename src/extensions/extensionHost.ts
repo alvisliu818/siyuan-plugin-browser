@@ -56,6 +56,8 @@ export interface IInstalledExtension {
     iconPath?: string;
     /** manifest.chrome_url_overrides.newtab（新标签页扩展：可设为新页签默认页） */
     newtabPath?: string;
+    /** manifest.options_ui/options_page（openOptionsPage 打开的目标页） */
+    optionsPath?: string;
 }
 
 const EXTENSIONS_KEY = "extensions.json";
@@ -211,20 +213,10 @@ export class ExtensionHost {
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
         const SHIM_VER = "v18";
         let changedShimCount = 0;
-        for (const ext of this.extensions) {
-            try {
-                const manifest = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
-                const swPath = manifest.background?.service_worker;
-                if (!swPath) continue;
-                const abs = path.join(ext.path, swPath);
-                const src = fs.readFileSync(abs, "utf8");
-                // 只在真的用到缺失 API 时才垫（省得污染没问题的扩展）。
-                // 注意：商店扩展的 background 多为压缩代码，chrome 常被别名化
-                // （实测 TM：`C.contextMenus`，全文无 "chrome." 字样）—— 检测必须
-                // 用裸关键字，不能带 chrome. 前缀。
-                const needsShim = /contextMenus|userScripts|notifications|webNavigation|alarms|omnibox|declarativeNetRequest|cookies|browserAction|browser_action|chrome\.(commands|action|downloads)/.test(src);
-                if (!needsShim) continue;
-                const shimBody = `
+        // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
+        // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
+        // shimBody 是静态模板，不依赖循环变量。
+        const shimBody = `
 ;(function () {
     try {
         if (typeof chrome === "undefined") return;
@@ -507,8 +499,12 @@ export class ExtensionHost {
             if (chrome.tabs && !chrome.tabs.__syTabWrapped) {
                 // 5a) tabs API 补桩：Electron 原生 tabs 缺 create/update/remove 等，
                 //     AdGuard onInstalled 流程调 tabs.create 直接 TypeError →
-                //     初始化链中断（tabsApi.start 永不执行 → popup 取状态卡 loading）
-                if (!chrome.tabs.create) chrome.tabs.create = function (props, cb) { var t = { id: 1, index: 0, windowId: 1, active: true, url: (props && props.url) || "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                //     初始化链中断（tabsApi.start 永不执行 → popup 取状态卡 loading）。
+                //     create **实装**：SW 无法直接开宿主页签，写内存出箱 __syTabCreateOutbox，
+                //     宿主路由 sendmessage 完成后排空 → bp.openUrl 真实开页签
+                //     （实测 TM popup「查找新脚本」走 SW newTab handler → tabs.create，
+                //     旧假桩静默吞掉 → 无反应/空页签）。update/remove 仍为桩。
+                if (!chrome.tabs.create) chrome.tabs.create = function (props, cb) { var u = (props && props.url) || ""; try { if (u) { self.__syTabCreateOutbox = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox.push({ url: String(u), active: !props || props.active !== false }); } } catch (e) {} var t = { id: 1, index: 0, windowId: 1, active: true, url: u }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
                 if (!chrome.tabs.update) chrome.tabs.update = function (id, props, cb) { var t = { id: typeof id === "number" ? id : 1, url: (props && props.url) || "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
                 if (!chrome.tabs.remove) chrome.tabs.remove = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
                 if (!chrome.tabs.get) chrome.tabs.get = function (id, cb) { var t = { id: id, index: 0, windowId: 1, active: false, url: "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
@@ -732,13 +728,26 @@ export class ExtensionHost {
 })();
 /* sy-bg-shim-end */
 `;
-                // 内容哈希进标记：同版本号但内容变化（开发迭代）也能触发重注入
-                let shimHash = 0x811c9dc5;
-                for (let i = 0; i < shimBody.length; i++) {
-                    shimHash ^= shimBody.charCodeAt(i);
-                    shimHash = Math.imul(shimHash, 0x01000193);
-                }
-                const SHIM_MARK = "/* sy-bg-shim:" + SHIM_VER + ":" + (shimHash >>> 0).toString(36) + " */";
+
+        let shimHash = 0x811c9dc5;
+        for (let i = 0; i < shimBody.length; i++) {
+            shimHash ^= shimBody.charCodeAt(i);
+            shimHash = Math.imul(shimHash, 0x01000193);
+        }
+        const SHIM_MARK = "/* sy-bg-shim:" + SHIM_VER + ":" + (shimHash >>> 0).toString(36) + " */";
+        for (const ext of this.extensions) {
+            try {
+                const manifest = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
+                const swPath = manifest.background?.service_worker;
+                if (!swPath) continue;
+                const abs = path.join(ext.path, swPath);
+                const src = fs.readFileSync(abs, "utf8");
+                // 只在真的用到缺失 API 时才垫（省得污染没问题的扩展）。
+                // 注意：商店扩展的 background 多为压缩代码，chrome 常被别名化
+                // （实测 TM：`C.contextMenus`，全文无 "chrome." 字样）—— 检测必须
+                // 用裸关键字，不能带 chrome. 前缀。
+                const needsShim = /contextMenus|userScripts|notifications|webNavigation|alarms|omnibox|declarativeNetRequest|cookies|browserAction|browser_action|chrome\.(commands|action|downloads)/.test(src);
+                if (!needsShim) continue;
                 if (src.startsWith(SHIM_MARK)) continue;
                 const shim = SHIM_MARK + shimBody;
                 // 换版剥离：文件里带旧版垫片且含尾标记 → 截掉垫片段，只保留原源码再前置新垫片
@@ -924,6 +933,11 @@ export class ExtensionHost {
                         || manifest.chrome_url_overrides?.homepage
                         || undefined;
                 }
+                if (ext.optionsPath === undefined) {
+                    ext.optionsPath = manifest.options_ui?.page
+                        || manifest.options_page
+                        || undefined;
+                }
                 changed = true;
             } catch {
                 // manifest 读不到（目录被删等）：留空，工具栏会跳过该项
@@ -1075,6 +1089,9 @@ export class ExtensionHost {
                 // 新标签页扩展：chrome_url_overrides.newtab（可作为新页签默认页）
                 newtabPath: manifest.chrome_url_overrides?.newtab
                     || manifest.chrome_url_overrides?.homepage
+                    || undefined,
+                optionsPath: manifest.options_ui?.page
+                    || manifest.options_page
                     || undefined,
             };
             // 同目录重复安装 → 更新
@@ -1530,6 +1547,7 @@ export class ExtensionHost {
                         contentScripts: e.contentScripts,
                         // 内容世界 tab 身份（真 Chrome sender.tab 语义，见 ICsExtInfo）
                         senderTabId: 1,
+                        optionsPath: e.optionsPath,
                     })),
             readFile: (extPath: string, rel: string) => {
                 const { fs, path } = nodeModules();
@@ -1646,6 +1664,37 @@ export class ExtensionHost {
         if (!ext) return;
         try { ses.removeExtension(electronId); } catch {}
         try { await ses.loadExtension(ext.path, { allowFileAccess: true }); } catch {}
+    }
+
+    // ===== SW 保活（对齐 Chrome 的"事件即唤醒"体感）=====
+    //
+    // MV3 SW 空闲 ~30s 即休眠：休眠后 popup/消息要先唤醒（startWorkerForScope
+    // 或 remove+load，实测数秒级），体感是"弹窗首开慢/消息迟钝"。浏览器页签
+    // 存在期间每 20s 用 startWorkerForScope（无副作用，只启动不卸载）对全部
+    // 原生扩展 SW 做一轮保活，SW 进程常驻、事件即时响应。代价是常驻内存
+    // （每个 SW 进程几十 MB），换取 Chrome 同款的即时性。
+    private swKeepAliveTimer: ReturnType<typeof setInterval> | null = null;
+
+    startSwKeepAlive(): void {
+        if (this.swKeepAliveTimer) return;
+        const tick = () => {
+            const ses = remoteSession();
+            if (!ses?.serviceWorkers?.startWorkerForScope) return;
+            for (const ext of this.extensions.filter((e) => e.enabled && e.native && !!e.electronId)) {
+                try {
+                    ses.serviceWorkers.startWorkerForScope(`chrome-extension://${ext.electronId}/`).catch(() => {});
+                } catch {}
+            }
+        };
+        tick();
+        this.swKeepAliveTimer = setInterval(tick, 20000);
+    }
+
+    stopSwKeepAlive(): void {
+        if (this.swKeepAliveTimer) {
+            clearInterval(this.swKeepAliveTimer);
+            this.swKeepAliveTimer = null;
+        }
     }
 
     /** dom-ready 时调用：确保该页签的 CDP 会话与各扩展自建世界就绪 */

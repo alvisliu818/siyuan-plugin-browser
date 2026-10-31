@@ -119,6 +119,62 @@ function collectCssHrefs(html: string): string[] {
  * （有样式、随面板关闭一起移除，不污染宿主页面）；面板不在时透传真实 body。
  * 只影响 popup 世界，页面主世界 / content 世界不受影响。
  */
+/**
+ * CSS 作用域重写（popup 世界注入版，经 fn.toString() 进 prelude）。
+ * 必须是**自包含**的普通函数：模板字符串里写正则会遭打包器非法转义二次
+ * cooking（实测 `\\*` 的反斜杠在 bundle 里丢失 → 注入代码语法错误），toString
+ * 注入则零转义、打包器任意变换都不影响。禁止引用模块级状态。
+ */
+export function syScopeCssJs(css: string, scopeSel: string): string {
+    const splitTop = (s: string): string[] => {
+        const out: string[] = [];
+        let depth = 0;
+        let cur = "";
+        for (const ch of s) {
+            if (ch === "(" || ch === "[") depth++;
+            else if (ch === ")" || ch === "]") depth--;
+            if (ch === "," && depth === 0) { out.push(cur); cur = ""; }
+            else cur += ch;
+        }
+        if (cur.trim()) out.push(cur);
+        return out.map((x) => x.trim()).filter(Boolean);
+    };
+    const reRoot = /(^|[\s>+~,])(html|body|:root)(?=[\s.#[{,:]|$)/gi;
+    const reStar = /(^|[\s>+~,]|\b)\*(?=[\s.#[{,:]|$)/g;
+    const mapSel = (sel: string): string => {
+        return splitTop(sel).map((t) => {
+            const replaced = t.replace(reRoot, (_m, pre) => pre + scopeSel);
+            if (replaced !== t) return replaced;
+            const star = t.replace(reStar, (_m, pre) => pre + scopeSel + " *");
+            if (star !== t) return star;
+            return scopeSel + " " + t;
+        }).join(", ");
+    };
+    const walk = (src: string): string => {
+        const out: string[] = [];
+        let i = 0;
+        while (i < src.length) {
+            const brace = src.indexOf("{", i);
+            if (brace < 0) break;
+            const sel = src.slice(i, brace).trim();
+            let depth = 1;
+            let j = brace + 1;
+            while (j < src.length && depth > 0) {
+                if (src[j] === "{") depth++;
+                else if (src[j] === "}") depth--;
+                j++;
+            }
+            const body = src.slice(brace + 1, j - 1);
+            i = j;
+            if (/^@(keyframes|font-face|charset)/i.test(sel)) out.push(sel + "{" + body + "}");
+            else if (/^@(media|supports|layer)/i.test(sel)) out.push(sel + "{" + walk(body) + "}");
+            else out.push(mapSel(sel) + "{" + body + "}");
+        }
+        return out.join("\n");
+    };
+    return walk(String(css));
+}
+
 export const POPUP_JS_PRELUDE = `
 (function () {
     if (window.__syExtPopupBodyHook) return;
@@ -240,6 +296,51 @@ export const POPUP_JS_PRELUDE = `
         syncBodyClass();
         new MutationObserver(syncBodyClass).observe(body, { attributes: true, attributeFilter: ["class"] });
     } catch (e) {}
+    // ★ 运行时 <style> 作用域化（仅 popup 模式）：扩展 popup JS（React 等）
+    //   会把样式块塞进 document.head —— 不经 body 补丁，规则全局生效污染
+    //   宿主页面（实测 AdGuard popup 运行时注入 23 个 style 块，含
+    //   "*,*:before,*:after{box-sizing}" 与 :root/body 规则，把宿主 body
+    //   压成 320px，页面布局全毁）。在隔离世界拦截 head 的 style 插入并按
+    //   popup 宿主作用域化；页面自己的脚本不受影响（补丁只在本扩展世界
+    //   生效）。整页扩展页模式不启用（页面本身就是扩展页，样式须全局）。
+    try {
+        var POPUP_MODE = !!document.getElementById("sy-ext-popup-host");
+        if (POPUP_MODE) {
+            var SCOPE = "#sy-ext-popup-host";
+            // 作用域算法经宿主函数 toString 注入（见 syScopeCssJs 注释：模板内
+            // 写正则会遭打包器非法转义二次 cooking，toString 注入零转义）
+            var syScopeCss = ${syScopeCssJs.toString()};
+            var scopeOnInsert = function (n) {
+                try {
+                    if (!n || n.tagName !== "STYLE" || n.getAttribute("data-sy-scoped")) return n;
+                    var css = n.textContent || "";
+                    if (css.trim().length > 4) {
+                        n.textContent = syScopeCss(css, SCOPE);
+                        n.setAttribute("data-sy-scoped", "1");
+                    }
+                } catch (e) {}
+                return n;
+            };
+            var patchHeadMethod = function (name) {
+                try {
+                    var el = document.head || document.documentElement;
+                    if (typeof el[name] !== "function") return;
+                    var orig = el[name].bind(el);
+                    Object.defineProperty(el, name, {
+                        configurable: true,
+                        value: function () {
+                            for (var i = 0; i < arguments.length; i++) scopeOnInsert(arguments[i]);
+                            return orig.apply(el, arguments);
+                        },
+                    });
+                } catch (e) {}
+            };
+            patchHeadMethod("appendChild");
+            patchHeadMethod("prepend");
+            patchHeadMethod("insertBefore");
+            patchHeadMethod("append");
+        }
+    } catch (e) {}
 })();
 `;
 
@@ -314,25 +415,18 @@ function scopeCss(css: string, scopeSel: string): string {
  * 真实 location（TM 靠 hashchange 切视图，需真事件）；href/reload/replace
  * 写操作 no-op（防错误兜底把宿主页面导航走）。
  */
-function spoofLocationWrap(src: string, spoofUrl: string): string {
+export function spoofLocationPrelude(spoofUrl: string): string {
     let u: URL;
     try {
         u = new URL(spoofUrl);
     } catch {
-        return src; // 非法 URL：放弃伪装，保持原样
+        return ""; // 非法 URL：放弃伪装
     }
     const base = JSON.stringify({
-        href: u.href,
-        origin: u.origin,
-        protocol: u.protocol,
-        host: u.host,
-        hostname: u.hostname,
-        port: u.port,
-        pathname: u.pathname,
-        search: u.search,
-        hash: u.hash,
+        href: u.href, origin: u.origin, protocol: u.protocol, host: u.host,
+        hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash,
     });
-    const prelude = `self.__syFakeLoc = (function (real) {
+    return `self.__syFakeLoc = (function (real) {
     var base = ${base};
     var o = {};
     o.pathname = base.pathname; o.origin = base.origin; o.protocol = base.protocol;
@@ -351,8 +445,17 @@ function spoofLocationWrap(src: string, spoofUrl: string): string {
     try { o.ancestorOrigins = real.ancestorOrigins; } catch (e) {}
     return o;
 })(location);`;
-    // window.location（token 定长替换）→ __syFakeLoc；裸 location → 形参遮蔽
-    const rewritten = String(src).split("window.location").join("__syFakeLoc");
+}
+
+/** token 替换：源码里的 window.location → 伪对象引用（整段遮蔽前的第一步） */
+function spoofLocationTokenReplace(src: string): string {
+    return String(src).split("window.location").join("__syFakeLoc");
+}
+
+function spoofLocationWrap(src: string, spoofUrl: string): string {
+    const prelude = spoofLocationPrelude(spoofUrl);
+    if (!prelude) return src; // 非法 URL：放弃伪装，保持原样
+    const rewritten = spoofLocationTokenReplace(src);
     return prelude + "\n;(function (location) {\n" + rewritten + "\n})(self.__syFakeLoc);";
 }
 
@@ -441,6 +544,9 @@ export async function showExtensionPopupInPage(opts: {
 (function () {
     if (window.__syExtPopup) { window.__syExtPopup.close(); }
     var P = ${JSON.stringify(payload)};
+    // 作用域算法经宿主函数 toString 注入（见 syScopeCssJs 注释）：模板内写正则
+    // 会遭打包器非法转义二次 cooking，toString 注入零转义
+    var syScopeCssJs = ${syScopeCssJs.toString()};
     var host = document.createElement("div");
     host.id = "sy-ext-popup-host";
     host.style.cssText = "position:fixed;z-index:2147483647;width:360px;max-height:520px;overflow:auto;"
@@ -467,6 +573,38 @@ export async function showExtensionPopupInPage(opts: {
     host.appendChild(wrap);
     // body 未就绪时挂 documentElement 也能显示
     (document.body || document.documentElement).appendChild(host);
+    // ★ 运行时样式守卫（主世界兜底）：扩展 popup JS（React 等）运行时把样式块
+    //   塞进 document.head —— 不经 body 补丁，规则全局生效污染宿主页面（实测
+    //   AdGuard popup 注入 19+ 个 style 块把宿主 body 压成 320px，页面布局全
+    //   毁）。popup 存续期间监视 head，凡新增 <style>（不管来自哪个世界）一律
+    //   按 popup 宿主作用域化；关闭时停止监视。漏网代价远小于布局全毁。
+    var styleMo = null;
+    try {
+        styleMo = new MutationObserver(function (muts) {
+            for (var i = 0; i < muts.length; i++) {
+                var added = muts[i].addedNodes || [];
+                for (var k = 0; k < added.length; k++) {
+                    var n = added[k];
+                    if (!n || n.nodeType !== 1) continue;
+                    var styles = n.tagName === "STYLE" ? [n] : [];
+                    if (n.querySelectorAll) Array.prototype.push.apply(styles, n.querySelectorAll("style"));
+                    for (var s = 0; s < styles.length; s++) {
+                        var st = styles[s];
+                        if (st.getAttribute("data-sy-scoped")) continue;
+                        if (st.closest && st.closest("#sy-ext-popup-host")) continue;
+                        try {
+                            var css2 = st.textContent || "";
+                            if (css2.trim().length > 4) {
+                                st.textContent = syScopeCssJs(css2, "#sy-ext-popup-host");
+                                st.setAttribute("data-sy-scoped", "1");
+                            }
+                        } catch (e3) {}
+                    }
+                }
+            }
+        });
+        styleMo.observe(document.head || document.documentElement, {childList: true, subtree: true});
+    } catch (e2) {}
     function position() {
         var a = P.anchor;
         var r = host.getBoundingClientRect();
@@ -479,6 +617,7 @@ export async function showExtensionPopupInPage(opts: {
     }
     function close() {
         try { host.remove(); } catch (e) {}
+        try { styleMo && styleMo.disconnect(); } catch (e) {}
         document.removeEventListener("mousedown", onOutside, true);
         document.removeEventListener("keydown", onKey, true);
         delete window.__syExtPopup;
@@ -533,6 +672,10 @@ export async function showExtensionPopupInPage(opts: {
                         if (self.__syDomReadyDispatched) return "already";
                         self.__syDomReadyDispatched = true;
                         try { document.dispatchEvent(new Event("DOMContentLoaded")); } catch (e) {}
+                        // window load 同理补发（部分扩展的引导挂在 window load 上，
+                        // 重建页面的真实 load 早于脚本注册 —— 实测 SiYuan Clip
+                        // options 面板空壳的根因之一）
+                        try { window.dispatchEvent(new Event("load")); } catch (e) {}
                         return "dispatched";
                     })()`,
                     "__domready__"
@@ -705,15 +848,27 @@ export async function injectExtensionPageRuntime(opts: {
 
         if (opts.begin) await opts.begin();
         await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
-        for (let i = 0; i < jsSources.length; i++) {
-            // location 伪装：改道重建场景页面 location 是 about:blank，扩展按
-            // pathname 分派引导分支会落空（TM options 静默空转）—— 与 popup
-            // 路径同机制，逐文件包 spoofLocationWrap
+        // 合并单次求值：对齐 Chrome 的多 <script> 语义（同一全局词法作用域，
+        // 传统多文件扩展的顶层函数跨文件可见）。逐文件独立求值会把 lib 的
+        // 顶层函数锁进各自作用域，后续文件全局不可见（实测 SiYuan Clip 面板
+        // 空壳：bootstrapPopup 报 siyuanLoadStorageSettings is not defined）。
+        // currentScript 逐文件伪造保留（webpack publicPath 检测依赖）。
+        // 全部文件放进**同一个** spoof IIFE：传统多文件扩展的顶层函数声明
+        // 必须在同一函数作用域内才能跨文件可见（逐文件 IIFE 会把 lib 函数锁进
+        // 各自作用域 —— 实测 SiYuan Clip 面板空壳的根因）；location 伪装对整段
+        // 统一生效（prelude 一次 + 单层形参遮蔽）。
+        const parts = jsSources.map((s, i) => {
             const src = opts.spoofLocationUrl
-                ? spoofLocationWrap(jsSources[i], opts.spoofLocationUrl)
-                : jsSources[i];
-            await opts.evalJs(src, jsRels[i]);
-        }
+                ? spoofLocationTokenReplace(s)
+                : s;
+            const fakeUrl = "chrome-extension://" + electronId + "/" + String(jsRels[i]).replace(/^\.\//, "");
+            return "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
+        });
+        const combinedSrc = (opts.spoofLocationUrl
+            ? spoofLocationPrelude(opts.spoofLocationUrl)
+                + "\n;(function (location) {\n" + parts.join("\n;\n") + "\n})(self.__syFakeLoc);"
+            : parts.join("\n;\n"));
+        await opts.evalJs(combinedSrc, "__scripts__");
         // DOMContentLoaded 兜底（与 showExtensionPopupInPage 同理由）
         try {
             await opts.evalJs(

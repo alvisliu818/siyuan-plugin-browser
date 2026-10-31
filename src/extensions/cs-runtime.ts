@@ -56,6 +56,8 @@ export interface ICsExtInfo {
     version: string;
     defaultLocale: string;
     contentScripts: Array<{ matches: string[]; js: string[]; css: string[] }>;
+    /** manifest 的 options 页（openOptionsPage 用；无则按钮降级 no-op） */
+    optionsPath?: string;
     /**
      * 该世界的 sender 身份 URL（port.sender.url / sendMessage sender）。
      * popup/扩展页面世界必须传 chrome-extension://<id>/<page>：真 Chrome 里
@@ -859,6 +861,31 @@ class CsPageSession {
             }
             return { data: undefined };
         }
+        if (req.type === "extfetch") {
+            // 扩展页运行时 fetch chrome-extension:// 资源（locales/配置/WASM 等）：
+            // Electron 对独立文档的该协议 fetch 非确定性拒绝 → 宿主按扩展目录读
+            // 文件返回。base64 传输保证二进制（WASM/图片）不损坏，Response 从
+            // 字节构造后 text()/json()/arrayBuffer() 全兼容。
+            const url = String((args && args.url) || "");
+            const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)(\/[^?#]*)?$/i);
+            if (!m) return { err: "extfetch: bad url" };
+            const eid = m[1];
+            const rel = decodeURIComponent((m[2] || "/").slice(1));
+            const ext = this.host.listNativeExts().find((e) => e.electronId === eid);
+            if (!ext) return { err: "extfetch: extension not found" };
+            try {
+                // 路径逃逸防御：规范化后必须仍在扩展目录内（/../ 逃逸拦截）
+                const norm = (p: string) => p.replace(/[\\/]+/g, "/").replace(/(^|\/)\.\.(?=$|\/)/g, "\u0000up");
+                const base = norm(ext.path.replace(/[\\/]+$/, ""));
+                const full = norm(base + "/" + rel.replace(/^\//, ""));
+                if (!full.startsWith(base + "/") && full !== base) return { data: { ok: false, status: 403, bodyB64: "" } };
+                const req2 = (window as any).require;
+                const data = req2("fs").readFileSync(full);
+                return { data: { ok: true, status: 200, bodyB64: data.toString("base64") } };
+            } catch (e) {
+                return { data: { ok: false, status: 404, bodyB64: "" } };
+            }
+        }
         if (req.type === "kernelfetch") {
             // 面板/内容世界的内核请求代理（mixed content 绕行）：Node http 代发
             const url = String(args.url || "");
@@ -924,6 +951,20 @@ class CsPageSession {
         if (req.type === "tabs-sendmessage") {
             // popup 世界 → content 世界的 onMessage 监听器（SW↔CS 路由缺失的替代）
             return await this.dispatchToContentWorld(ext, args);
+        }
+        if (req.type === "opentab") {
+            // 扩展世界请求开新页签（openOptionsPage / tabs.create / update）
+            const url = String((args && args.url) || "");
+            if (url) {
+                try {
+                    const bp = (window as any).browserPlugin;
+                    if (bp?.openUrl) bp.openUrl(url);
+                    else window.open(url, "_blank");
+                } catch (e: any) {
+                    return { err: String(e?.message || e) };
+                }
+            }
+            return { data: null };
         }
         if (req.type === "usdata") {
             // 新标签页扩展数据适配：topSites/bookmarks/history 查询由宿主
@@ -1298,6 +1339,21 @@ class CsPageSession {
         })()`;
         const r = await this.evalInSw(ext, expr);
         if (r.err) return { err: r.err };
+        // SW 侧 chrome.tabs.create 出箱（垫片 5a）：SW 无法直接开宿主页签，路由期间
+        // TM「查找新脚本」/ AdGuard 等经 SW handler 写 __syTabCreateOutbox，这里排空
+        // → bp.openUrl 真实开页签。失败静默：条目留在箱里，下次路由再排。
+        try {
+            const dr = await this.evalInSw(ext, `(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()`);
+            const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
+            for (const it of (Array.isArray(items) ? items : [])) {
+                const u = String((it && it.url) || "");
+                if (!u) continue;
+                try {
+                    const bp = (window as any).browserPlugin;
+                    if (bp?.openUrl) bp.openUrl(u, { force: true });
+                } catch (e2) {}
+            }
+        } catch (e1) {}
         try {
             let parsed = JSON.parse(String(r.value));
             // SW 刚被 loadExtension 唤醒时 app 尚在初始化（AdGuard 过滤器加载 5-10s），
@@ -1475,7 +1531,7 @@ class CsPageSession {
      * Electron 下事件缺失 → getTabContext 恒 undefined → popup 取状态静默失败。
      * tabId 与垫片 tabs.query 返回的固定 id=1 对齐。
      */
-    private async feedTabEventToSw(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+    async feedTabEventToSw(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
         const tabJson = JSON.stringify({
             id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false,
             incognito: false, url: String(args?.url || ""), title: String(args?.title || ""),
@@ -2076,11 +2132,28 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     // 内核请求代理：https 页面的隔离世界 fetch http://127.0.0.1/<localhost> 是
     // mixed content，直接 "Failed to fetch"（实测 Clip 发送/笔记本列表全挂）。
     // 内核 URL 转经宿主桥，宿主用 Node http 代发（绕开浏览器 fetch 限制）。
+    // ★ chrome-extension:// 同理补齐：独立文档（overlay/重建页）fetch 自己的
+    //   运行时资源（locales/配置/Worker 脚本）在 Electron 下非确定性拒绝
+    //   （实测 SiYuan Clip 语言文件 fetch 拒绝 → bootstrap 走 catch → 面板
+    //   空壳永不渲染）。转经宿主桥由宿主按扩展目录读文件返回。
     try {
         var oFetch = window.fetch;
         window.fetch = function (input, init) {
             try {
                 var url = typeof input === "string" ? input : (input && input.url) || "";
+                if (/^chrome-extension:\\/\\//i.test(url)) {
+                    return hostCall("extfetch", { url: url }).then(function (r) {
+                        var resp = (typeof r === "string") ? JSON.parse(r) : (r || {});
+                        if (resp.err) throw new TypeError("Failed to fetch");
+                        // base64 → 字节构造 Response：二进制（WASM/图片）不损坏，
+                        // text()/json()/arrayBuffer() 全兼容
+                        var b64 = resp.bodyB64 || "";
+                        var bin = atob(b64);
+                        var arr = new Uint8Array(bin.length);
+                        for (var bi = 0; bi < bin.length; bi++) arr[bi] = bin.charCodeAt(bi);
+                        return new Response(arr, { status: resp.status || 200 });
+                    });
+                }
                 if (/^http:\\/\\/(127\\.0\\.0\\.1|localhost)(:\\d+)?/i.test(url)) {
                     var headers = {};
                     if (init && init.headers) {
@@ -2211,7 +2284,22 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         onRestartRequired: eventHub(),
         onMessageExternal: eventHub(),
         getBackgroundPage: function () { return Promise.resolve(undefined); },
-        openOptionsPage: function () { return Promise.resolve(); },
+        // 打开扩展 options 页（TM「管理面板」等按钮走这里）：经宿主 opentab 桥
+        // 用插件页签打开，比 no-op 桩至少让按钮"有反应"；无 options 页时提示
+        openOptionsPage: function (cb) {
+            try {
+                // 模板字符串内写正则必须双写反斜杠：单写 /^\.\// 会被模板 cooking
+                // 成 /^.//（非法 JS），垫片 eval 直接 SyntaxError（TM popup 全挂）
+                var u = EXT.optionsPath ? ("chrome-extension://" + EXT.id + "/" + String(EXT.optionsPath).replace(/^\\.\\//, "")) : "";
+                if (u) {
+                    hostCall("opentab", { url: u }).catch(function () {});
+                } else {
+                    console.warn("[sy-ext-shim] openOptionsPage: 扩展未声明 options 页");
+                }
+                if (typeof cb === "function") { try { cb(); } catch (e) {} }
+                return Promise.resolve();
+            } catch (e) { return Promise.resolve(); }
+        },
         setUninstallURL: function () {},
         reload: function () {},
         getPlatformInfo: function () { return Promise.resolve({ os: "win", arch: "x86-64", nacl_arch: "x86-64" }); },
@@ -2360,6 +2448,26 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                 // 缺失，不喂的话 getTabContext 恒 undefined → popup 卡 loading
                 try { hostCall("tabevent", { url: tab.url, title: tab.title }).catch(function () {}); } catch (e) {}
                 return cbStyle(Promise.resolve([tab]), cb);
+            },
+            // 新页签/导航：经宿主 opentab 桥用插件页签打开（TM 面板里
+            // 「管理面板」「导出」一类按钮走 tabs.create/update）
+            create: function (props, cb) {
+                try {
+                    var u = (props && props.url) || "";
+                    if (u) hostCall("opentab", { url: String(u) }).catch(function () {});
+                    var t = { id: 2, index: 1, windowId: 1, active: !props || props.active !== false, highlighted: !props || props.active !== false, pinned: false, incognito: false, url: u, title: "" };
+                    if (typeof cb === "function") { try { cb(t); } catch (e) {} }
+                    return Promise.resolve(t);
+                } catch (e) { return Promise.resolve(undefined); }
+            },
+            update: function (tabId, props, cb) {
+                try {
+                    var u = props && props.url ? String(props.url) : "";
+                    if (u) hostCall("opentab", { url: u }).catch(function () {});
+                    var t2 = { id: typeof tabId === "number" ? tabId : 1, url: u };
+                    if (typeof cb === "function") { try { cb(t2); } catch (e) {} }
+                    return Promise.resolve(t2);
+                } catch (e) { return Promise.resolve(undefined); }
             },
             // 派发到本扩展 content 世界的 onMessage 监听器（宿主中转；SW↔CS 路由缺失的替代）
             sendMessage: function (tabId, msg, cb) {

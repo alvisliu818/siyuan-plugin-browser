@@ -65,6 +65,35 @@ export default class BrowserPlugin extends Plugin {
         // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
         (window as any).browserPlugin = this;
 
+        // 陈旧句柄 rejection 兜底：webview 重建（崩溃恢复/分屏搬移）与扩展 SW
+        // 休眠会让缓存的 CDP flat session / remote 句柄短暂失效，相关调用方
+        // 均有重试与降级（实测失效后下一轮即自愈，功能不受影响），这些
+        // "Uncaught (in promise)" 只产生控制台噪声。按模式匹配忽略，30s 限频
+        // 告警一次；非匹配原因照常抛出。
+        const staleHandlePatterns = [
+            "No session with given id",
+            "No session for given target id",
+            "Multiple sessions attached, specify id.",
+            "Object has been destroyed",
+            "No webContents with given id",
+        ];
+        let lastStaleWarn = 0;
+        window.addEventListener("unhandledrejection", (ev) => {
+            try {
+                const reason: any = (ev as PromiseRejectionEvent).reason;
+                const msg = String((reason && (reason.message || reason)) || "");
+                if (!staleHandlePatterns.some((pat) => msg.includes(pat))) return;
+                ev.preventDefault();
+                const now = Date.now();
+                if (now - lastStaleWarn > 30000) {
+                    lastStaleWarn = now;
+                    // debug 级别：调用方均有重试降级（上行走 evalInSw* 的内部
+                    // try/catch），这是自愈型噪声而非故障；warn 会刷屏误导排查
+                    console.debug("[browser-plugin] 陈旧句柄 rejection 已忽略（重试自愈，30s 限频）:", msg.slice(0, 120));
+                }
+            } catch {}
+        });
+
         // 初始化 stores
         this.bookmarksStore = new BookmarksStore(this);
         this.historyStore = new HistoryStore(this);

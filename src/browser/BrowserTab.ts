@@ -13,10 +13,11 @@ import { EDGE_UA } from "../extensions/edgeStore";
 import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
-import { showExtensionPopupInPage, closeExtensionPopupInPage, injectExtensionPageRuntime } from "./ext-popup";
+import { closeExtensionPopupInPage, injectExtensionPageRuntime, POPUP_JS_PRELUDE } from "./ext-popup";
+import { ExtensionPopupOverlay } from "./PopupOverlay";
+import { dnrBlocker } from "./dnrEngine";
 import { evalInExtensionWorld } from "../extensions/sw-bridge";
 import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup } from "../extensions/cs-runtime";
-import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 浏览器页签实例依赖 */
@@ -61,6 +62,8 @@ export class BrowserTab {
     private extPageInjecting = false;
     /** webview 健康监测定时器 */
     private healthTimer: any = null;
+    // Chrome 式扩展 popup：常温独立文档 overlay（文档全新、进程温热，见 PopupOverlay.ts）
+    private extPopup: ExtensionPopupOverlay | null = null;
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
     private healthFailCount = 0;
     /** Electron 默认 UA（懒捕获：构造时 webview 可能尚未 attach） */
@@ -224,13 +227,30 @@ export class BrowserTab {
         // Electron webview 被重新挂载后 guest 即损坏（白屏且无响应），需自动重建
         this.startHealthMonitor();
 
+        // SW 保活（幂等）：浏览器页签存在期间扩展 SW 常驻，popup/消息零唤醒延迟
+        // （对齐 Chrome 的"事件即唤醒"；代价是 SW 进程常驻内存）
+        try { (window as any).browserPlugin?.extensionHost?.startSwKeepAlive?.(); } catch {}
+        // DNR 引擎暴露（统计/排查用）
+        try { (window as any).browserPlugin.dnrBlocker = dnrBlocker; } catch {}
+
         // 异步初始化：先确保 preload 路径就绪，再加载初始 URL
         // preload 必须在 webview 第一次加载前设置，否则不生效
         this.init(initialUrl);
 
-        // 地址栏旁的扩展图标区：初始刷一次，扩展宿主数据就绪后再刷
-        this.onExtHostLoaded = () => void this.refreshExtensionIcons();
+        // 地址栏旁的扩展图标区：初始刷一次，扩展宿主数据就绪后再刷；
+        // 同一事件顺带惰性加载 DNR 广告拦截规则集（AdGuard 扩展目录，一次）
+        this.onExtHostLoaded = () => {
+            void this.refreshExtensionIcons();
+            try {
+                const list = (window as any).browserPlugin?.extensionHost?.list?.() || [];
+                const adg = list.find((e: any) => /adguard/i.test(e.name || ""));
+                if (adg?.path) void dnrBlocker.load(adg.path);
+            } catch {}
+        };
         window.addEventListener("sy-browser-ext-host-loaded", this.onExtHostLoaded);
+
+        // 立即尝试一次（扩展宿主可能早已就绪，如页签恢复）
+        try { this.onExtHostLoaded(); } catch {}
         this.refreshExtensionIcons();
     }
 
@@ -320,6 +340,17 @@ export class BrowserTab {
     }
 
     private registerWebRequest(session: any): void {
+        // 0. 网络层广告拦截：DNR 规则引擎（AdGuard 官方规则集，惰性加载）——
+        //    对齐 Chrome 的网络层过滤能力（Electron 无 declarativeNetRequest）
+        session.webRequest.onBeforeRequest((details: any, cb: (r: any) => void) => {
+            try {
+                if (dnrBlocker.shouldBlock(details?.url || "", details?.resourceType, details?.referrer || "")) {
+                    cb({ cancel: true });
+                    return;
+                }
+            } catch {}
+            cb({});
+        });
         // 1. 响应头：移除站点安全限制（CSP / X-Frame-Options）
         session.webRequest.onHeadersReceived((details: any, cb: (r: any) => void) => {
             try {
@@ -501,8 +532,14 @@ export class BrowserTab {
             showMessage(`「${ext.name}」没有 popup 面板`, 4000, "info");
             return;
         }
+        // Chrome 式 toggle：同一扩展已开 → 再点即关；其他扩展已开 → 切换文档。
+        // overlay 常温（关闭 = 隐藏 + 归位 about:blank，进程/缓存温热，无孤儿元素）。
+        if (this.extPopup?.isOpenFor(extId)) {
+            this.extPopup.close();
+            return;
+        }
         // 预热 SW：面板脚本的首个 storage 调用若撞上 SW 冷启动会挂到超时（Clip 无重试
-        // 逻辑 → 面板全白"点不开"）。世界创建+脚本注入本身有 1-2s，唤醒并行完成。
+        // 逻辑 → 面板全白"点不开"）。唤醒并行完成。
         try {
             const wakeP = (window as any).browserPlugin?.extensionHost?.wakeSw?.(ext.electronId);
             if (wakeP) await Promise.race([wakeP, new Promise((r) => setTimeout(r, 2500))]);
@@ -511,61 +548,49 @@ export class BrowserTab {
         const r = anchor
             ? anchor.getBoundingClientRect()
             : ({ right: (window.innerWidth || 1200) - 24, bottom: 48 } as DOMRect);
-        // popup JS 在扩展专属世界执行（chrome.* 经桥真实可用；主世界是空壳）。
-        // 每个文件执行前伪造 document.currentScript —— webpack/rspack runtime 的
-        // publicPath 自动检测依赖它（缺失会 throw "Automatic publicPath is not supported"）
-        const extInfo = {
-            electronId: ext.electronId,
-            path: ext.path,
-            name: ext.name,
-            version: ext.version,
-            defaultLocale: ext.defaultLocale,
-            contentScripts: ext.contentScripts,
-            // popup 世界寄生在宿主页面里（location.href 是页面 URL），但真 Chrome
-            // 的弹出面板 sender 是扩展文档 —— SW 侧按 sender.url 判 extpage 白名单
-            //（TM 的 hints/syncInfo/tabWatch 等 allow:{extpage:!0}，不符即静默丢弃
-            // → 面板空等不渲染），必须以扩展页 URL 身份发包。
-            senderPageUrl: "chrome-extension://" + ext.electronId + "/" + String(ext.popupPath).replace(/^\.\//, ""),
-        };
         // TM 的 popup 自己不调 chrome.tabs.query，靠 SW 侧 getSelected 解析当前
         // 页签 —— 宿主主动喂一次 tabevent（喂的是"面板锚定的页签"，即本页）。
         // 必须等喂完再放行面板：loadTree 会在面板 JS 启动后立刻发出，抢跑的话
         // SW 侧活动页签还是空 → 面板无 tab 上下文（no access）。限时防挂。
-        // （★ 此块必须位于 extInfo 声明之后 —— 初版放在前面踩了 TDZ，
-        //   "Cannot access 's' before initialization" 被 catch 吞成静默失败。）
         try {
             const curUrl = String(this.webview.getURL?.() || "");
             const curTitle = String((this.webview as any).getTitle?.() || document.title || "");
             if (/^https?:\/\//i.test(curUrl)) {
                 await Promise.race([
-                    feedTabEventForPopup(this.webview, extInfo, curUrl, curTitle),
+                    feedTabEventForPopup(this.webview, {
+                        electronId: ext.electronId,
+                        path: ext.path,
+                        name: ext.name,
+                        version: ext.version,
+                        defaultLocale: ext.defaultLocale,
+                        contentScripts: ext.contentScripts,
+                        senderPageUrl: "chrome-extension://" + ext.electronId + "/" + String(ext.popupPath).replace(/^\.\//, ""),
+                    }, curUrl, curTitle),
                     new Promise((r2) => setTimeout(r2, 3000)),
                 ]);
             }
         } catch {}
-        const out = await showExtensionPopupInPage({
-            webview: this.webview,
+        if (!this.extPopup) {
+            this.extPopup = new ExtensionPopupOverlay(this.element, {
+                onClosed: (closedExtId) => {
+                    console.info("[browser-plugin] popup closed:", closedExtId);
+                },
+                onError: (msg) => showMessage(msg, 5000, "error"),
+            });
+            this.extPopup.installGlobalListeners();
+        }
+        this.extPopup.open({
+            extId,
+            anchorRect: { right: r.right, bottom: r.bottom },
             extPath: ext.path,
             electronId: ext.electronId,
             popupPath: ext.popupPath,
-            anchorRect: { right: r.right, bottom: r.bottom },
-            // 引导分支伪装：TM 等扩展的 popup 按 location.pathname 分派（/action →
-            // popup 分支），宿主页面路径不对则引导整段跳过、UI 只有壳
-            spoofLocationUrl: "chrome-extension://" + ext.electronId + "/" + String(ext.popupPath).replace(/^\.\//, ""),
-            begin: () => beginPopupWorld(this.webview, extInfo),
-            evalJs: (src, relPath) => {
-                const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
-                const prefixed =
-                    "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
-                return evalPopupJs(this.webview, extInfo, prefixed).then((rr) => {
-                    if (!rr.ok) throw new Error(rr.error);
-                    return rr.value;
-                });
-            },
+            name: ext.name,
+            version: ext.version,
+            defaultLocale: ext.defaultLocale,
+            contentScripts: ext.contentScripts,
+            userAgent: this.settings.userAgent,
         });
-        if (!out.ok) {
-            showMessage(`打开「${ext.name}」面板失败: ${out.error}`, 5000, "error");
-        }
     }
 
     /**
@@ -742,8 +767,13 @@ export class BrowserTab {
                 // 不了"加载被拒"——重建后 loadURL 依旧失败，还得重注入，唯一
                 // 效果是把刚渲染好的页面洗成空白（实测 TM options 打开即循环洗白）。
                 // 这类页真损坏时的恢复手段是重开页签（或后续做重注入）。
+                // 注意不能用 getCurrentUrl 完事：伪装 location 的 hash 写穿透会让
+                // guest 真实 URL 变成 about:blank#xxx —— "!== about:blank" 判定失配
+                // 后不再兜底 lastKnownUrl，跳过失效 → TM 大体量注入期间 isHealthy
+                // 超时×2 → 循环 rebuild（实测设置页打开即"闪一下"+ 陈旧句柄刷屏）。
+                // 这里直接看 pendingExtPageUrl：整个扩展页会话期间一律跳过。
                 const curUrl = this.controller.getCurrentUrl?.() || "";
-                if (/^chrome-extension:\/\//i.test(curUrl)) return;
+                if (/^chrome-extension:\/\//i.test(curUrl) || this.controller.pendingExtPageUrl) return;
                 const healthy = await this.controller.isHealthy();
                 if (!healthy && !this.disposed && !this.rebuilding) {
                     // 连续两次失败才判定损坏，避免偶发超时误判
@@ -965,6 +995,10 @@ export class BrowserTab {
     dispose(): void {
         if (this.disposed) return;
         this.disposed = true;
+        if (this.extPopup) {
+            this.extPopup.destroy();
+            this.extPopup = null;
+        }
         if (this.healthTimer) {
             clearInterval(this.healthTimer);
             this.healthTimer = null;

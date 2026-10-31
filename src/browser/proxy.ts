@@ -85,8 +85,9 @@ async function buildProxyConfig(s: BrowserSettings): Promise<IProxyConfig> {
         if (p?.scheme === "system") return { mode: "system" };
         const url = formatSiyuanProxyUrl(p);
         if (url) return { proxyRules: url };
-        // 思源未配置代理：与思源本体行为一致（直连）
-        console.warn("[browser-plugin] SiYuan proxy not configured, webview falls back to direct");
+        // 思源未配置代理：与思源本体行为一致（直连）。这是正常路径不是错误，
+        // 每次布局就绪/设置变更都会走到，用 log 级别避免误导。
+        console.log("[browser-plugin] SiYuan proxy not configured, webview uses direct connection (正常)");
         return { mode: "direct" };
     }
 
