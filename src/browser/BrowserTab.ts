@@ -67,6 +67,9 @@ export class BrowserTab {
     /** .user.js 待装脚本（确认弹窗 → confirmInstall 的中转） */
     private pendingInstalls = new Map<string, { url: string; code: string; name: string; version: string; author: string; description: string; matches: string[]; electronId: string; extName: string }>();
     private pendingInstallDialogs = new Set<HTMLElement>();
+    /** 安装确认弹窗防重入：url（去查询串）→ 上次展示时间。文本页留在地址栏，
+     *  重建/恢复/刷新会重新触发导航——3 分钟内同脚本不重复弹 */
+    private installDialogShownAt = new Map<string, number>();
     /** webRequest 阻塞桥：electronId → 该扩展注册的监听器 filter 快照
      *  （垫片 addListener 时连同 urls/types 一起暴露，宿主按此预筛派发） */
     private wrBridgeCache = new Map<string, Array<{ ev: string; urls: string[] | null; types: string[] | null }>>();
@@ -585,6 +588,25 @@ export class BrowserTab {
                 electronId: tm.electronId,
                 extName: tm.name,
             });
+            // 防重入：同脚本 3 分钟内不重复弹（文本页留在地址栏，重建/恢复/刷新
+            // 会重新触发导航）；已有弹窗打开时也不叠加
+            const dkey = url.split("?")[0];
+            const lastShown = this.installDialogShownAt.get(dkey) || 0;
+            if (Date.now() - lastShown < 3 * 60 * 1000) {
+                console.info("[browser-plugin] .user.js 确认弹窗 3 分钟内已展示过，跳过:", dkey.slice(0, 80));
+                this.pendingInstalls.delete(aid);
+                return;
+            }
+            if (this.pendingInstallDialogs.size > 0) {
+                console.info("[browser-plugin] .user.js 确认弹窗已有打开实例，跳过叠加");
+                this.pendingInstalls.delete(aid);
+                return;
+            }
+            this.installDialogShownAt.set(dkey, Date.now());
+            if (this.installDialogShownAt.size > 50) {
+                const oldest = this.installDialogShownAt.keys().next().value;
+                if (oldest !== undefined) this.installDialogShownAt.delete(oldest);
+            }
             this.showInstallDialog(aid, { name, version, author, description, matches, from: url });
         } catch (e) {
             console.warn("[browser-plugin] .user.js 安装失败:", e);
@@ -634,7 +656,11 @@ export class BrowserTab {
     /** 用户确认后的注册（原直装逻辑后移至此） */
     private async confirmInstall(aid: string): Promise<void> {
         const pending = this.pendingInstalls.get(aid);
-        if (!pending) return;
+        if (!pending) {
+            // aid 失联（tab 重建换了实例等）——给用户可见反馈而非静默
+            showMessage("安装会话已失效，请重新点击「安装此脚本」", 4000, "error");
+            return;
+        }
         this.pendingInstalls.delete(aid);
         const { code, name, matches, electronId: electronId } = pending;
         try {
