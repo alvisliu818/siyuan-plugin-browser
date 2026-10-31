@@ -431,7 +431,7 @@ export class BrowserTab {
                     for (const it of (Array.isArray(items) ? items : [])) {
                         const u = String((it && it.url) || "");
                         if (!u) continue;
-                        if (u.includes("ask.html") && this.pendingUserJs) this.pendingUserJs.askOpened = true;
+                        if (u.includes("ask.html")) { for (const pj of this.pendingUserJs.values()) if (!pj.askOpened) pj.askOpened = true; }
                         const bp = (window as any).browserPlugin;
                         if (bp?.openUrl) bp.openUrl(u, { force: true });
                     }
@@ -497,7 +497,7 @@ export class BrowserTab {
                             for (const it of (Array.isArray(items) ? items : [])) {
                                 const u = String((it && it.url) || "");
                                 if (!u) continue;
-                                if (u.includes("ask.html") && this.pendingUserJs) this.pendingUserJs.askOpened = true;
+                                if (u.includes("ask.html")) { for (const pj of this.pendingUserJs.values()) if (!pj.askOpened) pj.askOpened = true; }
                                 const bp = (window as any).browserPlugin;
                                 if (bp?.openUrl) bp.openUrl(u, { force: true });
                             }
