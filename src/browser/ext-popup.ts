@@ -125,6 +125,32 @@ function collectCssHrefs(html: string): string[] {
  * cooking（实测 `\\*` 的反斜杠在 bundle 里丢失 → 注入代码语法错误），toString
  * 注入则零转义、打包器任意变换都不影响。禁止引用模块级状态。
  */
+
+/** 宿主页 localStorage 上扩展存储的键前缀（localStorage 垫片持久化用） */
+export function extLsHostKey(electronId: string): string {
+    return "syExtLs::" + electronId;
+}
+
+/** 读扩展的 localStorage 种子（宿主页 → 模拟扩展文档）。坏数据返回 null。 */
+export function readExtLsSeed(electronId: string): Record<string, string> | null {
+    try {
+        const raw = window.localStorage.getItem(extLsHostKey(electronId));
+        if (!raw) return null;
+        const obj = JSON.parse(raw);
+        return obj && typeof obj === "object" && !Array.isArray(obj) ? obj : null;
+    } catch {
+        return null;
+    }
+}
+
+/** 宿主页持久化扩展的 localStorage 快照（guest 垫片经 ipc 回灌时调用） */
+export function persistExtLs(electronId: string, data: unknown): void {
+    try {
+        if (!electronId || !data || typeof data !== "object") return;
+        window.localStorage.setItem(extLsHostKey(electronId), JSON.stringify(data));
+    } catch {}
+}
+
 export function syScopeCssJs(css: string, scopeSel: string): string {
     const splitTop = (s: string): string[] => {
         const out: string[] = [];
@@ -179,6 +205,63 @@ export const POPUP_JS_PRELUDE = `
 (function () {
     if (window.__syExtPopupBodyHook) return;
     window.__syExtPopupBodyHook = true;
+    // ★ localStorage/sessionStorage 垫片：模拟扩展文档跑在 about:blank（不透明
+    //   源）上，原生 window.localStorage 访问直接抛 SecurityError —— 实测 AdGuard
+    //   popup 的 React init 读 localStorage 崩溃 → 面板永不挂载（DevTools 才
+    //   看得到的静默根因）。特征检测：仅当原生访问被拒时安装内存垫片（真实
+    //   源文档不装、行为不变）。种子由宿主经 __syLsCtx 传入（宿主页 localStorage
+    //   的 syExtLs::<extId>，"连宿主 localStorage"），写入防抖后经 preload 暴露的
+    //   __syExtLsSend（仅 about:blank 主帧存在）回灌宿主持久化，关弹窗不丢。
+    try {
+        var __syLsOk = true;
+        try { if (!window.localStorage || typeof window.localStorage.getItem !== "function") __syLsOk = false; } catch (eLsProbe) { __syLsOk = false; }
+        if (!__syLsOk) {
+            var __syMkStorage = function (seed, onWrite) {
+                var d = {};
+                try {
+                    for (var k in seed) {
+                        if (Object.prototype.hasOwnProperty.call(seed, k)) d[k] = String(seed[k]);
+                    }
+                } catch (e) {}
+                var st = {
+                    getItem: function (k) { k = String(k); return Object.prototype.hasOwnProperty.call(d, k) ? d[k] : null; },
+                    setItem: function (k, v) { d[String(k)] = String(v); if (onWrite) onWrite(d); },
+                    removeItem: function (k) { delete d[String(k)]; if (onWrite) onWrite(d); },
+                    clear: function () { d = {}; if (onWrite) onWrite(d); },
+                    key: function (i) { var ks = Object.keys(d); return i >= 0 && i < ks.length ? ks[i] : null; },
+                };
+                Object.defineProperty(st, "length", { configurable: true, get: function () { return Object.keys(d).length; } });
+                return st;
+            };
+            var __syLsDict = null;      // localStorage 垫片的活字典（回灌快照源）
+            var __syLsFlushT = null;
+            var __syFlushLsNow = function () {
+                if (!__syLsDict || !(typeof window.__syExtLsSend === "function") || !self.__syLsCtx || !self.__syLsCtx.extId) return;
+                try { window.__syExtLsSend(self.__syLsCtx.extId, __syLsDict); } catch (e) {}
+            };
+            var __syFlushLsSoon = function () {
+                if (__syLsFlushT) clearTimeout(__syLsFlushT);
+                __syLsFlushT = setTimeout(function () { __syLsFlushT = null; __syFlushLsNow(); }, 400);
+            };
+            var __sySeed = (self.__syLsCtx && self.__syLsCtx.seed) || null;
+            try {
+                Object.defineProperty(window, "localStorage", {
+                    configurable: true,
+                    writable: true,
+                    value: __syMkStorage(__sySeed, function (d) { __syLsDict = d; __syFlushLsSoon(); }),
+                });
+            } catch (e) {}
+            try {
+                Object.defineProperty(window, "sessionStorage", {
+                    configurable: true,
+                    writable: true,
+                    value: __syMkStorage(null, null),
+                });
+            } catch (e) {}
+            // 导航销毁文档前把挂起的写入立即回灌（防抖窗口内关弹窗不丢尾数据）
+            try { self.addEventListener("beforeunload", __syFlushLsNow); } catch (e) {}
+        }
+    } catch (e) {}
     // ★ confirm/alert 抑制：扩展 JS（实测 TM options）的 window.onerror 兜底
     //   会弹原生 confirm（"An internal error occurred..."）—— Electron 下该
     //   对话框同步阻塞 JS 线程直到用户点按钮，页面表现为假死（CDP evaluate/
@@ -733,6 +816,11 @@ export async function injectExtensionPageRuntime(opts: {
      * location.pathname 分派分支（/options、/action…），改道重建场景页面真实
      * location 是 about:blank，分支分派落空 → 脚本静默空转（无错无 UI）。 */
     spoofLocationUrl?: string;
+    /** localStorage 垫片种子（宿主页 localStorage 的 syExtLs::<extId> 快照）。
+     * 模拟扩展文档（about:blank 不透明源）原生 localStorage 被拒，垫片起于
+     * 种子、写入防抖回灌宿主（见 POPUP_JS_PRELUDE）。真实源文档不装垫片，
+     * 传了也无副作用。 */
+    lsSeed?: Record<string, string> | null;
 }): Promise<{ ok: boolean; error?: string; scripts?: number }> {
     const { webview, extPath, electronId, pagePath } = opts;
     try {
@@ -847,6 +935,12 @@ export async function injectExtensionPageRuntime(opts: {
         }
 
         if (opts.begin) await opts.begin();
+        // localStorage 垫片种子先于 prelude 落地（prelude 安装垫片时读取）
+        if (opts.lsSeed && Object.keys(opts.lsSeed).length > 0) {
+            try {
+                await opts.evalJs("self.__syLsCtx = " + JSON.stringify({ extId: electronId, seed: opts.lsSeed }) + ";", "__lsseed__");
+            } catch {}
+        }
         await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
         // 合并单次求值：对齐 Chrome 的多 <script> 语义（同一全局词法作用域，
         // 传统多文件扩展的顶层函数跨文件可见）。逐文件独立求值会把 lib 的

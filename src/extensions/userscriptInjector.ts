@@ -122,11 +122,23 @@ export class UserscriptInjector {
             const scripts = this.regs.get(electronId);
             if (!scripts || scripts.size === 0) continue;
             // 世界可能不存在（油猴类扩展无静态 content script，cs-runtime 的
-            // installExt 会跳过建世界）—— 注入前确保世界 + chrome.* 垫片就绪
-            try {
-                await ensureExtensionWorld(webview, ext as any);
-            } catch (e) {
-                console.warn(`[browser-plugin] userScript world ensure failed (${ext.name}):`, String((e as any)?.message || e).slice(0, 120));
+            // installExt 会跳过建世界）—— 注入前确保世界 + chrome.* 垫片就绪。
+            // 首个 dom-ready 常撞上会话启动竞态（frameId 未就绪），带退避重试
+            // 覆盖 ~2s 启动窗口，耗尽才放弃本次注入。
+            let ensured = false;
+            let lastErr: any = null;
+            for (let attempt = 0; attempt < 6; attempt++) {
+                try {
+                    await ensureExtensionWorld(webview, ext as any);
+                    ensured = true;
+                    break;
+                } catch (e) {
+                    lastErr = e;
+                    await new Promise((r) => setTimeout(r, 400));
+                }
+            }
+            if (!ensured) {
+                console.warn(`[browser-plugin] userScript world ensure failed (${ext.name}) 重试后仍失败:`, String(lastErr?.message || lastErr).slice(0, 120));
                 continue;
             }
             for (const entry of (scripts.values() as IterableIterator<IUserScriptEntry>)) {

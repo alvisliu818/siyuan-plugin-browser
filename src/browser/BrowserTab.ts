@@ -13,11 +13,11 @@ import { EDGE_UA } from "../extensions/edgeStore";
 import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
-import { closeExtensionPopupInPage, injectExtensionPageRuntime, POPUP_JS_PRELUDE } from "./ext-popup";
+import { closeExtensionPopupInPage, injectExtensionPageRuntime, POPUP_JS_PRELUDE, readExtLsSeed, persistExtLs } from "./ext-popup";
 import { ExtensionPopupOverlay } from "./PopupOverlay";
 import { dnrBlocker } from "./dnrEngine";
 import { evalInExtensionWorld } from "../extensions/sw-bridge";
-import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup, evalInSwByElectronId } from "../extensions/cs-runtime";
 import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 浏览器页签实例依赖 */
@@ -64,6 +64,15 @@ export class BrowserTab {
     private healthTimer: any = null;
     // Chrome 式扩展 popup：常温独立文档 overlay（文档全新、进程温热，见 PopupOverlay.ts）
     private extPopup: ExtensionPopupOverlay | null = null;
+    /** .user.js 待装脚本（确认弹窗 → confirmInstall 的中转） */
+    private pendingInstalls = new Map<string, { url: string; code: string; name: string; version: string; author: string; description: string; matches: string[]; electronId: string; extName: string }>();
+    private pendingInstallDialogs = new Set<HTMLElement>();
+    /** webRequest 阻塞桥：electronId → 该扩展注册的监听器 filter 快照
+     *  （垫片 addListener 时连同 urls/types 一起暴露，宿主按此预筛派发） */
+    private wrBridgeCache = new Map<string, Array<{ ev: string; urls: string[] | null; types: string[] | null }>>();
+    private wrBridgeCacheAt = 0;
+    /** .user.js 待装导航（TM ask.html 开出即置 askOpened；12s 未开走宿主弹窗） */
+    private pendingUserJs: { url: string; askOpened: boolean } | null = null;
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
     private healthFailCount = 0;
     /** Electron 默认 UA（懒捕获：构造时 webview 可能尚未 attach） */
@@ -96,6 +105,9 @@ export class BrowserTab {
                     this.syncUserAgent(url);
                     // 页面跳转后旧面板挂在已废弃的 DOM 上，直接关掉
                     void closeExtensionPopupInPage(this.webview);
+                    // webNavigation.onCommitted 合成派发（TM 安装检测等导航观察；
+                    // chrome-extension/data 页不派发）
+                    if (url && /^https?:\/\//i.test(url)) void this.emitWebNavCommitted(url);
                 },
                 onTitleChange: (title) => {
                     deps.onTabTitleChange(title);
@@ -242,9 +254,20 @@ export class BrowserTab {
         this.onExtHostLoaded = () => {
             void this.refreshExtensionIcons();
             try {
-                const list = (window as any).browserPlugin?.extensionHost?.list?.() || [];
+                const host = (window as any).browserPlugin?.extensionHost;
+                const list = host?.list?.() || [];
                 const adg = list.find((e: any) => /adguard/i.test(e.name || ""));
                 if (adg?.path) void dnrBlocker.load(adg.path);
+                // SW 预唤醒（无副作用 startWorkerForScope）：页脚本的油猴引导/消息
+                // 在 dom-ready 后立刻发出，SW 冷启动期（background 执行中）handlers
+                // 为空 → 撞重试窗口。开页即并行唤醒，页脚本发消息时已就绪。
+                for (const e of list) {
+                    if (e.native && e.electronId) {
+                        try { host.wakeSw(e.electronId).catch(() => {}); } catch {}
+                    }
+                }
+                // SW 唤醒后拉一次 webRequest filter 快照（阻塞桥预筛用）
+                setTimeout(() => void this.refreshWrBridge(true), 2500);
             } catch {}
         };
         window.addEventListener("sy-browser-ext-host-loaded", this.onExtHostLoaded);
@@ -330,6 +353,317 @@ export class BrowserTab {
         }
     }
 
+    /** 刷新 webRequest 阻塞桥缓存：拉取各扩展 SW 里暴露的监听器 filter 快照 */
+    private async refreshWrBridge(force = false): Promise<void> {
+        if (!force && Date.now() - this.wrBridgeCacheAt < 30000) return;
+        this.wrBridgeCacheAt = Date.now();
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            const list = host?.list?.() || [];
+            const expr = "(function () { var f = self.__syWebRequestFilters || {}; var out = []; for (var ev in f) { var fs = f[ev] || []; for (var i = 0; i < fs.length; i++) { out.push({ ev: ev, urls: fs[i] ? fs[i].urls : null, types: fs[i] ? fs[i].types : null }); } } return JSON.stringify(out); })()";
+            for (const e of list) {
+                if (!e.native || !e.electronId) continue;
+                const r = await evalInSwByElectronId(e.electronId, expr).catch(() => null);
+                try {
+                    const arr = JSON.parse(String(r?.value || "[]"));
+                    if (Array.isArray(arr) && arr.length) this.wrBridgeCache.set(e.electronId, arr);
+                    else this.wrBridgeCache.delete(e.electronId);
+                } catch {}
+            }
+        } catch {}
+    }
+
+    /** webRequest filter 匹配（urls 通配 + types） */
+    private wrFilterMatches(f: { urls: string[] | null; types: string[] | null }, url: string, rtDnr: string | null): boolean {
+        try {
+            if (f.types && f.types.length && (!rtDnr || !f.types.includes(rtDnr))) return false;
+            if (f.urls && f.urls.length) {
+                const hit = f.urls.some((pat) => {
+                    try {
+                        const re = new RegExp("^" + pat.split("*").map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i");
+                        return re.test(url);
+                    } catch { return false; }
+                });
+                if (!hit) return false;
+            }
+            return true;
+        } catch { return false; }
+    }
+
+    /** webRequest 阻塞桥派发：filter 命中的扩展 SW 合成派发，收 {cancel/redirectUrl}。
+     *  返回 true = 已接管（cb 由派发路径回调）；false = 无人接管，调用方继续。 */
+    /** 阻塞桥派发收集：向 filter 命中的扩展 SW 合成派发，汇总 {cancel/redirectUrl}。
+     *  无 cb 参与（.user.js 分支的 fire-and-forget 用）。 */
+    private async dispatchWrCollect(url: string, rtDnr: string | null, details: any): Promise<{ cancel?: boolean; redirectUrl?: string } | null> {
+        const tasks: Array<Promise<{ cancel?: boolean; redirectUrl?: string } | null>> = [];
+        let initiator = "";
+        try { initiator = String(this.webview.getURL?.() || ""); } catch {}
+        for (const [eid, entries] of this.wrBridgeCache) {
+            const evs = entries.filter((f) => f.ev === "onBeforeRequest" && this.wrFilterMatches(f, url, rtDnr));
+            if (!evs.length) continue;
+            const d = {
+                url, method: String(details?.method || "GET"), type: rtDnr || "other", resourceType: rtDnr || "other",
+                frameId: 0, parentFrameId: -1, requestId: String(details?.requestId || "sy-" + Date.now()),
+                tabId: 1, timeStamp: Date.now(), initiator, originUrl: initiator, fromCache: !!details?.fromCache,
+            };
+            const expr = "(async function (detailsJson) { var details = JSON.parse(detailsJson); var entries = (self.__syWebRequestFns && self.__syWebRequestFns.onBeforeRequest) || []; var out = null; for (var i = 0; i < entries.length; i++) { try { var r = entries[i](details, function () {}); if (r && typeof r.then === 'function') { r = await Promise.race([r, new Promise(function (res) { setTimeout(function () { res(null); }, 4000); })]); } if (r && typeof r === 'object') { out = r; break; } } catch (e) {} } return out ? JSON.stringify(out) : ''; })(" + JSON.stringify(JSON.stringify(d)) + ")";
+            tasks.push(evalInSwByElectronId(eid, expr).then((r) => {
+                try { const parsed = JSON.parse(String(r?.value || "")); return parsed && typeof parsed === "object" ? parsed : null; } catch { return null; }
+            }).catch(() => null));
+        }
+        if (!tasks.length) return null;
+        const results = await Promise.all(tasks.map((t) => Promise.race([t, new Promise((res) => setTimeout(() => res(null), 6000))])));
+        for (const r of results) {
+            if (!r) continue;
+            if (r.cancel || r.redirectUrl) return r;
+        }
+        return null;
+    }
+
+    /** 排空各扩展 SW 的 tabs.create 出箱（ask.html 等由 openUrl 真实打开） */
+    private async drainWrOutbox(): Promise<void> {
+        try {
+            const drExpr = "(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()";
+            for (const eid of this.wrBridgeCache.keys()) {
+                try {
+                    const dr = await evalInSwByElectronId(eid, drExpr);
+                    const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
+                    for (const it of (Array.isArray(items) ? items : [])) {
+                        const u = String((it && it.url) || "");
+                        if (!u) continue;
+                        if (u.includes("ask.html") && this.pendingUserJs) this.pendingUserJs.askOpened = true;
+                        const bp = (window as any).browserPlugin;
+                        if (bp?.openUrl) bp.openUrl(u, { force: true });
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    private maybeDispatchWr(url: string, rtDnr: string | null, details: any, cb: (r: any) => void): boolean {
+        try {
+            if (!this.wrBridgeCache.size) {
+                void this.refreshWrBridge(true);
+                return false; // 首请求只触发缓存刷新（SW 冷启动期 filter 尚未知）
+            }
+            let dispatched = false;
+            for (const [, entries] of this.wrBridgeCache) {
+                if (entries.some((f) => f.ev === "onBeforeRequest" && this.wrFilterMatches(f, url, rtDnr))) { dispatched = true; break; }
+            }
+            if (!dispatched) return false;
+            // ★ 回调不能拖到 drain 之后：阻塞挂起超时会被 Chromium 以 ERR_ABORTED
+            //   中止（实测 .user.js 导航 -3）。cb 只等派发汇总，drain 在回调后跑。
+            void (async () => {
+                try {
+                    const r = await this.dispatchWrCollect(url, rtDnr, details);
+                    if (r) {
+                        if (r.cancel) { cb({ cancel: true }); return; }
+                        if (r.redirectUrl) { cb({ redirectUrl: r.redirectUrl }); return; }
+                    }
+                } catch {}
+                cb({});
+                await this.drainWrOutbox();
+            })();
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /** webNavigation.onCommitted 合成派发：扩展（TM 的 .user.js 安装检测等）
+     *  的导航观察依赖事件流；派发后多点排空 tabs 出箱（ask.html 由 openUrl
+     *  真实打开）。仅对暴露了真实事件面的扩展派发（探针预筛）。 */
+    private async emitWebNavCommitted(url: string): Promise<void> {
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            const list = host?.list?.() || [];
+            const native = list.filter((e: any) => e.native && e.electronId);
+            if (!native.length) return;
+            const probe = "(function () { var f = self.__syWebNavFns || {}; return JSON.stringify({ c: (f.onCommitted || []).length }); })()";
+            const dispatchExpr = "(function (d) { var fns = (self.__syWebNavFns && self.__syWebNavFns.onCommitted) || []; for (var i = 0; i < fns.length; i++) { try { fns[i](d); } catch (e) {} } return new Promise(function (res) { setTimeout(function () { res(JSON.stringify({ outbox: (self.__syTabCreateOutbox || []).map(function (x) { return String(x.url).slice(0, 90); }) })); }, 3500); }); })(" + JSON.stringify(JSON.stringify({ frameId: 0, tabId: 1, url, transitionType: "link", transitionQualifiers: [], timeStamp: Date.now() })) + ")";
+            const drainExpr = "(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()";
+            for (const e of native) {
+                try {
+                    const chk = await evalInSwByElectronId(e.electronId, probe).catch(() => null);
+                    if (!chk || !String(chk.value || "").includes('"c":')) continue;
+                    if (String(chk.value).includes('"c":0')) continue; // 该扩展没挂 onCommitted
+                    await evalInSwByElectronId(e.electronId, dispatchExpr).catch(() => null);
+                    // 多点排空（TM handler 异步 fetch 后才 tabs.create）
+                    for (const delay of [1500, 4000, 8000]) {
+                        await new Promise((r) => setTimeout(r, delay === 1500 ? 1500 : delay === 4000 ? 2500 : 4000));
+                        try {
+                            const dr = await evalInSwByElectronId(e.electronId, drainExpr);
+                            const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
+                            for (const it of (Array.isArray(items) ? items : [])) {
+                                const u = String((it && it.url) || "");
+                                if (!u) continue;
+                                if (u.includes("ask.html") && this.pendingUserJs) this.pendingUserJs.askOpened = true;
+                                const bp = (window as any).browserPlugin;
+                                if (bp?.openUrl) bp.openUrl(u, { force: true });
+                            }
+                        } catch {}
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    /** .user.js 导航 → 油猴安装：宿主拦下导航（Electron 无阻塞 webRequest，
+     *  TM MV3 自己也不再有该能力），下载脚本内容并解析 ==UserScript== 头，
+     *  注册进油猴扩展的 userScripts 注册表（垫片持久化，宿主注入器自动在
+     *  匹配页面执行）。@grant none 类脚本完整可用；带 GM_* 的脚本受限于
+     *  TM 未知其记录，GM 调用暂不可用（v1 权衡）。 */
+    private async interceptUserScriptInstall(url: string, resourceType: string, cb: (r: any) => void): Promise<void> {
+        cb({ cancel: true });
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            if (!host?.list) {
+                console.warn("[browser-plugin] .user.js 拦截: extensionHost 缺 list");
+                return;
+            }
+            const tm = host.list().find((e: any) => /tampermonkey|篡改猴/i.test(String(e.name || "")) && e.electronId && e.native);
+            if (!tm) {
+                showMessage("未找到油猴扩展，无法安装脚本", 4000, "error");
+                return;
+            }
+            // 下载脚本内容：★ 必须走浏览器分区的 session.fetch（代理/cookie 与
+            // 页面一致）——渲染进程默认 fetch 走思源会话，实测 update/greasyfork
+            // 全部超时而分区网络正常。update 域失败时镜像到主站 code 路径。
+            const ses = (() => {
+                try { return (this.webview as any)?.getWebContents?.()?.session || null; } catch { return null; }
+            })() || remoteSession(BROWSER_PARTITION);
+            const fetchVia = async (u: string, ms: number): Promise<string> => {
+                // ★ ses.fetch（Electron net）不接受 AbortSignal——用 Promise.race
+                //   超时放弃慢请求（后台连接自行终止即可）
+                const doReq = async (): Promise<string> => {
+                    const r = ses && ses.fetch ? await ses.fetch(u, { credentials: "include" }) : await fetch(u, { credentials: "include" });
+                    if (!r.ok) throw new Error("HTTP " + r.status);
+                    return await r.text();
+                };
+                let timer: any = null;
+                const timeoutP = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("fetch 超时 " + ms + "ms")), ms); });
+                try { return await Promise.race([doReq(), timeoutP]); } finally { clearTimeout(timer); }
+            };
+            let code = "";
+            try {
+                code = await fetchVia(url, 15000);
+            } catch (e1) {
+                // greasyfork 的 update 域直连常见超时：镜像到主站 code 路径
+                const m = url.match(/^https?:\/\/update\.greasyfork\.org\/scripts\/(\d+)\/([^/?#]+\.user\.js)$/i);
+                if (!m) throw e1;
+                code = await fetchVia("https://greasyfork.org/scripts/" + m[1] + "/code/" + m[2], 15000);
+            }
+            const USERSCRIPT_HEAD = new RegExp("==\\s*UserScript\\s*==");
+            if (!USERSCRIPT_HEAD.test(code)) throw new Error("内容缺少 ==UserScript== 头，不是用户脚本");
+            const meta = (k: string): string => {
+                const m = code.match(new RegExp("//\\s*@" + k + "\\s+([^\\r\\n]+)", "i"));
+                return m ? m[1].trim() : "";
+            };
+            const fname = decodeURIComponent((url.split("?")[0].split("/").pop() || "")).replace(/\.user\.js$/i, "");
+            const name = meta("name") || fname || "userscript";
+            const version = meta("version");
+            const author = meta("author");
+            const description = meta("description");
+            const matches: string[] = [];
+            const re = new RegExp("//\\s*@(match|include)\\s+([^\\r\\n]+)", "gi");
+            let mm: RegExpExecArray | null;
+            while ((mm = re.exec(code))) {
+                const pat = mm[2].trim();
+                if (pat && !matches.includes(pat)) matches.push(pat);
+            }
+            if (!matches.length) matches.push("*://*/*");
+            // 确认弹窗（对齐 TM ask.html 语义）：展示脚本信息，用户点安装才注册
+            const aid = "aid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+            this.pendingInstalls.set(aid, {
+                url,
+                code,
+                name,
+                version,
+                author,
+                description,
+                matches,
+                electronId: tm.electronId,
+                extName: tm.name,
+            });
+            this.showInstallDialog(aid, { name, version, author, description, matches, from: url });
+        } catch (e) {
+            console.warn("[browser-plugin] .user.js 安装失败:", e);
+            showMessage("安装脚本失败: " + (e instanceof Error ? e.message : e), 5000, "error");
+        }
+    }
+
+    /** 安装确认弹窗（宿主侧 DOM，对齐 TM ask.html 的确认语义） */
+    private showInstallDialog(aid: string, info: { name: string; version: string; author: string; description: string; matches: string[]; from: string }): void {
+        const esc = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+        const overlay = document.createElement("div");
+        overlay.className = "sy-us-install-overlay";
+        overlay.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;";
+        const rows: Array<[string, string]> = [
+            ["名称", info.name],
+            ["版本", info.version || "（未声明）"],
+            ["作者", info.author || "（未声明）"],
+            ["描述", info.description || "（未声明）"],
+            ["运行于", info.matches.join("、")],
+        ];
+        overlay.innerHTML =
+            '<div class="sy-us-install-card" style="background:#fff;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.3);width:420px;max-width:92vw;padding:18px 20px;font-size:13px;color:#333;">'
+            + '<div style="font-size:15px;font-weight:600;margin-bottom:10px;">安装用户脚本</div>'
+            + rows.map(([k, v]) => '<div style="display:flex;gap:8px;margin:4px 0;"><div style="flex:0 0 52px;color:#888;">' + k + '</div><div style="flex:1;word-break:break-all;">' + esc(v) + "</div></div>").join("")
+            + '<div style="margin:10px 0 0;color:#888;font-size:12px;">来源: ' + esc(info.from.slice(0, 90)) + "</div>"
+            + '<div style="display:flex;gap:10px;justify-content:flex-end;margin-top:14px;">'
+            + '<button data-act="cancel" style="padding:6px 16px;border-radius:6px;border:1px solid #ddd;background:#f5f5f5;cursor:pointer;">取消</button>'
+            + '<button data-act="install" style="padding:6px 18px;border-radius:6px;border:none;background:#1a73e8;color:#fff;cursor:pointer;font-weight:600;">安装</button>'
+            + "</div></div>";
+        const close = () => { try { overlay.remove(); } catch {} };
+        this.pendingInstallDialogs.add(overlay);
+        overlay.addEventListener("click", (ev) => {
+            const btn = (ev.target as HTMLElement).closest("button[data-act]");
+            if (!btn) {
+                if (ev.target === overlay) close(); // 点遮罩 = 取消
+                return;
+            }
+            const act = btn.getAttribute("data-act");
+            close();
+            this.pendingInstallDialogs.delete(overlay);
+            if (act !== "install") return;
+            void this.confirmInstall(aid);
+        });
+        this.element.appendChild(overlay);
+    }
+
+    /** 用户确认后的注册（原直装逻辑后移至此） */
+    private async confirmInstall(aid: string): Promise<void> {
+        const pending = this.pendingInstalls.get(aid);
+        if (!pending) return;
+        this.pendingInstalls.delete(aid);
+        const { code, name, matches, electronId: electronId } = pending;
+        try {
+            const id = "sy-install-" + Date.now().toString(36);
+            const tryRegister = async (m: string[]): Promise<string> => {
+                const script = { id, matches: m, js: [{ code }], world: "USER_SCRIPT", runAt: "document_idle" };
+                // ★ 传参是 JSON 字符串，SW 侧必须先 JSON.parse —— 否则 register
+                //   收到 string，s.id undefined 被守卫跳过，还报 "ok"（实测踩坑）
+                const expr = "(function (scriptJson) { try { var script = JSON.parse(scriptJson); chrome.userScripts.register(script, function () {}); return 'ok'; } catch (e) { return 'throw:' + e.message; } })(" + JSON.stringify(JSON.stringify(script)) + ")";
+                const r = await evalInSwByElectronId(electronId, expr);
+                return String(r?.value || "");
+            };
+            let reg = await tryRegister(matches);
+            if (reg !== "ok") {
+                // match pattern 不合法（@include 通配等）→ 兜底 <all_urls>
+                reg = await tryRegister(["<all_urls>"]);
+            }
+            if (reg !== "ok") {
+                showMessage("安装脚本失败: " + reg.replace("throw:", ""), 5000, "error");
+                return;
+            }
+            console.info("[browser-plugin] 油猴脚本已安装:", name, "matches:", matches.join(" "));
+            showMessage("已安装油猴脚本: " + name, 4000, "info");
+        } catch (e) {
+            console.warn("[browser-plugin] .user.js 安装失败:", e);
+            showMessage("安装脚本失败: " + (e instanceof Error ? e.message : e), 5000, "error");
+        }
+    }
+
     private webviewSessionFallback(): any | null {
         try {
             const wv: any = this.webview;
@@ -340,11 +674,37 @@ export class BrowserTab {
     }
 
     private registerWebRequest(session: any): void {
-        // 0. 网络层广告拦截：DNR 规则引擎（AdGuard 官方规则集，惰性加载）——
-        //    对齐 Chrome 的网络层过滤能力（Electron 无 declarativeNetRequest）
+        // 0. 网络层拦截：①webRequest 阻塞桥（扩展监听器 filter 命中才派发，
+        //    TM 的 .user.js 安装由此原生走通）；②.user.js 宿主直装兜底；
+        //    ③DNR 规则引擎（AdGuard 官方规则集，惰性加载）。
         session.webRequest.onBeforeRequest((details: any, cb: (r: any) => void) => {
             try {
-                if (dnrBlocker.shouldBlock(details?.url || "", details?.resourceType, details?.referrer || "")) {
+                const url = details?.url || "";
+                if (/^chrome-extension:/i.test(url) || /^data:/i.test(url)) { cb({}); return; }
+                const RT_MAP: Record<string, string> = { mainFrame: "main_frame", subFrame: "sub_frame", xhr: "xmlhttprequest", cspReport: "csp_report", webSocket: "websocket" };
+                const rtDnr = RT_MAP[String(details?.resourceType || "")] || String(details?.resourceType || "") || null;
+                // ★ .user.js 最优先且立即放行（绝不持阻塞回调——挂起超时会被
+                //   Chromium 以 ERR_ABORTED 中止，实测 -3）。导航继续渲染文本页；
+                //   桥派发与 onCommitted 派发异步进行（TM 若接管自行开 ask 页）；
+                //   12s 未接管 → 回落宿主确认弹窗直装（interceptUserScriptInstall）。
+                if (/\.user\.js(?:[?#]|$)/i.test(url)) {
+                    cb({});
+                    this.pendingUserJs = { url, askOpened: false };
+                    void (async () => {
+                        try { await this.dispatchWrCollect(url, rtDnr, details); await this.drainWrOutbox(); } catch {}
+                    })();
+                    setTimeout(() => {
+                        const pj = this.pendingUserJs;
+                        if (pj && pj.url === url && !pj.askOpened) {
+                            console.info("[browser-plugin] .user.js TM 未接管，回落宿主确认安装:", url.slice(0, 80));
+                            void this.interceptUserScriptInstall(url, "mainFrame", () => {});
+                        }
+                        if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
+                    }, 12000);
+                    return;
+                }
+                if (this.maybeDispatchWr(url, rtDnr, details, cb)) return;
+                if (dnrBlocker.shouldBlock(url, details?.resourceType, details?.referrer || "")) {
                     cb({ cancel: true });
                     return;
                 }
@@ -589,7 +949,14 @@ export class BrowserTab {
             version: ext.version,
             defaultLocale: ext.defaultLocale,
             contentScripts: ext.contentScripts,
+            optionsPath: (ext as any).optionsPath,
             userAgent: this.settings.userAgent,
+            // 锚定页：overlay 真实源架构下垫片世界 tabs.query 的"当前页签"
+            // （不传则 AdGuard 的 tab 上下文塌成扩展页 → 弹窗端口回包永空）
+            anchorTab: {
+                url: String(this.webview.getURL?.() || ""),
+                title: String((this.webview as any).getTitle?.() || document.title || ""),
+            },
         });
     }
 
@@ -640,11 +1007,19 @@ export class BrowserTab {
                         pagePath,
                         // 改道重建场景页面真实 location 是 about:blank，TM 等按
                         // pathname 分派引导分支会静默空转 —— 伪装成目标 URL
-                        spoofLocationUrl: url,
-                        // Electron 44 实测 webview 加载 chrome-extension:// 被拒（退
-                        // about:blank），页面 DOM/CSS 不会原生存在。不能按当前 URL 判断
-                        // —— dom-ready 触发时 getURL() 可能还是目标 URL（随后才被洗成
-                        // about:blank，注入全被冲掉）。直接探页面实际 DOM：空页即重建。
+                        // 真实源原生加载（2026-10-31 起 options 页与 popup 同架构）：
+                        // location 语义已原生正确，跳过伪装；about:blank/chrome-error
+                        // 兜底路径才需要（TM 等按 pathname 分派引导分支，真实
+                        // location 是 about:blank 会静默空转）
+                        spoofLocationUrl: /^chrome-extension:\/\//i.test((() => {
+                            try { return this.webview.getURL?.() || ""; } catch { return ""; }
+                        })()) ? undefined : url,
+                        // 页面 DOM 是否原生存在不能按 URL 判断（dom-ready 时 getURL()
+                        // 与实际文档可能错位）—— 直接探页面实际 DOM：空页即重建。
+                        // about:blank 兜底文档（不透明源）→ localStorage 垫片种子照传
+                        //（原生真源文档垫片不装，种子自动闲置；写入经 webview ipc
+                        // 回灌宿主，见 WebviewController ipc-message 监听）
+                        lsSeed: readExtLsSeed(electronId),
                         rebuildDom: await (async () => {
                             try {
                                 const len = await this.webview.executeJavaScript(

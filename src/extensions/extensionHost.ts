@@ -243,6 +243,33 @@ export class ExtensionHost {
             } catch (e) {}
             return msg;
         };
+        // 0c) onInstalled 收集 + 真首次放行：Electron 每次 loadExtension（含本
+        //     插件启动时的 removeExtension+loadExtension 保活/重载）都以
+        //     reason=install 派发 onInstalled —— 实测 TM 据此每次启动都开
+        //     tampermonkey.net/installed.php 欢迎页签（旧 tabs.create 假桩静默
+        //     吞掉所以从未暴露，create 实装后每个 SW 启动都弹页签）。属性替换后
+        //     原生事件落到无监听的原生对象上自然被吞；是否放行改由 storage
+        //     持久标记决定（按扩展隔离，真·首次安装语义）。
+        try {
+            if (chrome.runtime && chrome.runtime.onInstalled && !chrome.runtime.onInstalled.__syWrapped) {
+                var oiFns = [];
+                var oiWrapped = {
+                    addListener: function (fn) { if (typeof fn === "function") oiFns.push(fn); },
+                    removeListener: function (fn) { var i = oiFns.indexOf(fn); if (i >= 0) oiFns.splice(i, 1); },
+                };
+                oiWrapped.__syWrapped = true;
+                try { Object.defineProperty(chrome.runtime, "onInstalled", { configurable: true, get: function () { return oiWrapped; } }); } catch (eOi) { try { chrome.runtime.onInstalled = oiWrapped; } catch (eOi2) {} }
+                var oiEmit = function (details) { for (var i = 0; i < oiFns.length; i++) { try { oiFns[i](details); } catch (eOi3) {} } };
+                oiWrapped.__syEmit = oiEmit;
+                try {
+                    chrome.storage.local.get(["__syOiSeen"], function (v) {
+                        if (v && v.__syOiSeen) return;
+                        try { chrome.storage.local.set({ __syOiSeen: Date.now() }, function () {}); } catch (eOi4) {}
+                        oiEmit({ reason: "install" });
+                    });
+                } catch (eOi5) {}
+            }
+        } catch (e) {}
         // 1) 通用存在性垫片：background 里引用到的缺失命名空间统一补空壳，
         //    否则任何一处 undefined 访问都会让 SW 整个崩掉（实测 SiYuan Clip
         //    第一行 contextMenus、中段 commands 各崩一次）。
@@ -310,6 +337,21 @@ export class ExtensionHost {
         // commands 补 API 形态（manifest 里声明的快捷键注册）
         if (chrome.commands && !chrome.commands.getAll) {
             chrome.commands.getAll = function (cb) { cb && cb([]); };
+        }
+        // chrome.windows 补桩：AdGuard init 链调 WindowsApi.update → chrome.windows.*，
+        // Electron SW 里 chrome.windows 缺失 → TypeError → init 中断（实测
+        // 设置页 React 不挂载的直接原因）。补齐 create/update/remove/getAll/getLastFocused。
+        if (!chrome.windows) {
+            chrome.windows = {
+                create: function (opts, cb) { var w = { id: 1 }; if (typeof cb === "function") { try { cb(w); } catch (e) {} } return Promise.resolve(w); },
+                update: function (id, props, cb) { var w = { id: id }; if (typeof cb === "function") { try { cb(w); } catch (e) {} } return Promise.resolve(w); },
+                remove: function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); },
+                getAll: function (cb) { var v = []; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); },
+                getLastFocused: function (cb) { var w = { id: 1 }; if (typeof cb === "function") { try { cb(w); } catch (e) {} } return Promise.resolve(w); },
+                onCreated: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                onRemoved: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                onFocusChanged: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+            };
         }
         // 3) onInstalled 补发：Electron 不触发 runtime.onInstalled，而不少扩展
         //    把 contextMenus.create 全放它的回调里（实测 SiYuan Clip）——
@@ -406,6 +448,21 @@ export class ExtensionHost {
                         } catch (e) {}
                     });
                 }
+            }
+        } catch (e) {}
+        // 3b) storage.managed 补桩：Electron 无 managed storage（企业策略存储）。
+        //     TM 启动探测它，原生缺失抛 "managed is not available" → 重试 4 轮
+        //     （每轮带延时）拖慢 SW 启动。补空桩（get 恒空对象）→ TM 立即走
+        //     storage.local 分支。sync 保持原生（Electron 原生 sync 实测可用）。
+        try {
+            if (chrome.storage && !chrome.storage.managed) {
+                chrome.storage.managed = {
+                    get: function (keys, cb) {
+                        var empty = {};
+                        if (typeof cb === "function") { try { cb(empty); } catch (e) {} }
+                        return Promise.resolve(empty);
+                    },
+                };
             }
         } catch (e) {}
         // 4) runtime.onConnect 端口语义（AdGuard 等经 port 与 SW 通信取状态）：
@@ -510,6 +567,57 @@ export class ExtensionHost {
                 if (!chrome.tabs.get) chrome.tabs.get = function (id, cb) { var t = { id: id, index: 0, windowId: 1, active: false, url: "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
                 if (!chrome.tabs.reload) chrome.tabs.reload = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
                 if (chrome.tabs.TAB_ID_NONE === undefined) chrome.tabs.TAB_ID_NONE = -1;
+                // 5b-2) declarativeNetRequest 虚拟存储：AdGuard 引擎启动会把十几万条
+                //     规则经 updateDynamicRules/updateSessionRules 写入 Electron 原生
+                //     DNR —— 实测大规则集写入挂起，Engine.start 永不返回，其后的消息
+                //     handler 注册全部不执行（设置页/弹窗数据全 undefined）。宿主的
+                //     dnrEngine 已独立执行真实拦截，这里把写入/读出改为**内存虚拟
+                //     存储**（写入即时成功且可回读——tswebextension 应用规则后会
+                //     校验回读，空回读会死循环重试），init 顺利越过；规则不触达
+                //     原生 DNR（真实拦截由宿主 dnrEngine 负责）。
+                if (chrome.declarativeNetRequest) {
+                    self.__syDnrStore = { dynamic: [], session: [] };
+                    const syDnrApply = function (store, p) {
+                        p = p || {};
+                        var remove = p.removeRuleIds || [];
+                        var add = p.addRules || [];
+                        for (var i = 0; i < remove.length; i++) {
+                            store = store.filter(function (r) { return r.id !== remove[i]; });
+                        }
+                        for (var j = 0; j < add.length; j++) {
+                            var found = false;
+                            for (var k = 0; k < store.length; k++) {
+                                if (store[k].id === add[j].id) { store[k] = add[j]; found = true; break; }
+                            }
+                            if (!found) store.push(add[j]);
+                        }
+                        return store;
+                    };
+                    const syDnrOk = function (cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
+                    chrome.declarativeNetRequest.updateDynamicRules = function (p, cb) {
+                        self.__syDnrStore.dynamic = syDnrApply(self.__syDnrStore.dynamic, p);
+                        return syDnrOk(cb);
+                    };
+                    chrome.declarativeNetRequest.updateSessionRules = function (p, cb) {
+                        self.__syDnrStore.session = syDnrApply(self.__syDnrStore.session, p);
+                        return syDnrOk(cb);
+                    };
+                    chrome.declarativeNetRequest.getDynamicRules = function (p, cb) {
+                        var cb2 = typeof p === "function" ? p : cb;
+                        if (typeof cb2 === "function") { try { cb2(self.__syDnrStore.dynamic); } catch (e) {} }
+                        // ★ Promise 路径必须返回数组（不能 {}）：AdGuard 引擎启动链
+                        //   await getDynamicRules() 后直接 .map —— 拿到 {} 抛
+                        //   "existingRules.map is not a function" → TsWebExtension
+                        //   innerStart 失败 → 整个 app 初始化中断（TabsApi 等全没跑）
+                        //   → popup 永远卡 loader（2026-10-31 实测定案）
+                        return Promise.resolve(self.__syDnrStore.dynamic);
+                    };
+                    chrome.declarativeNetRequest.getSessionRules = function (p, cb) {
+                        var cb2 = typeof p === "function" ? p : cb;
+                        if (typeof cb2 === "function") { try { cb2(self.__syDnrStore.session); } catch (e) {} }
+                        return Promise.resolve(self.__syDnrStore.session);
+                    };
+                }
                 // 5c) permissions API 补桩：AdGuard 引擎启动链调 permissions.contains
                 //     （Electron 原生缺失 → "Cannot be started"）。MV3 所需权限默认放行。
                 if (chrome.permissions) {
@@ -721,6 +829,132 @@ export class ExtensionHost {
                     console.warn("[sy-shim] chrome.downloads.download 未实现（改用页内下载）:", opts && opts.url);
                     if (typeof cb === "function") { try { cb(undefined); } catch (e3) {} }
                     return Promise.resolve(undefined);
+                };
+            }
+        } catch (e) {}
+        // 9) webRequest 真实事件面 + 阻塞桥（2026-10-31"阻塞桥"定案）：扩展的
+        //    webRequest 监听器由宿主代理——垫片在 addListener 时**连同 filter
+        //    （urls/types）一起登记**并暴露快照；宿主（BrowserTab registerWebRequest）
+        //    对每个请求先按 filter 预筛，命中才经 evalInSw 合成派发，收集扩展
+        //    返回的 {cancel/redirectUrl} 并执行。TM 的 .user.js 安装拦截（阻塞 +
+        //    ask.html?aid 重定向）由此原生走通（真 ask.html 确认页）。派发量被
+        //    filter 预筛压到趋近于零，不拖累页面加载。
+        try {
+            if (chrome.webRequest && !chrome.webRequest.__syReal) {
+                var wrFns = self.__syWebRequestFns = self.__syWebRequestFns || {};
+                var wrFilters = self.__syWebRequestFilters = self.__syWebRequestFilters || {};
+                var wrEv = function (name) {
+                    var entries = wrFns[name] = wrFns[name] || [];
+                    var filters = wrFilters[name] = wrFilters[name] || [];
+                    return {
+                        addListener: function (fn, filter) {
+                            if (typeof fn !== "function") return;
+                            entries.push(fn);
+                            filters.push(filter && typeof filter === "object"
+                                ? { urls: Array.isArray(filter.urls) ? filter.urls.map(String) : null, types: Array.isArray(filter.types) ? filter.types.map(String) : null }
+                                : null);
+                        },
+                        removeListener: function (fn) {
+                            var i = entries.indexOf(fn);
+                            if (i >= 0) { entries.splice(i, 1); filters.splice(i, 1); }
+                        },
+                        hasListener: function (fn) { return entries.indexOf(fn) >= 0; },
+                    };
+                };
+                chrome.webRequest = {
+                    __syReal: true,
+                    onBeforeRequest: wrEv("onBeforeRequest"),
+                    onBeforeSendHeaders: wrEv("onBeforeSendHeaders"),
+                    onSendHeaders: wrEv("onSendHeaders"),
+                    onHeadersReceived: wrEv("onHeadersReceived"),
+                    onAuthRequired: wrEv("onAuthRequired"),
+                    onBeforeRedirect: wrEv("onBeforeRedirect"),
+                    onResponseStarted: wrEv("onResponseStarted"),
+                    onCompleted: wrEv("onCompleted"),
+                    onErrorOccurred: wrEv("onErrorOccurred"),
+                    MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
+                    OnBeforeSendHeadersOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                    OnHeadersReceivedOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                    OnAuthRequiredOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                    handlerBehaviorChanged: function (cb) { if (typeof cb === "function") { try { cb(); } catch (eWr) {} } return Promise.resolve(); },
+                };
+            }
+        } catch (e) {}
+        // 10) downloads 真实事件面：TM MV3 的 .user.js 安装入口是
+        //     downloads.onCreated（真 Chrome 把 .user.js 当下载，TM 观察后自己
+        //     fetch URL、登记待装、tabs.create 开 ask.html）。宿主拦 .user.js
+        //     导航后经 evalInSw 调 __syEmitDownload 合成下载事件 → TM 原生安装
+        //     流（含 ask.html?aid 确认页）完整走通。search 按宿主合成条目作答。
+        try {
+            if (chrome.downloads && !chrome.downloads.__syReal) {
+                var dlFns = self.__syDownloadFns = self.__syDownloadFns || {};
+                var dlEv = function (name) {
+                    var fns = dlFns[name] = dlFns[name] || [];
+                    return {
+                        addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                        removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                        hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
+                    };
+                };
+                var dlItems = self.__syDownloadItems = self.__syDownloadItems || {};
+                chrome.downloads.__syReal = true;
+                chrome.downloads.onCreated = dlEv("onCreated");
+                chrome.downloads.onChanged = dlEv("onChanged");
+                chrome.downloads.onErased = dlEv("onErased");
+                chrome.downloads.search = function (q, cb) {
+                    var items = [];
+                    try {
+                        for (var k in dlItems) {
+                            var it = dlItems[k];
+                            if (!q || (!q.id && !q.url) || (q.id && String(it.id) === String(q.id)) || (q.url && String(it.url).indexOf(String(q.url)) >= 0)) items.push(it);
+                        }
+                    } catch (eDl1) {}
+                    if (typeof cb === "function") { try { cb(items); } catch (eDl2) {} }
+                    return Promise.resolve(items);
+                };
+                chrome.downloads.cancel = function (id, cb) { if (typeof cb === "function") { try { cb(true); } catch (eDl3) {} } return Promise.resolve(true); };
+                chrome.downloads.erase = function (q, cb) { if (typeof cb === "function") { try { cb([]); } catch (eDl4) {} } return Promise.resolve([]); };
+                chrome.downloads.pause = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (eDl5) {} } return Promise.resolve(); };
+                chrome.downloads.resume = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (eDl6) {} } return Promise.resolve(); };
+                // 宿主入口：合成一条下载（触发 onCreated 监听器）
+                self.__syEmitDownload = function (url) {
+                    var did = "sy-dl-" + Date.now();
+                    var item = { id: did, url: String(url), filename: decodeURIComponent((String(url).split("?")[0].split("/").pop() || "file")), state: "in_progress", bytesReceived: 0, totalBytes: 0, mime: "text/plain" };
+                    dlItems[did] = item;
+                    var fns2 = dlFns.onCreated || [];
+                    for (var j = 0; j < fns2.length; j++) { try { fns2[j](item); } catch (eDl7) {} }
+                    return did;
+                };
+            }
+        } catch (e) {}
+        // 11) webNavigation 真实事件面：TM 的安装检测（.user.js 导航观察）与
+        //     各类 URL 感知逻辑依赖导航事件流；哑桩时代注册被静默吞掉。宿主
+        //     （BrowserTab did-navigate）按 onCommitted 合成派发，监听器数组
+        //     暴露到 self.__syWebNavFns 供宿主预筛。
+        try {
+            if (chrome.webNavigation && !chrome.webNavigation.__syReal) {
+                var wnFns = self.__syWebNavFns = self.__syWebNavFns || {};
+                var wnEv = function (name) {
+                    var fns = wnFns[name] = wnFns[name] || [];
+                    return {
+                        addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                        removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                        hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
+                    };
+                };
+                chrome.webNavigation = {
+                    __syReal: true,
+                    onBeforeNavigate: wnEv("onBeforeNavigate"),
+                    onCommitted: wnEv("onCommitted"),
+                    onDOMContentLoaded: wnEv("onDOMContentLoaded"),
+                    onCompleted: wnEv("onCompleted"),
+                    onErrorOccurred: wnEv("onErrorOccurred"),
+                    onCreatedNavigationTarget: wnEv("onCreatedNavigationTarget"),
+                    onHistoryStateUpdated: wnEv("onHistoryStateUpdated"),
+                    onReferenceFragmentUpdated: wnEv("onReferenceFragmentUpdated"),
+                    onTabReplaced: wnEv("onTabReplaced"),
+                    getAllFrames: function (opts, cb) { var v = [{ frameId: 0, url: String(location.href), parentFrameId: -1 }]; if (typeof cb === "function") { try { cb(v); } catch (eWn1) {} } return Promise.resolve(v); },
+                    getFrame: function (opts, cb) { var v = { frameId: 0, url: String(location.href), parentFrameId: -1 }; if (typeof cb === "function") { try { cb(v); } catch (eWn2) {} } return Promise.resolve(v); },
                 };
             }
         } catch (e) {}

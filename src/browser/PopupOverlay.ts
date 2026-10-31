@@ -9,7 +9,7 @@
 // SW 保持温热），下次打开直接注入，无冷启动。
 import { IWebviewTag } from "../types";
 import { BROWSER_PARTITION } from "../constants";
-import { injectExtensionPageRuntime } from "./ext-popup";
+import { injectExtensionPageRuntime, readExtLsSeed, persistExtLs } from "./ext-popup";
 import { beginPopupWorld, evalPopupJs, ICsExtInfo } from "../extensions/cs-runtime";
 
 export interface PopupOpenOptions {
@@ -23,7 +23,11 @@ export interface PopupOpenOptions {
     version: string;
     defaultLocale: string;
     contentScripts: Array<{ matches: string[]; js: string[]; css: string[] }>;
+    optionsPath?: string;
     userAgent?: string;
+    /** 弹窗锚定页（tabs.query 的"当前页签"语义；overlay 真实源架构下必须
+     * 显式传入，否则垫片世界把扩展页自己喂给 SW，AdGuard tab 上下文塌掉） */
+    anchorTab?: { url: string; title: string };
     onError: (msg: string) => void;
 }
 
@@ -39,6 +43,8 @@ export class ExtensionPopupOverlay {
     private openRequested = false;             // 已请求注入（等 dom-ready）
     private docReady = false;                  // guest 文档就绪（about:blank 加载完成）
     private activeOpts: PopupOpenOptions | null = null;
+    private navRetries = 0;                    // 原生源导航重试计数（>8 = 放弃走兜底）
+    private navTimer: ReturnType<typeof setTimeout> | null = null;
     private onClosedCb: (extId: string) => void;
     private onErrorCb: (msg: string) => void;
 
@@ -65,13 +71,39 @@ export class ExtensionPopupOverlay {
         const vw = document.createElement("webview") as unknown as IWebviewTag;
         vw.setAttribute("src", "about:blank");
         vw.setAttribute("partition", BROWSER_PARTITION);
-        // 与页面 webview 同偏好（禁沙箱世界语义一致）；不挂 preload（弹窗不需要链接拦截）
+        // 与页面 webview 同偏好；挂 preload（confirm 抑制 + 缩放 + F12 DevTools 转发）
         vw.setAttribute("webpreferences", "contextIsolation=no,nodeIntegrationInSubFrames=yes");
+        try {
+            const preloadPath = (window as any).browserPlugin?.getPreloadPathSync?.();
+            if (preloadPath) vw.setAttribute("preload", preloadPath);
+        } catch {}
         if (this.userAgent) {
             try { vw.useragent = this.userAgent; } catch {}
         }
         vw.style.cssText = "width:100%;height:100%;border:0;";
         host.appendChild(vw);
+        // 调试按钮：点击打开 overlay webview 的 DevTools（定位扩展 React 不挂载等问题）
+        const dbgBtn = document.createElement("button");
+        dbgBtn.textContent = "DT";
+        dbgBtn.title = "打开/关闭 DevTools";
+        dbgBtn.style.cssText = "position:absolute;top:2px;left:2px;z-index:10;width:24px;height:20px;"
+            + "background:#1a73e8;color:#fff;border:none;border-radius:3px;cursor:pointer;"
+            + "font-size:10px;font-weight:bold;line-height:20px;text-align:center;padding:0;opacity:.7;";
+        dbgBtn.addEventListener("click", () => { this.openGuestDevTools(); });
+        host.style.position = "fixed";
+        host.style.overflow = "visible";
+        host.appendChild(dbgBtn);
+        // guest → 宿主通道：F12 开 DevTools；localStorage 垫片快照回灌持久化
+        vw.addEventListener("ipc-message", (e: any) => {
+            if (e.channel === "sy-open-devtools") {
+                this.openGuestDevTools();
+            } else if (e.channel === "sy-ext-ls-write") {
+                try {
+                    const p = e.args && e.args[0];
+                    if (p && p.extId) persistExtLs(String(p.extId), p.data);
+                } catch {}
+            }
+        });
         vw.addEventListener("dom-ready", () => {
             this.docReady = true;
             if (this.openRequested) void this.injectNow();
@@ -84,6 +116,34 @@ export class ExtensionPopupOverlay {
         this.tabRoot.appendChild(host);
         this.host = host;
         this.vw = vw;
+    }
+
+    /** 打开/关闭 overlay webview guest 的 DevTools（DT 按钮与 F12 共用）。
+     *  首选 @electron/remote 拿 webContents 调 openDevTools({mode:"detach"})——
+     *  独立窗口醒目可见（webview 方法默认停靠形态曾疑似开在主窗后不可见）；
+     *  remote 不可用再退 webview 元素方法。失败弹 toast（"没反应"不可接受）。 */
+    private openGuestDevTools(): void {
+        const vw = this.vw;
+        if (!vw) return;
+        try {
+            const remote = (window as any).require?.("@electron/remote");
+            const id = (vw as any).getWebContentsId?.();
+            if (remote?.webContents?.fromId && typeof id === "number") {
+                const wc = remote.webContents.fromId(id);
+                if (wc) {
+                    if (wc.isDevToolsOpened()) { wc.closeDevTools(); } else { wc.openDevTools({ mode: "detach" }); }
+                    return;
+                }
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] DT remote path failed:", e);
+        }
+        try {
+            if (vw.isDevToolsOpened()) { vw.closeDevTools(); } else { vw.openDevTools({ mode: "detach" } as any); }
+        } catch (e) {
+            console.warn("[browser-plugin] DT webview path failed:", e);
+            this.onErrorCb("打开 DevTools 失败: " + (e instanceof Error ? e.message : e));
+        }
     }
 
     private applyUserAgent(ua?: string): void {
@@ -107,19 +167,59 @@ export class ExtensionPopupOverlay {
         this.host!.style.display = "";
         if (this.userAgent) this.applyUserAgent(this.userAgent);
         if (sameDoc) return; // 同一扩展已显示（注入完成过）——保持现状
-        // 全新文档注入：强制真实导航（loadURL 同值也导航，src 同值会被去重），
-        // dom-ready 后注入
+        // 全新文档注入：直接导航真实扩展源（Electron 内建扩展 URL 工厂可伺服
+        // chrome-extension://<id>/<path>，真源 = 原生 localStorage 持久化 + 原生
+        // location 语义；2026-10-31 实测 BrowserWindow/webview 均原生加载成功 ——
+        // 早前"被拒退 about:blank"的结论是请求了不存在的根路径 /popup.html 的
+        // 假象，真实路径是 pages/popup.html）。原生失败时由 injectNow 按 URL
+        // 降级到 about:blank 重建路径。
         this.openRequested = true;
         this.docReady = false;
-        try { const lp = this.vw!.loadURL?.("about:blank"); if (lp && typeof lp.catch === "function") lp.catch(() => {}); } catch { try { this.vw!.src = "about:blank"; } catch {} }
-        // 同 URL 导航会被 Chromium 去重（无 dom-ready）→ reload 强制新文档
-        try { this.vw!.reload(); } catch {}
+        const extUrl = "chrome-extension://" + opts.electronId + "/" + String(opts.popupPath).replace(/^\.\//, "");
+        const curUrl = (() => { try { return this.vw!.getURL?.() || ""; } catch { return ""; } })();
+        if (this.navTimer) { clearTimeout(this.navTimer); this.navTimer = null; }
+        this.navRetries = 0;
+        if (curUrl === extUrl) {
+            // 同 URL 导航会被 Chromium 去重（无 dom-ready）→ reload 强制新文档
+            try { this.vw!.reload(); } catch {}
+        } else {
+            // ★ 必须用 src 属性导航：webview.loadURL() 对 chrome-extension:// 静默
+            //   失败（落回 about:blank，2026-10-31 实测），src 赋值则原生加载成功。
+            //   但 open() 瞬间 webview 常有挂起导航（close 归位/上一文档），会吃掉
+            //   src 赋值 —— 轮询重试直到 getURL 到位；8 次后放弃并归位 about:blank
+            //   触发 dom-ready 走重建兜底。
+            try { this.vw!.src = extUrl; } catch {}
+            const navTick = () => {
+                const vw = this.vw;
+                if (!vw || this.openExtId !== opts.extId || !this.openRequested) return;
+                let cur = ""; try { cur = vw.getURL?.() || ""; } catch {}
+                if (cur === extUrl) return; // 到位，等 dom-ready 注入
+                this.navRetries++;
+                if (this.navRetries > 8) {
+                    try { const lp = vw.loadURL?.("about:blank"); if (lp && typeof lp.catch === "function") lp.catch(() => {}); } catch {}
+                    return;
+                }
+                try { vw.src = extUrl; } catch {}
+                this.navTimer = setTimeout(navTick, 800);
+            };
+            this.navTimer = setTimeout(navTick, 800);
+        }
     }
 
     private async injectNow(): Promise<void> {
         const opts = this.activeOpts;
         const vw = this.vw;
         if (!opts || !vw || !this.openRequested) return;
+        // 原生加载成功（webview 停在真实扩展源）= 跳过 DOM 重建（原生 DOM
+        // 就位）、跳过 location 伪装（原生 location 正确）、跳过 localStorage
+        // 垫片（真源原生存储，隔离世界同源共享）。否则走 about:blank 重建兜底。
+        let curUrl = ""; try { curUrl = vw.getURL?.() || ""; } catch {}
+        const nativeLoad = /^chrome-extension:\/\//i.test(curUrl);
+        if (!nativeLoad && this.navRetries <= 8) {
+            // 原生源导航还在重试窗口内：本次 dom-ready 是中间态（close 归位的
+            // about:blank 等）—— 不消耗 openRequested，等真正的扩展文档到位
+            return;
+        }
         this.openRequested = false;
         try {
             const pagePath = String(opts.popupPath).replace(/^\.\//, "");
@@ -130,17 +230,26 @@ export class ExtensionPopupOverlay {
                 version: opts.version,
                 defaultLocale: opts.defaultLocale,
                 contentScripts: opts.contentScripts,
+                optionsPath: opts.optionsPath,
                 // 与 in-page popup 同理：SW 侧按 sender.url 判 extpage 白名单，
                 // 必须以扩展页 URL 身份发包
                 senderPageUrl: "chrome-extension://" + opts.electronId + "/" + pagePath,
+                // 锚定页 = tabs.query 的"当前页签"（真实源架构下必传，否则
+                // AdGuard 的 tab 上下文塌成扩展页、弹窗端口回包永空）
+                anchorTab: opts.anchorTab || null,
             };
             const out = await injectExtensionPageRuntime({
                 webview: vw,
                 extPath: opts.extPath,
                 electronId: opts.electronId,
                 pagePath,
-                spoofLocationUrl: "chrome-extension://" + opts.electronId + "/" + pagePath,
-                rebuildDom: true,
+                // 原生加载：location/存储/DOM 全是真语义，不重建不伪装不垫片；
+                // about:blank 兜底：重建 DOM + 伪装 location + localStorage 垫片
+                //（不透明源原生被拒 → AdGuard popup React init 崩溃不挂载的根因），
+                // 垫片写入经 ipc 回灌宿主 localStorage 持久化
+                spoofLocationUrl: nativeLoad ? undefined : "chrome-extension://" + opts.electronId + "/" + pagePath,
+                rebuildDom: !nativeLoad,
+                lsSeed: nativeLoad ? null : readExtLsSeed(opts.electronId),
                 begin: () => beginPopupWorld(vw, extInfo),
                 evalJs: (src2, relPath) => {
                     const fakeUrl = "chrome-extension://" + opts.electronId + "/" + String(relPath).replace(/^\.\//, "");
@@ -166,6 +275,7 @@ export class ExtensionPopupOverlay {
         const extId = this.openExtId;
         this.openExtId = null;
         this.openRequested = false;
+        if (this.navTimer) { clearTimeout(this.navTimer); this.navTimer = null; }
         if (!this.host) return;
         try {
             document.removeEventListener("mousedown", this.onOutsideRef, true);
@@ -186,6 +296,7 @@ export class ExtensionPopupOverlay {
             document.removeEventListener("mousedown", this.onOutsideRef, true);
             window.removeEventListener("keydown", this.onEscRef, true);
         } catch {}
+        if (this.navTimer) { clearTimeout(this.navTimer); this.navTimer = null; }
         try { this.host?.remove(); } catch {}
         this.host = null;
         this.vw = null;

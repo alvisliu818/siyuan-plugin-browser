@@ -2,11 +2,17 @@
 // （filters/declarative/ruleset_N/ruleset_N.json），经 session.webRequest
 // 阻塞式拦截（对齐 Chrome 的网络层过滤能力；Electron 无 DNR，这是等价实现）。
 //
-// 匹配器按规则分布优化（实测 5 个默认规则集共 28.3 万条 block 规则）：
-//   - 98.7% 是 "||domain" 锚定 → hostname 后缀 Map，O(域名标签数)/请求
-//   - 3.5k 泛匹配（路径/通配）→ 编译为正则（上限防御）
-//   - initiator 条件/regexFilter 规则占比 <0.5% → v1 跳过（fail-open，计数）
-// allow 规则优先于 block（AdGuard 例外/自放行）。
+// 匹配器按规则分布优化（实测 53 个规则集 35 万条规则）：
+//   - "||domain" 锚定 → hostname 后缀 Map，规则粒度 {all/paths, rts, dt}
+//   - 其余（泛匹配/带约束）→ 约束分组正则（rts/dt 相同的规则合并编译，逐组
+//     先查约束再跑正则）/ 富规则单条（regexFilter/urlFilter + initiator）
+//
+// ★ 约束完备性（2026-10-31 bidianer 误杀定案）：v1 忽略 resourceTypes（10 万条
+//   规则带此约束）与 domainType（1.5 万条），rich 路径还丢 urlFilter —— 一条
+//   initiatorDomains:["com"] + urlFilter:/assets/images/*.gif^ + resourceTypes:
+//   ["image"] 的规则被放大成"拦 .com 来源的一切请求"，站点自家 CSS/JS 全灭。
+//   本版补齐三个维度；excludedDomains / excludedInitiatorDomains /
+//   requestMethods / tabIds 规则仍跳过（fail-open 计数）。
 
 function dnrNodeMods(): { fs: any; path: any } {
     const req = (window as any).require;
@@ -14,9 +20,40 @@ function dnrNodeMods(): { fs: any; path: any } {
     return { fs: req("fs"), path: req("path") };
 }
 
+/** Electron webRequest resourceType（camelCase）→ DNR resourceTypes（snake_case） */
+const RT_MAP: Record<string, string> = {
+    mainFrame: "main_frame",
+    subFrame: "sub_frame",
+    xhr: "xmlhttprequest",
+    cspReport: "csp_report",
+    webSocket: "websocket",
+    webTransport: "webtransport",
+};
+
+interface DnrRule {
+    all?: boolean;
+    paths?: string[];
+    rts?: Set<string> | null;
+    dt?: string | null;
+}
+
 interface DnrDomainEntry {
-    all?: boolean;          // ||domain^（主机与全部路径）
-    paths?: string[];       // ||domain^path / ||domain/path（路径前缀）
+    rules: DnrRule[];
+}
+
+interface RichRule {
+    re: RegExp | null;      // regexFilter
+    ufRe: RegExp | null;    // urlFilter 编译（rich 路径必须受 urlFilter 约束）
+    initiator: string[] | null;
+    rts: Set<string> | null;
+    dt: string | null;
+}
+
+interface GenericGroup {
+    rts: Set<string> | null;
+    dt: string | null;
+    srcs: string[];
+    re: RegExp | null;
 }
 
 export interface DnrStats {
@@ -30,11 +67,21 @@ export interface DnrStats {
     blocked: number;
 }
 
+const sameSite = (a: string, b: string): boolean => {
+    const strip = (s: string) => (s.startsWith("www.") ? s.slice(4) : s);
+    const x = strip(a), y = strip(b);
+    return x === y || x.endsWith("." + y) || y.endsWith("." + x);
+};
+
 export class DnrBlocker {
     private blockDom = new Map<string, DnrDomainEntry>();
     private allowDom = new Map<string, DnrDomainEntry>();
-    private blockGenRe: RegExp | null = null;
-    private allowGenRe: RegExp | null = null;
+    private blockRich: RichRule[] = [];
+    private allowRich: RichRule[] = [];
+    private blockGroups: GenericGroup[] = [];
+    private allowGroups: GenericGroup[] = [];
+    private blockGroupMap = new Map<string, GenericGroup>();
+    private allowGroupMap = new Map<string, GenericGroup>();
     private genericBlockCount = 0;
     private genericAllowCount = 0;
     private skipped = 0;
@@ -77,6 +124,8 @@ export class DnrBlocker {
                         this.ingest(rules);
                     } catch {}
                 }
+                this.finalizeGroups(this.blockGroupMap, this.blockGroups);
+                this.finalizeGroups(this.allowGroupMap, this.allowGroups);
                 this.loaded = true;
                 console.log("[browser-plugin] DNR 规则集加载完成:", JSON.stringify(this.stats));
             } catch (e) {
@@ -100,9 +149,10 @@ export class DnrBlocker {
                 if (cond.tabIds || cond.requestMethods) { this.skipped++; continue; }
                 let uf = String(cond.urlFilter || "");
                 if (uf === "dummy.rule.adguard.com") { this.skipped++; continue; } // 占位规则
-                const map = isAllow ? this.allowDom : this.blockDom;
-                // 富规则：regexFilter（177 条）与 initiator 条件（1,063 条）——按
-                // referrer/正则逐条判定（量小，逐条正则可接受）
+                const rts = Array.isArray(cond.resourceTypes) && cond.resourceTypes.length
+                    ? new Set(cond.resourceTypes.map((x: any) => String(x)))
+                    : null;
+                const dt = cond.domainType === "firstParty" || cond.domainType === "thirdParty" ? cond.domainType : null;
                 const iniRaw = cond.initiatorDomains || cond.domains || null;
                 const hasIni = !!iniRaw && iniRaw.length > 0;
                 let re: RegExp | null = null;
@@ -110,12 +160,18 @@ export class DnrBlocker {
                     try { re = new RegExp(String(cond.regexFilter), cond.isUrlFilterCaseSensitive ? "" : "i"); }
                     catch { this.skipped++; continue; } // RE2 语法 JS 不兼容的 fail-open
                 }
-                if (re || hasIni) {
-                    const entry = {
+                const ufRe = uf ? this.compileUf(uf) : null;
+                if (uf && !ufRe) { this.skipped++; continue; }
+                // 富规则：regexFilter / initiator / 带约束的 urlFilter —— 逐条判定
+                if (re || hasIni || rts || dt) {
+                    const entry: RichRule = {
                         re,
+                        ufRe: uf ? ufRe : null,
                         initiator: hasIni ? iniRaw.map((d: string) => String(d).toLowerCase()) : null,
+                        rts,
+                        dt,
                     };
-                    (isAllow ? this.allowRich : this.richBlock).push(entry);
+                    (isAllow ? this.allowRich : this.blockRich).push(entry);
                     continue;
                 }
                 if (!uf) { this.skipped++; continue; }
@@ -126,22 +182,25 @@ export class DnrBlocker {
                     const domain = (cut < 0 ? rest : rest.slice(0, cut)).toLowerCase();
                     if (!domain || domain.includes("*")) { this.skipped++; continue; }
                     let pathPart = cut < 0 ? "" : rest.slice(cut); // 可能以 ^ 开头
-                    const entry = map.get(domain) || (map.set(domain, {}), map.get(domain)!);
+                    const entry = this.allowDom.has(domain) || this.blockDom.has(domain)
+                        ? (isAllow ? this.allowDom : this.blockDom).get(domain)!
+                        : ((isAllow ? this.allowDom : this.blockDom).set(domain, { rules: [] }), (isAllow ? this.allowDom : this.blockDom).get(domain)!);
+                    const rule: DnrRule = { rts, dt };
                     if (!pathPart || pathPart === "^") {
-                        entry.all = true;
+                        rule.all = true;
                     } else if (!pathPart.slice(1).includes("*")) {
                         // "||d^/p" 或 "||d^p" 或 "||d/p"：^ 视作路径分隔符；尾 * = 前缀匹配
                         const norm = ("/" + pathPart.replace(/^\^/, "").replace(/\^/g, "/")).replace(/\/{2,}/g, "/");
-                        (entry.paths || (entry.paths = [])).push(norm.replace(/\*+$/, "").replace(/\/{2,}/g, "/"));
+                        rule.paths = [norm.replace(/\*+$/, "").replace(/\/{2,}/g, "/")];
                     } else {
-                        // 路径中段含 *：转正则池（domain 字面 + 其余走通配转换）
-                        if (!isAllow) this.addGenericSource(escapeRe(domain) + this.dnrToRegexSource(pathPart.replace(/^\^/, "")));
-                        else this.skipped++;
+                        // 路径中段含 *：转约束分组正则池（domain 字面 + 其余走通配转换）
+                        this.addGroupSource(isAllow, escapeRe(domain) + this.dnrToRegexSource(pathPart.replace(/^\^/, "")), rts, dt);
+                        continue;
                     }
+                    entry.rules.push(rule);
                 } else {
-                    // 泛匹配：编译为正则（^ → 分隔符类，* → 任意串，| → 锚）
-                    if (isAllow) this.genericAllowCount++; else this.genericBlockCount++;
-                    if (!isAllow) this.addGenericSource(this.dnrToRegexSource(uf));
+                    // 泛匹配：按约束签名分组编译（^ → 分隔符类，* → 任意，| → 锚）
+                    this.addGroupSource(isAllow, this.dnrToRegexSource(uf), rts, dt);
                 }
             } catch {
                 this.skipped++;
@@ -149,26 +208,38 @@ export class DnrBlocker {
         }
     }
 
+    /** 约束签名分组（rts/dt 相同的规则合并编译，逐组先查约束再跑正则） */
+    private addGroupSource(isAllow: boolean, src: string, rts: Set<string> | null, dt: string | null): void {
+        const key = (rts ? Array.from(rts).sort().join(",") : "*") + "|" + (dt || "*");
+        const map = isAllow ? this.allowGroupMap : this.blockGroupMap;
+        let g = map.get(key);
+        if (!g) {
+            g = { rts, dt, srcs: [], re: null };
+            map.set(key, g);
+        }
+        g.srcs.push(src);
+        if (isAllow) this.genericAllowCount++; else this.genericBlockCount++;
+    }
+
+    private finalizeGroups(map: Map<string, GenericGroup>, out: GenericGroup[]): void {
+        for (const g of map.values()) {
+            try { g.re = new RegExp(g.srcs.join("|"), "i"); } catch { g.re = null; }
+            if (g.re) out.push(g);
+        }
+        map.clear();
+    }
+
+    private compileUf(uf: string): RegExp | null {
+        // urlFilter = URL 任意位置子串匹配；||/| 锚语义简化处理（rich 规则量小）
+        const s = uf.startsWith("||") ? uf.slice(2) : uf;
+        try { return new RegExp(this.dnrToRegexSource(s), "i"); } catch { return null; }
+    }
+
     private escapeRe(s: string): string {
         return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     }
 
-    private genericRe: RegExp | null = null;
-    private genericSrcs: string[] = [];
-    private richBlock: Array<{ re: RegExp | null; initiator: string[] | null }> = [];
-    private allowRich: Array<{ re: RegExp | null; initiator: string[] | null }> = [];
-    private addGenericSource(reSrc: string): void {
-        this.genericSrcs.push(reSrc);
-        if (this.genericSrcs.length >= 4000 && !this.genericRe) this.rebuildGeneric();
-    }
-    private rebuildGeneric(): void {
-        try {
-            this.genericRe = new RegExp(this.genericSrcs.join("|"), "i");
-        } catch {
-            this.genericRe = null;
-        }
-    }
-    /** DNR urlFilter → 正则源（^ = 非字母数字分隔符或结尾，* = 任意，|| 已在上游分流） */
+    /** DNR urlFilter → 正则源（^ = 非字母数字分隔符或结尾，* = 任意，| → 锚） */
     private dnrToRegexSource(uf: string): string {
         let s = "";
         for (let i = 0; i < uf.length; i++) {
@@ -181,7 +252,7 @@ export class DnrBlocker {
         return s;
     }
 
-    /** 请求判定：true = 阻断（allow 优先于 block；initiator 按 referrer 判定） */
+    /** 请求判定：true = 阻断（allow 优先于 block；initiator/referrer + rts/dt 全约束） */
     shouldBlock(url: string, resourceType?: string, referrer?: string): boolean {
         if (!this.loaded) return false;
         let host = "";
@@ -196,18 +267,31 @@ export class DnrBlocker {
         } catch {
             return false;
         }
+        const rtDnr = resourceType ? (RT_MAP[resourceType] || resourceType) : null;
+        const rtsOk = (set: Set<string> | null): boolean => !set || !rtDnr || set.has(rtDnr);
+        const dtOk = (dt: string | null): boolean => {
+            if (!dt) return true;
+            if (!refHost) return false; // 有 firstParty/thirdParty 条件但拿不到 referrer → fail-open
+            return dt === "firstParty" ? sameSite(refHost, host) : !sameSite(refHost, host);
+        };
         // 域名后缀匹配：host 全名 → 逐级剥标签（a.b.c → c → b.c → a.b.c）
         const labels = host.split(".");
         const domHit = (map: Map<string, DnrDomainEntry>): boolean => {
             for (let cut = 0; cut < labels.length; cut++) {
                 const entry = map.get(labels.slice(cut).join("."));
-                if (entry && (entry.all || (entry.paths && entry.paths.some((p) => path.startsWith(p) || path === p)))) return true;
+                if (!entry) continue;
+                for (const rl of entry.rules) {
+                    const pathOk = rl.all || (rl.paths && rl.paths.some((p) => path.startsWith(p) || path === p));
+                    if (pathOk && rtsOk(rl.rts) && dtOk(rl.dt)) return true;
+                }
             }
             return false;
         };
-        const richHit = (list: Array<{ re: RegExp | null; initiator: string[] | null }>): boolean => {
+        const richHit = (list: RichRule[]): boolean => {
             for (const e of list) {
+                if (!rtsOk(e.rts) || !dtOk(e.dt)) continue;
                 if (e.re && !e.re.test(url)) continue;
+                if (e.ufRe && !e.ufRe.test(url)) continue;
                 if (e.initiator) {
                     // 有 initiator 条件但拿不到 referrer → fail-open（不匹配）
                     if (!refHost) continue;
@@ -221,9 +305,15 @@ export class DnrBlocker {
             }
             return false;
         };
-        if (domHit(this.allowDom) || richHit(this.allowRich)) return false;   // 例外规则优先
-        let blocked = domHit(this.blockDom) || richHit(this.richBlock);
-        if (!blocked && this.genericRe && this.genericRe.test(url)) blocked = true;
+        const groupHit = (groups: GenericGroup[]): boolean => {
+            for (const g of groups) {
+                if (!rtsOk(g.rts) || !dtOk(g.dt)) continue;
+                if (g.re && g.re.test(url)) return true;
+            }
+            return false;
+        };
+        if (domHit(this.allowDom) || richHit(this.allowRich) || groupHit(this.allowGroups)) return false; // 例外规则优先
+        let blocked = domHit(this.blockDom) || richHit(this.blockRich) || groupHit(this.blockGroups);
         if (blocked) {
             this.blockedCount++;
             const now = Date.now();

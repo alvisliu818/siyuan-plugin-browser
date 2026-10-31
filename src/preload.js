@@ -96,6 +96,27 @@
                 },
                 { passive: false }
             );
+            // F12 转发到宿主：打开扩展 popup/options 的 DevTools
+            window.addEventListener(
+                "keydown",
+                (e) => {
+                    if (e.key === "F12") {
+                        e.preventDefault();
+                        ipcRenderer.sendToHost("sy-open-devtools");
+                    }
+                },
+            );
+            // 扩展页 localStorage 回灌通道：overlay 的模拟扩展文档跑在 about:blank
+            // （不透明源）上，localStorage 被原生拒绝，guest 里的垫片（POPUP_JS_PRELUDE）
+            // 写入后经此把快照回灌宿主页持久化。仅 about:blank 主帧暴露 —— 真实站点
+            // （http/https）绝不暴露，防网页伪造扩展存储。
+            try {
+                if (location.protocol === "about:" && window.top === window) {
+                    window.__syExtLsSend = function (extId, data) {
+                        try { ipcRenderer.sendToHost("sy-ext-ls-write", { extId: String(extId || ""), data: data }); } catch (e) {}
+                    };
+                }
+            } catch (e) {}
         } catch (e) {
             console.warn("[browser-preload] zoom init failed:", e);
         }

@@ -4,6 +4,7 @@ import type { BookmarksStore } from "../storage/bookmarksStore";
 import { pickFavicon } from "../utils/favicon";
 import { parseEdgeInstallNavigation } from "../extensions/edgeStore";
 import { showWebViewContextMenu } from "./contextMenu";
+import { persistExtLs } from "./ext-popup";
 import type { IContextMenuParams } from "../types";
 
 /**
@@ -215,12 +216,12 @@ export class WebviewController {
                 this.callbacks.onUrlChange(this.pendingExtPageUrl + (url.includes("#") ? url.slice(url.indexOf("#")) : ""));
                 return;
             }
-            // ★ 漏网回收：无论哪条路径（src 直赋 / 未拦截导航）让 guest 真落地了
-            // chrome-extension://，立即改道走垫片路径 —— 不给主世界扩展脚本跑
-            // 引导的机会（原生 confirm 无 hook 会同步阻塞整页，见 loadURL 注释）。
+            // ★ chrome-extension:// 真实源原生落地（2026-10-31 起 = 扩展整页的
+            // 正常路径，不再"漏网回收"改道）：地址栏按扩展页 URL 语义上报，
+            // 历史不记（与改道时代 about:blank 落地的语义对齐）。垫片注入由
+            // dom-ready → maybeInjectExtensionPage 负责。
             if (/^chrome-extension:\/\//i.test(url)) {
-                console.warn("[browser-plugin] native ext page load leaked, redirecting:", url);
-                void this.loadURL(url);
+                this.callbacks.onUrlChange(url);
                 return;
             }
             if (url && !url.startsWith("data:")) this.lastKnownUrl = url;
@@ -247,9 +248,11 @@ export class WebviewController {
                 const url = this.webview.getURL?.() || "";
                 if (/^(https?:|chrome-extension:)\/\//i.test(url)) {
                     this.onDomReady?.(this.webview, url);
-                } else if (/^about:blank/i.test(url) && this.pendingExtPageUrl) {
-                    // loadURL 改道落地的 about:blank：换成改道目标 URL 通知宿主，
-                    // 由 maybeInjectExtensionPage 走磁盘重建 + 隔离世界重放
+                } else if (/^(about:blank|chrome-error:)/i.test(url) && this.pendingExtPageUrl) {
+                    // 原生加载失败落地（about:blank 兜底改道残留 / chrome-error
+                    // 错误页）：换成改道目标 URL 通知宿主，由 maybeInjectExtension
+                    // Page 走磁盘重建 + 隔离世界重放（chrome-error 文档可注入，
+                    // rebuildDom 探测到空 DOM 自动置真）
                     this.onDomReady?.(this.webview, this.pendingExtPageUrl);
                 }
             } catch {}
@@ -291,6 +294,13 @@ export class WebviewController {
                 // 商店详情页悬浮"安装到思源"按钮（preload 桥转发）
                 const id = e.args?.[0];
                 if (id) this.triggerEdgeInstall(String(id), "ipc");
+            } else if (e.channel === "sy-ext-ls-write") {
+                // 扩展页（改道重建在 about:blank 上）localStorage 垫片的快照回灌：
+                // 宿主页 localStorage 持久化，下次注入作种子（"连宿主 localStorage"）
+                try {
+                    const p = e.args?.[0];
+                    if (p && p.extId) persistExtLs(String(p.extId), p.data);
+                } catch {}
             }
         });
         this.on("will-navigate", (e) => {
@@ -299,15 +309,9 @@ export class WebviewController {
             if (!url) return;
             // Edge 商店"获取"按钮落点（microsoft-edge: 协议 / CRX 直链）→ 安装而非导航
             if (this.tryEdgeInstall(url, "will-navigate", () => e.preventDefault?.())) return;
-            // 本插件管理的扩展整页：页内导航（location.href / 链接点击）同样改道，
-            // 与 loadURL 同一机制 —— 不让主世界原生跑扩展脚本
-            if (this.isManagedExtPage(url)) {
-                console.log("[browser-plugin] will-navigate redirect ext page:", url);
-                e.preventDefault?.();
-                this.programmaticNav = false; // 复位，让 loadURL 的改道自己置位
-                void this.loadURL(url);
-                return;
-            }
+            // 本插件管理的扩展整页：页内导航（location.href / 链接点击）直接放行
+            // 原生加载（2026-10-31 起扩展页走真实源，见 loadURL 注释；落地后由
+            // dom-ready → maybeInjectExtensionPage 注入垫片世界）。
             // 编程导航（loadURL 发起）直接放行，不拦截
             if (this.programmaticNav) {
                 this.callbacks.onUrlChange(url);
@@ -412,34 +416,20 @@ export class WebviewController {
     /** 加载 URL（编程导航，will-navigate 会放行） */
     async loadURL(url: string): Promise<void> {
         console.log("[browser-plugin] loadURL:", url);
-        // ★ chrome-extension:// 整页改道（本插件管理的扩展）：**不原生加载**。
-        // Electron 44 的 webview 对该协议"有时"能原生加载成功（非确定性！实测
-        // 同一 URL 反复开关结果不同），一旦成功，页面脚本跑在主世界 —— 那里
-        // chrome.* 是 Electron 原生受限版（sendMessage 报 Receiving end does not
-        // exist / SW 冷启动窗口内拿到无 items 无 error 的空回包），扩展引导或
-        // loadTree 走 fail 分支时 window.confirm 会弹**原生同步对话框**阻塞渲染
-        // 线程（实测 TM Dashboard："An internal error occurred" 弹框整页假死，
-        // CDP evaluate/Debugger 全部超时）。改道后统一走确定性路径：
-        // about:blank → dom-ready → maybeInjectExtensionPage 磁盘重建 + 隔离
-        // 世界重放（PRELUDE 已 hook confirm，主世界从此没有扩展脚本）。
+        // ★ chrome-extension:// 整页（本插件管理的扩展）：**真实源原生加载**。
+        // （2026-10-31 定案，推翻本函数旧注释的"不原生加载"结论：早前"被拒/
+        // 非确定性"是探针请求了不存在的根路径 /popup.html 的假象——manifest
+        // 映射的真实路径 pages/*.html 用 src 赋值可确定性原生加载。真源 =
+        // 原生 localStorage 持久化 + 原生 location 语义；主世界的受限 chrome.*
+        // 由 preload confirm 钩子防同步弹框假死，扩展脚本由 maybeInjectExtension
+        // Page 的隔离世界重放兜底（原生 DOM 已就位 → rebuildDom 自动判 false）。
+        // 必须用 src 属性：webview.loadURL() 对该协议静默失败，见 PopupOverlay。）
         if (this.isManagedExtPage(url)) {
             this.pendingExtPageUrl = url;
             this.lastKnownUrl = url;
             this.callbacks.onUrlChange(url);
-            let cur = "";
-            try { cur = this.webview.getURL?.() || ""; } catch {}
-            if (cur && cur !== "about:blank") {
-                // 正在别的页面：导航去 about:blank，dom-ready 后由宿主重建
-                this.programmaticNav = true;
-                this.webview.src = "about:blank";
-            } else if (this.hasLoadedOnce) {
-                // 已在 about:blank 且首载完成：src 重指派不保证触发新 dom-ready，
-                // 直接调注入回调（未 dom-ready 时 executeJavaScript 会被
-                // maybeInjectExtensionPage 的 try/catch 吸收，不产生副作用）
-                this.onDomReady?.(this.webview, url);
-            }
-            // 未 attach / 首载未完成：初始 src=about:blank 加载完成后 dom-ready
-            // 自带 pendingExtPageUrl 走注入，无需额外动作
+            this.programmaticNav = true;
+            this.webview.src = url;
             return;
         }
         if (this.pendingExtPageUrl && !/^about:blank$/i.test(url)) {

@@ -74,6 +74,15 @@ export interface ICsExtInfo {
      * 对齐。popup/扩展页面世界不设（真 Chrome 里 popup 的 sender 无 tab）。
      */
     senderTabId?: number;
+    /**
+     * 弹窗锚定页（overlay 真实源架构专用）。旧架构垫片世界寄生在锚定页面里，
+     * tabs.query 拿 location.href 就是当前页；改成独立 overlay webview 跑真实
+     * chrome-extension:// 源后，location.href 是扩展页自己 —— tabs.query 再拿它
+     * 喂 SW，AdGuard 的 tab 上下文就塌成扩展页（其弹窗处理器按"当前页"取状态，
+     * 扩展页 tab 上下文被静默放弃 → 端口回包永空 → popup 卡 loading）。宿主
+     * （BrowserTab）必须把锚定页 URL/标题显式传进来。
+     */
+    anchorTab?: { url: string; title: string } | null;
 }
 
 /** 宿主能力提供者（extensionHost 实现），避免模块循环依赖 */
@@ -95,6 +104,12 @@ let manager: CsRuntimeManager | null = null;
 
 export function initCsRuntime(host: ICsRuntimeHost): void {
     manager = new CsRuntimeManager(host);
+}
+
+/** 模块级 SW eval（BrowserTab 等无 manager 引用的调用方用）：任一通道 → 主窗口兜底 */
+export async function evalInSwByElectronId(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
+    if (!manager) return { err: "cs-runtime manager 未初始化" };
+    return await manager.evalInSwAny(electronId, expr);
 }
 
 export function ensureCsRuntime(webview: IWebviewTag): void {
@@ -785,9 +800,17 @@ class CsPageSession {
             if (electronId) this.ctxToExt.set(ctxId, electronId);
         }
         const ext = this.host.listNativeExts().find((e) => e.electronId === electronId);
+        // 路由可观测性（portpoll 每 600ms 一次太吵不记；getCookieRules 是内容
+        // 世界的周期轮询同样不记）：sendmessage/tabevent 的进出耗时与结果
+        const msgType0 = req.args && req.args.msg && req.args.msg.type;
+        const logRoute = (req.type === "sendmessage" || req.type === "tabevent" || req.type === "portmessage")
+            && msgType0 !== "getCookieRules";
+        const t0 = logRoute ? Date.now() : 0;
+        if (logRoute) console.info("[browser-plugin] bridge →", req.type, "ctx=" + ctxId, "ext=" + electronId, "msgType=", msgType0);
         const result = ext
             ? await this.route(ext, req).catch((e) => ({ err: String(e?.message || e) }))
             : { err: "unknown context" };
+        if (logRoute) console.info("[browser-plugin] bridge ←", req.type, Date.now() - t0 + "ms", "err=", (result as any).err ?? null, "dataLen=", JSON.stringify((result as any).data ?? null).length);
         const replyExpr = `window.__syExtHostResolve && window.__syExtHostResolve(${JSON.stringify(
             JSON.stringify({ reqId: req.reqId, ...result })
         )})`;
@@ -1363,7 +1386,9 @@ class CsPageSession {
             let tries = 0;
             while (parsed && parsed.__noHandlers && tries < 8) {
                 tries++;
-                console.warn("[browser-plugin] SW handlers 未就绪，重试", tries + "/8");
+                // 每轮重试降为 debug：SW 冷启动期（background 执行中）的正常窗口，
+                // 信息级会刷屏；耗尽仍空才是故障（下方 warn）
+                console.debug("[browser-plugin] SW handlers 未就绪，重试", tries + "/8");
                 await new Promise((res) => setTimeout(res, 2000));
                 const r2 = await this.evalInSw(ext, expr);
                 if (r2.err) return { err: r2.err };
@@ -2010,6 +2035,9 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         version: ext.version,
         senderPageUrl: ext.senderPageUrl || "",
         senderTabId: typeof ext.senderTabId === "number" ? ext.senderTabId : null,
+        // 弹窗锚定页（overlay 真实源架构）：tabs.query 的"当前页签"优先取它，
+        // 见 ICsExtInfo.anchorTab 注释
+        anchorTab: ext.anchorTab || null,
     });
     const messagesJson = JSON.stringify(messages || {});
     return `
@@ -2412,7 +2440,10 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     var STUBS = {};
     var stubFor = function (label) {
         if (!STUBS[label]) {
-            try { console.warn("[sy-ext-shim] " + label + " 未实现，返回通用桩"); } catch (e) {}
+            // 缺失 API 的桩日志默认静默：扩展（TM bootstrap）启动期会探测几十个
+            // 嵌套 API，每个缺失访问一行 warn 就是几百行刷屏。需要排查时置
+            // window.__syShimDebug = true 再重载。
+            try { if (window.__syShimDebug) console.warn("[sy-ext-shim] " + label + " 未实现，返回通用桩"); } catch (e) {}
             var cache = {};
             STUBS[label] = new Proxy(PROMISE_UNDEF, {
                 get(_t, prop) {
@@ -2440,9 +2471,14 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     if (!chrome_.tabs) {
         chrome_.tabs = {
             lastError: undefined,
-            // popup 的"当前标签"就是它所在的页面
+            // popup 的"当前标签"就是它所在的页面：in-page 世界 = location.href；
+            // overlay 真实源世界 = 宿主注入的锚定页（location.href 已是扩展页自己，
+            // 喂进 SW 会让 AdGuard 的 tab 上下文塌掉 → 弹窗端口回包永空）
             query: function (q, cb) {
-                var tab = { id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false, url: String(location.href), title: document.title };
+                var at = EXT.anchorTab;
+                var tab = { id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false,
+                    url: at && at.url ? String(at.url) : String(location.href),
+                    title: at && at.title ? String(at.title) : document.title };
                 // 顺手把该 tab 喂进 SW 的 tab 注册表（tabevent 通道）——
                 // AdGuard 的 tabsApi 靠 tabs 事件建 tabContext，Electron 下事件
                 // 缺失，不喂的话 getTabContext 恒 undefined → popup 卡 loading
@@ -2475,6 +2511,262 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                 return cbStyle(p, typeof cb === "function" ? cb : undefined);
             },
         };
+    }
+    // ★ 全量 API 实装（2026-10-31"全实现"定案）：扩展（TM bootstrap）启动期探测
+    //   几十个命名空间，stubFor 通用桩日志刷屏且行为不可预期。按语义逐个实装：
+    //   事件 = 真 hub（可挂监听；本世界不自发派发，跨世界真行为以 SW 垫片为准）、
+    //   写操作 = 经 hostCall 路由宿主或本地状态、读操作 = 返回结构正确的值。
+    if (!chrome_.__syFullApis) {
+        chrome_.__syFullApis = true;
+        var mkEv = function () {
+            var fns = [];
+            var ev = {
+                addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
+                addRules: function (rules, cb) { return cbStyle(Promise.resolve([]), typeof cb === "function" ? cb : undefined); },
+                removeRules: function (ids, cb) { return cbStyle(Promise.resolve(), typeof cb === "function" ? cb : undefined); },
+                getAllRules: function (cb) { return cbStyle(Promise.resolve([]), typeof cb === "function" ? cb : undefined); },
+            };
+            ev.__emit = function () { var a = arguments; for (var i = 0; i < fns.length; i++) { try { fns[i].apply(null, a); } catch (e) {} } };
+            return ev;
+        };
+        var syWin = function () { return { id: 1, index: 0, focused: true, type: "normal", state: "normal", incognito: false, alwaysOnTop: false, width: window.innerWidth || 1200, height: window.innerHeight || 800, left: 0, top: 0 }; };
+        if (!chrome_.windows) {
+            chrome_.windows = {
+                WINDOW_ID_NONE: -1,
+                WINDOW_ID_CURRENT: -2,
+                onCreated: mkEv(), onRemoved: mkEv(), onFocusChanged: mkEv(),
+                get: function (id, cb) { return cbStyle(Promise.resolve(syWin()), cb); },
+                getCurrent: function (cb) { return cbStyle(Promise.resolve(syWin()), cb); },
+                getLastFocused: function (cb) { return cbStyle(Promise.resolve(syWin()), cb); },
+                getAll: function (q, cb) { return cbStyle(Promise.resolve([syWin()]), typeof q === "function" ? q : cb); },
+                create: function (props, cb) {
+                    var u = props && props.url ? String(props.url) : "";
+                    if (u) hostCall("opentab", { url: u }).catch(function () {});
+                    var w = { id: 2, focused: true, type: "normal", incognito: false, tabs: [{ id: 2, url: u }] };
+                    return cbStyle(Promise.resolve(w), cb);
+                },
+                update: function (id, props, cb) {
+                    var u = props && props.url ? String(props.url) : "";
+                    if (u) hostCall("opentab", { url: u }).catch(function () {});
+                    return cbStyle(Promise.resolve(syWin()), cb);
+                },
+                remove: function (id, cb) { return cbStyle(Promise.resolve(), cb); },
+            };
+        }
+        if (!chrome_.webRequest) {
+            chrome_.webRequest = {
+                onBeforeRequest: mkEv(), onBeforeSendHeaders: mkEv(), onSendHeaders: mkEv(),
+                onHeadersReceived: mkEv(), onAuthRequired: mkEv(), onBeforeRedirect: mkEv(),
+                onResponseStarted: mkEv(), onCompleted: mkEv(), onErrorOccurred: mkEv(),
+                MAX_HANDLER_BEHAVIOR_CHANGED_CALLS_PER_10_MINUTES: 20,
+                OnBeforeSendHeadersOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                OnHeadersReceivedOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                OnAuthRequiredOptions: { EXTRA_HEADERS: ["extraHeaders"] },
+                handlerBehaviorChanged: function (cb) { return cbStyle(Promise.resolve(), cb); },
+            };
+        }
+        if (!chrome_.webNavigation) {
+            chrome_.webNavigation = {
+                onBeforeNavigate: mkEv(), onCommitted: mkEv(), onCompleted: mkEv(),
+                onDOMContentLoaded: mkEv(), onErrorOccurred: mkEv(), onCreatedNavigationTarget: mkEv(),
+                onHistoryStateUpdated: mkEv(), onReferenceFragmentUpdated: mkEv(),
+                onTabReplaced: mkEv(), onBeforeRetarget: mkEv(),
+                getAllFrames: function (opts, cb) { return cbStyle(Promise.resolve([{ frameId: 0, url: String(location.href), parentFrameId: -1 }]), typeof opts === "function" ? opts : cb); },
+                getFrame: function (opts, cb) { return cbStyle(Promise.resolve({ frameId: 0, url: String(location.href), parentFrameId: -1 }), typeof opts === "function" ? opts : cb); },
+            };
+        }
+        if (!chrome_.action) {
+            chrome_.action = {
+                onClicked: mkEv(),
+                setBadgeText: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                setBadgeBackgroundColor: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                setBadgeTextColor: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                setTitle: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                getTitle: function (p, cb) { return cbStyle(Promise.resolve(""), typeof p === "function" ? p : cb); },
+                setIcon: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                setPopup: function (p, cb) { return cbStyle(Promise.resolve(), cb); },
+                getPopup: function (p, cb) { return cbStyle(Promise.resolve(""), typeof p === "function" ? p : cb); },
+                isEnabled: function (p, cb) { return cbStyle(Promise.resolve(true), typeof p === "function" ? p : cb); },
+                enable: function (id, cb) { return cbStyle(Promise.resolve(), cb); },
+                disable: function (id, cb) { return cbStyle(Promise.resolve(), cb); },
+            };
+        }
+        if (!chrome_.declarativeContent) {
+            chrome_.declarativeContent = {
+                onPageChanged: mkEv(),
+                PageStateMatcher: function (opts) { this.opts = opts || {}; },
+                RequestContentScript: function (opts) { this.opts = opts || {}; },
+            };
+        }
+        if (!chrome_.contentScripts) {
+            chrome_.contentScripts = {
+                register: function (props, cb) { return cbStyle(Promise.resolve([]), cb); },
+                unregister: function (ids, cb) { return cbStyle(Promise.resolve(), cb); },
+                getRegistered: function (opts, cb) { return cbStyle(Promise.resolve([]), typeof opts === "function" ? opts : cb); },
+                update: function (ids, cb) { return cbStyle(Promise.resolve(), cb); },
+            };
+        }
+        if (!chrome_.userScripts) {
+            // SW 侧是真实注册表（宿主对账注入到页面）；本世界提供形态完整的
+            // 本地镜像（TM bootstrap 只做探测与轻量操作，不在此注册）
+            var usLocal = [];
+            chrome_.userScripts = {
+                ExecutionWorld: { MAIN: "MAIN", USER_SCRIPT: "USER_SCRIPT" },
+                register: function (scripts, cb) {
+                    scripts = Array.isArray(scripts) ? scripts : [scripts];
+                    for (var i = 0; i < scripts.length; i++) {
+                        if (scripts[i] && scripts[i].id) {
+                            usLocal = usLocal.filter(function (s) { return s.id !== scripts[i].id; });
+                            usLocal.push(JSON.parse(JSON.stringify(scripts[i])));
+                        }
+                    }
+                    return cbStyle(Promise.resolve(), cb);
+                },
+                getScripts: function (filter, cb) {
+                    var ids = filter && typeof filter === "object" && filter.ids ? filter.ids : null;
+                    var list = usLocal.filter(function (s) { return !ids || ids.indexOf(s.id) >= 0; });
+                    return cbStyle(Promise.resolve(list), typeof filter === "function" ? filter : cb);
+                },
+                update: function (ids, props, cb) { return cbStyle(Promise.resolve(), cb); },
+                unregister: function (filter, cb) {
+                    var ids = filter && typeof filter === "object" && filter.ids ? filter.ids : null;
+                    usLocal = usLocal.filter(function (s) { return !ids || ids.indexOf(s.id) < 0; });
+                    return cbStyle(Promise.resolve(), cb);
+                },
+                configureWorld: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                resetWorldConfiguration: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                executeScript: function (props, cb) { return cbStyle(Promise.resolve([]), cb); },
+                onUserScriptMessage: mkEv(),
+            };
+        }
+        if (!chrome_.scripting) {
+            chrome_.scripting = {
+                executeScript: function (props, cb) { return cbStyle(Promise.resolve([]), cb); },
+                insertCSS: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                removeCSS: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                registerContentScripts: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                getRegisteredContentScripts: function (props, cb) { return cbStyle(Promise.resolve([]), typeof props === "function" ? props : cb); },
+                unregisterContentScripts: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+                updateContentScripts: function (props, cb) { return cbStyle(Promise.resolve(), cb); },
+            };
+        }
+        if (!chrome_.declarativeNetRequest) {
+            var dnrStore = { session: [], dynamic: [] };
+            var dnrApply = function (store, p) {
+                p = p || {};
+                var next = store.filter(function (rl) { return !((p.remove || []).indexOf(rl.id) >= 0); });
+                (p.add || []).forEach(function (rl) {
+                    if (rl && typeof rl.id === "number") {
+                        next = next.filter(function (x) { return x.id !== rl.id; });
+                        next.push(rl);
+                    }
+                });
+                return next;
+            };
+            var dnrGet = function (key) { return function (p, cb) { var v = dnrStore[key]; return cbStyle(Promise.resolve(v), typeof p === "function" ? p : cb); }; };
+            var dnrUpd = function (key) { return function (p, cb) { dnrStore[key] = dnrApply(dnrStore[key], p); return cbStyle(Promise.resolve(), cb); }; };
+            chrome_.declarativeNetRequest = {
+                MAX_NUMBER_OF_DYNAMIC_RULES: 30000,
+                MAX_NUMBER_OF_SESSION_RULES: 5000,
+                MAX_NUMBER_OF_UNSAFE_DYNAMIC_RULES: 30000,
+                MAX_NUMBER_OF_UNSAFE_SESSION_RULES: 5000,
+                MATCH_ACTION: null,
+                onRuleMatchedDebug: mkEv(),
+                updateSessionRules: dnrUpd("session"),
+                getSessionRules: dnrGet("session"),
+                updateDynamicRules: dnrUpd("dynamic"),
+                getDynamicRules: dnrGet("dynamic"),
+            };
+        }
+        if (!chrome_.storage.managed) {
+            chrome_.storage.managed = { get: function (keys, cb) { return cbStyle(Promise.resolve({}), typeof keys === "function" ? keys : cb); } };
+        }
+        if (!chrome_.commands) {
+            chrome_.commands = { onCommand: mkEv(), getAll: function (cb) { return cbStyle(Promise.resolve([]), cb); } };
+        }
+        if (!chrome_.notifications) {
+            var ntfCount = 0;
+            chrome_.notifications = {
+                create: function (id, opts, cb) {
+                    if (typeof id === "object") { opts = id; id = "n" + Date.now() + "-" + (++ntfCount); }
+                    var nid = String(id);
+                    setTimeout(function () { chrome_.notifications.onShown && chrome_.notifications.onShown.__emit && chrome_.notifications.onShown.__emit(nid); }, 0);
+                    if (typeof cb === "function") { try { cb(nid); } catch (e) {} }
+                    return nid;
+                },
+                update: function (id, opts, cb) { return cbStyle(Promise.resolve(true), cb); },
+                clear: function (id, cb) { return cbStyle(Promise.resolve(true), cb); },
+                getAll: function (cb) { return cbStyle(Promise.resolve({}), cb); },
+                getPermissionLevel: function (cb) { return cbStyle(Promise.resolve("granted"), cb); },
+                onClicked: mkEv(), onClosed: mkEv(), onPermissionLevelChanged: mkEv(), onShown: mkEv(), onButtonClicked: mkEv(),
+            };
+        }
+        if (!chrome_.contextMenus) {
+            var cmId = 0;
+            chrome_.contextMenus = {
+                create: function (props, cb) {
+                    var id = props && props.id ? String(props.id) : "cm" + Date.now() + "-" + (++cmId);
+                    if (typeof cb === "function") { try { cb(id); } catch (e) {} }
+                    return id;
+                },
+                update: function (id, props, cb) { return cbStyle(Promise.resolve(), cb); },
+                remove: function (id, cb) { return cbStyle(Promise.resolve(), cb); },
+                removeAll: function (cb) { return cbStyle(Promise.resolve(), cb); },
+                onClicked: mkEv(),
+            };
+        }
+        if (!chrome_.permissions) {
+            chrome_.permissions = {
+                contains: function (p, cb) { return cbStyle(Promise.resolve(true), typeof p === "function" ? p : cb); },
+                getAll: function (cb) { return cbStyle(Promise.resolve({ origins: [], permissions: [] }), cb); },
+                request: function (p, cb) { return cbStyle(Promise.resolve(true), cb); },
+                remove: function (p, cb) { return cbStyle(Promise.resolve(true), cb); },
+            };
+        }
+        if (!chrome_.alarms) {
+            var alarms = {};
+            var alarmSeq = 0;
+            chrome_.alarms = {
+                onAlarm: mkEv(),
+                create: function (name, info, cb) {
+                    if (typeof name === "object") { cb = info; info = name; name = undefined; }
+                    name = name === undefined || name === null ? "alarm" + Date.now() + "-" + (++alarmSeq) : String(name);
+                    info = info || {};
+                    var delay = info.when ? Math.max(0, Number(info.when) - Date.now()) : (info.delayInMinutes ? Number(info.delayInMinutes) * 60000 : 1000);
+                    var period = info.periodInMinutes ? Number(info.periodInMinutes) * 60000 : 0;
+                    if (alarms[name] && alarms[name].t) clearTimeout(alarms[name].t);
+                    var handle = { name: name, scheduledTime: Date.now() + delay, periodInMinutes: info.periodInMinutes || undefined };
+                    var fire = function () {
+                        chrome_.alarms.onAlarm.__emit(handle);
+                        if (period) { handle.scheduledTime = Date.now() + period; handle.t = setTimeout(fire, period); }
+                    };
+                    handle.t = setTimeout(fire, delay);
+                    alarms[name] = handle;
+                    if (typeof cb === "function") { try { cb(handle); } catch (e) {} }
+                    return handle;
+                },
+                get: function (name, cb) { return cbStyle(Promise.resolve(alarms[String(name)] || undefined), cb); },
+                getAll: function (cb) { return cbStyle(Promise.resolve(Object.keys(alarms).map(function (k) { return alarms[k]; })), cb); },
+                clear: function (name, cb) {
+                    var had = !!alarms[String(name)];
+                    if (had) { clearTimeout(alarms[String(name)].t); delete alarms[String(name)]; }
+                    return cbStyle(Promise.resolve(had), cb);
+                },
+                clearAll: function (cb) {
+                    Object.keys(alarms).forEach(function (k) { clearTimeout(alarms[k].t); delete alarms[k]; });
+                    return cbStyle(Promise.resolve(true), cb);
+                },
+            };
+        }
+        if (!chrome_.extension) {
+            chrome_.extension = {
+                isAllowedFileSchemeAccess: function (cb) { return cbStyle(Promise.resolve(false), typeof cb === "function" ? cb : undefined); },
+                isAllowedIncognitoAccess: function (cb) { return cbStyle(Promise.resolve(false), typeof cb === "function" ? cb : undefined); },
+                getURL: function (p) { return (EXT && EXT.id ? "chrome-extension://" + EXT.id + "/" : "") + String(p || ""); },
+            };
+        }
     }
     if (!chrome_.dom) chrome_.dom = {};
     // 命名空间级补桩（在整体替换前完成，保证缺失事件也不炸）
