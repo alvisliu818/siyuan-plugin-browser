@@ -206,6 +206,9 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
+        // v23：userScripts.execute 补桩（SW→页面 下发用户脚本代码，出箱
+        //       __syUsExecOutbox 由 cs-runtime 回包泵排空后在自建世界执行）——
+        //       Violentmonkey MV3 注入链 forceContent 路径的关键通道。
         // v22：tabs.get/update 原生存在也包装（get 失败兜底假 tab；update 带 url
         //       写出箱）——VM .user.js 安装链 confirmInstall 的 getTab+tabs.update
         //       被原生实现卡死，confirm 页永不出现。
@@ -217,7 +220,7 @@ export class ExtensionHost {
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v22";
+        const SHIM_VER = "v23";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -1059,6 +1062,38 @@ export class ExtensionHost {
                         // messaging/csp：自建世界恒有消息桥，无需配置
                         if (typeof cb === "function") { try { cb(); } catch (e3) {} }
                         return Promise.resolve();
+                    },
+                    // execute（v23 增）：MV3 用户脚本代码的 SW→页面 下发通道。
+                    // Violentmonkey 注入链的关键路径：页面引导在隔离世界拿不到页面
+                    // realm（GetInjected 回包 page:false → 引导发 InjectionFeedback
+                    // 带 forceContent:true）→ SW 侧 triageRealms 把脚本判为 content
+                    // realm → 真实脚本代码经 injectContentRealm → userScripts.execute
+                    // 下发。缺此方法时代码静默丢失（setTimeout fire-and-forget 吞错），
+                    // 页面只收到 code:"" 的空壳 → Run{ids:[]} 永远无脚本执行。
+                    // SW 无法直接 eval 页面 —— 代码落 __syUsExecOutbox，宿主
+                    // cs-runtime 的 SW 回包泵（600ms 轮询）取走后在扩展自建世界执行
+                    // （= Chrome USER_SCRIPT 世界语义：与引导同世界，共享 VM bridge
+                    // 全局）。回包 [{result:null}]：VM 只用结果通知 UNWRAP/报错，
+                    // 代码执行本身 fire-and-forget。
+                    execute: function (details) {
+                        try {
+                            var jsCode = "";
+                            if (details && details.js) {
+                                for (var i = 0; i < details.js.length; i++) {
+                                    jsCode += (details.js[i] && details.js[i].code) || "";
+                                }
+                            }
+                            if (jsCode) {
+                                self.__syUsExecOutbox = self.__syUsExecOutbox || [];
+                                self.__syUsExecOutbox.push({
+                                    code: jsCode,
+                                    injectImmediately: !!(details && details.injectImmediately),
+                                    tabId: details && details.target ? details.target.tabId : undefined,
+                                    frameIds: details && details.target && details.target.frameIds || null,
+                                });
+                            }
+                        } catch (e2) {}
+                        return Promise.resolve([{ result: null }]);
                     },
                 };
             }
@@ -2044,6 +2079,7 @@ export class ExtensionHost {
                         // 内容世界 tab 身份（真 Chrome sender.tab 语义，见 ICsExtInfo）
                         senderTabId: 1,
                         optionsPath: e.optionsPath,
+                        popupPath: e.popupPath,
                     })),
             readFile: (extPath: string, rel: string) => {
                 const { fs, path } = nodeModules();

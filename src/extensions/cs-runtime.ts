@@ -50,6 +50,10 @@ const clipTemplateCache = new Map<string, string>();
 const SW_REPLY_WINDOW_MS = 300_000;
 /** 取走 SW 垫片 v13 __syTabsOutbox 里待发往 content 世界的消息（原子取走） */
 const SW_TABS_DRAIN_EXPR = `(() => { const out = self.__syTabsOutbox || []; self.__syTabsOutbox = []; return JSON.stringify(out); })()`;
+/** 取走 SW 垫片 v23 __syUsExecOutbox 里待执行的 userScripts.execute 代码（原子取走）。
+ *  VM 的 content-realm 脚本代码（forceContent 路径）经 chrome.userScripts.execute
+ *  落此箱，泵取走后在扩展自建世界执行（与引导同世界，共享 VM bridge 全局）。 */
+const SW_US_EXEC_DRAIN_EXPR = `(() => { const out = self.__syUsExecOutbox || []; self.__syUsExecOutbox = []; return JSON.stringify(out); })()`;
 
 export interface ICsExtInfo {
     electronId: string;
@@ -60,6 +64,8 @@ export interface ICsExtInfo {
     contentScripts: Array<{ matches: string[]; js: string[]; css: string[] }>;
     /** manifest 的 options 页（openOptionsPage 用；无则按钮降级 no-op） */
     optionsPath?: string;
+    /** manifest.action.default_popup 的相对路径（dom-ready 喂活动页签的筛选条件） */
+    popupPath?: string;
     /**
      * 该世界的 sender 身份 URL（port.sender.url / sendMessage sender）。
      * popup/扩展页面世界必须传 chrome-extension://<id>/<page>：真 Chrome 里
@@ -254,12 +260,29 @@ class CsRuntimeManager {
         if (existing && existing.alive) {
             existing.pageUrl = pageUrl;
             await existing.sync();
+            this.feedActiveTabForPopups(existing, pageUrl);
             return;
         }
         const s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
         this.sessions.set(key, s);
         await s.start();
         await s.sync();
+        this.feedActiveTabForPopups(s, pageUrl);
+    }
+
+    /** dom-ready 即喂活动页签（SW 垫片的 __syLastFedTab）：VM 的 popup 初始数据
+     *  走 SW fetch 虚拟脚本（get-data.js → makeDataResponse → initPopup →
+     *  getActiveTab → tabs.query），若等 popup 打开才喂，SW eval 通道唤醒与
+     *  popup 页加载赛跑 —— 输了则 url 为空 → getFailureReason 判 noninjectable
+     *  → 面板永远 "cannot run userscripts"。提前到 dom-ready 后 __syLastFedTab
+     *  常驻 SW，popup 何时开都拿得到。只筛有 popup 面板的扩展，喂失败不阻塞。 */
+    private feedActiveTabForPopups(s: CsPageSession, pageUrl: string): void {
+        try {
+            const exts = this.host.listNativeExts().filter((e) => e.popupPath);
+            for (const ext of exts) {
+                s.feedTabEventToSw(ext, { url: pageUrl, title: "" }).catch(() => {});
+            }
+        } catch {}
     }
 
     disposeFor(webview: IWebviewTag): void {
@@ -1129,11 +1152,57 @@ class CsPageSession {
                     `(() => { const p = self.__syTabsPending && self.__syTabsPending[${rid}]; if (p) { delete self.__syTabsPending[${rid}]; p(${JSON.stringify(respJson)}); } return 1; })()`
                 ).catch(() => null);
             }
+            // userScripts.execute 出箱（垫片 v23）：VM content-realm 脚本代码
+            // 在此取走并执行。fire-and-forget，不阻塞泵。
+            try {
+                const dr2 = await evalInSwFlatCached(sender, electronId, SW_US_EXEC_DRAIN_EXPR);
+                if (!dr2.err && dr2.value) {
+                    const execs = JSON.parse(String(dr2.value)) || [];
+                    for (const ex of (Array.isArray(execs) ? execs : [])) {
+                        const code = String((ex && ex.code) || "");
+                        if (code) void this.evalUsExecInWorld(electronId, code);
+                    }
+                }
+            } catch {}
         } catch {
             // 会话失效/调试通道异常 → 停泵（下次 CS→SW 派发会重新开窗）
             this.stopSwReplyPump(electronId, entry);
         } finally {
             entry.busy = false;
+        }
+    }
+
+    /** userScripts.execute 代码在扩展自建世界执行（垫片 v23 的宿主落点）。
+     *  大代码分块经世界侧缓冲拼接（实测 SEJ ~357KB，单条 CDP 求值会超时）。 */
+    private async evalUsExecInWorld(electronId: string, code: string): Promise<void> {
+        const CHUNK = 80_000;
+        try {
+            if (code.length <= CHUNK) {
+                const r = await this.evalInExtensionWorldFlat(electronId, code);
+                if (!r.ok) console.warn("[browser-plugin] userScripts.execute failed:", String(r.error || "").slice(0, 160));
+                return;
+            }
+            const init = await this.evalInExtensionWorldFlat(electronId, "self.__syUsExecBuf = ''; 'ok'");
+            if (!init.ok) {
+                console.warn("[browser-plugin] userScripts.execute buf init failed:", String(init.error || "").slice(0, 120));
+                return;
+            }
+            for (let i = 0; i < code.length; i += CHUNK) {
+                const piece = code.slice(i, i + CHUNK);
+                const r = await this.evalInExtensionWorldFlat(electronId, `self.__syUsExecBuf += ${JSON.stringify(piece)}; 'ok'`);
+                if (!r.ok) {
+                    console.warn("[browser-plugin] userScripts.execute chunk failed:", String(r.error || "").slice(0, 120));
+                    return;
+                }
+            }
+            const fin = await this.evalInExtensionWorldFlat(electronId, "eval(self.__syUsExecBuf); self.__syUsExecBuf = ''; 'ok'");
+            if (fin.ok) {
+                console.log(`[browser-plugin] userScripts.execute done (${code.length}B) ext: ${electronId.slice(0, 8)}`);
+            } else {
+                console.warn("[browser-plugin] userScripts.execute eval failed:", String(fin.error || "").slice(0, 160));
+            }
+        } catch (e: any) {
+            console.warn("[browser-plugin] userScripts.execute err:", String(e?.message || e).slice(0, 160));
         }
     }
 
