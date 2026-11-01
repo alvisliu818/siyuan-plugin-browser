@@ -76,6 +76,14 @@ export class BrowserTab {
     private wrBridgeCacheAt = 0;
     /** .user.js 待装导航（TM ask.html 开出即置 askOpened；12s 未开走宿主弹窗） */
     private pendingUserJs: { url: string; askOpened: boolean } | null = null;
+
+    /** 扩展安装确认页识别：TM = ask.html?aid；VM(Violentmonkey) = confirm/index.html。
+     *  出箱排空时据此置 pendingUserJs.askOpened，9s 回落才不会误触发。 */
+    private markUserJsChainOpened(u: string): void {
+        if (!/ask\.html|confirm\/index\.html/i.test(u)) return;
+        const pj = this.pendingUserJs;
+        if (pj && !pj.askOpened) pj.askOpened = true;
+    }
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
     private healthFailCount = 0;
     /** Electron 默认 UA（懒捕获：构造时 webview 可能尚未 attach） */
@@ -439,7 +447,7 @@ export class BrowserTab {
                     for (const it of (Array.isArray(items) ? items : [])) {
                         const u = String((it && it.url) || "");
                         if (!u) continue;
-                        if (u.includes("ask.html")) { for (const pj of this.pendingUserJs.values()) if (!pj.askOpened) pj.askOpened = true; }
+                        if (u.includes("ask.html") || u.includes("confirm/index.html")) { const pj = this.pendingUserJs; if (pj && !pj.askOpened) pj.askOpened = true; }
                         const bp = (window as any).browserPlugin;
                         if (bp?.openUrl) bp.openUrl(u, { force: true });
                     }
@@ -505,7 +513,7 @@ export class BrowserTab {
                             for (const it of (Array.isArray(items) ? items : [])) {
                                 const u = String((it && it.url) || "");
                                 if (!u) continue;
-                                if (u.includes("ask.html")) { for (const pj of this.pendingUserJs.values()) if (!pj.askOpened) pj.askOpened = true; }
+                                if (u.includes("ask.html") || u.includes("confirm/index.html")) { const pj = this.pendingUserJs; if (pj && !pj.askOpened) pj.askOpened = true; }
                                 const bp = (window as any).browserPlugin;
                                 if (bp?.openUrl) bp.openUrl(u, { force: true });
                             }
@@ -531,7 +539,33 @@ export class BrowserTab {
             }
             const tm = host.list().find((e: any) => /tampermonkey|篡改猴/i.test(String(e.name || "")) && e.electronId && e.native);
             if (!tm) {
-                showMessage("未找到油猴扩展，无法安装脚本", 4000, "error");
+                const vm = host.list().find((e: any) => /violentmonkey|暴力猴/i.test(String(e.name || "")) && e.electronId && e.native);
+                if (!vm) {
+                    showMessage("未找到油猴扩展，无法安装脚本", 4000, "error");
+                    return;
+                }
+                // VM 自有安装链（webRequest 观察者 + confirm/index.html#key 页）：
+                // 走到这里 = 9s 窗口内 VM 链条未走出 confirm（其 SW fetch 常慢于窗口）。
+                // 再给一轮合成下载事件 + wr 派发 + 多点排空，confirm 出现即止；
+                // 仍失败才按实际装的管理器提示。
+                showMessage("已交给 Violentmonkey 处理安装…", 3000, "info");
+                console.info("[browser-plugin] .user.js 交由 VM 安装链重试:", url.slice(0, 80));
+                void (async () => {
+                    try {
+                        await evalInSwByElectronId(vm.electronId, `try { self.__syEmitDownload && self.__syEmitDownload(${JSON.stringify(url)}); } catch (e) {}`).catch(() => null);
+                        this.pendingUserJs = { url, askOpened: false };
+                        try { await this.dispatchWrCollect(url, "main_frame", { url, resourceType: "mainFrame", type: "mainFrame" }); } catch {}
+                        for (const delay of [1500, 3000, 5000, 7000]) {
+                            await new Promise((r) => setTimeout(r, delay));
+                            await this.drainWrOutbox();
+                            if (this.pendingUserJs && this.pendingUserJs.askOpened) { console.info("[browser-plugin] .user.js VM confirm 已打开"); break; }
+                        }
+                        if (this.pendingUserJs && this.pendingUserJs.url === url && !this.pendingUserJs.askOpened) {
+                            showMessage("Violentmonkey 安装页未打开（脚本源不可达或网络代理未开）", 5000, "error");
+                        }
+                        if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
+                    } catch {}
+                })();
                 return;
             }
             // 下载脚本内容：★ 必须走浏览器分区的 session.fetch（代理/cookie 与

@@ -206,6 +206,9 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
+        // v22：tabs.get/update 原生存在也包装（get 失败兜底假 tab；update 带 url
+        //       写出箱）——VM .user.js 安装链 confirmInstall 的 getTab+tabs.update
+        //       被原生实现卡死，confirm 页永不出现。
         // v21：+ 0f 事件面补全（notifications/download 等命名空间"有对象无事件"，
         //       VM sw.js 顶层 browser.notifications.onClicked.addListener TypeError）。
         // v20：chrome.extension 兼容（0e 节，Violentmonkey SW 启动即死修复）。
@@ -214,7 +217,7 @@ export class ExtensionHost {
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v21";
+        const SHIM_VER = "v22";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -743,11 +746,68 @@ export class ExtensionHost {
                 //     create **实装**：SW 无法直接开宿主页签，写内存出箱 __syTabCreateOutbox，
                 //     宿主路由 sendmessage 完成后排空 → bp.openUrl 真实开页签
                 //     （实测 TM popup「查找新脚本」走 SW newTab handler → tabs.create，
-                //     旧假桩静默吞掉 → 无反应/空页签）。update/remove 仍为桩。
+                //     旧假桩静默吞掉 → 无反应/空页签）。update 同样写出箱（VM MV3
+                //     confirmInstall 走 tabs.update(tabId,{url:confirmUrl}) 替换当前
+                //     页签打开安装确认页 —— 假桩静默吞 URL → confirm 页永不出现，
+                //     .user.js 安装链 9s 回落报"未找到油猴扩展"）。remove 仍为桩。
                 if (!chrome.tabs.create) chrome.tabs.create = function (props, cb) { var u = (props && props.url) || ""; try { if (u) { self.__syTabCreateOutbox = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox.push({ url: String(u), active: !props || props.active !== false }); } } catch (e) {} var t = { id: 1, index: 0, windowId: 1, active: true, url: u }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
-                if (!chrome.tabs.update) chrome.tabs.update = function (id, props, cb) { var t = { id: typeof id === "number" ? id : 1, url: (props && props.url) || "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                // ★ update 包装（v22，原生存在也要包）：VM MV3 confirmInstall 走
+                //     tabs.update(tabId,{url:confirmUrl}) 替换当前页签打开安装确认页
+                //     —— 原生 update 是无宿主页签模型的静默 no-op（"No such tab"），
+                //     confirm 页 URL 被吞 → .user.js 安装链 9s 回落报"未找到油猴扩展"。
+                //     带 url 的 update 一律写 __syTabCreateOutbox（宿主排空 openUrl），
+                //     再委托原生（失败/无效果也无害）。
+                if (chrome.tabs && !chrome.tabs.__syUpdatePatched) {
+                    var origTabsUpdate = typeof chrome.tabs.update === "function" ? chrome.tabs.update.bind(chrome.tabs) : null;
+                    chrome.tabs.update = function (id, props, cb) {
+                        var u = (props && props.url) || "";
+                        try { if (u) { self.__syTabCreateOutbox = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox.push({ url: String(u), active: !props || props.active !== false }); } } catch (e) {}
+                        // ★ 必须恒返回 Promise：Electron 原生 update 可能返回 undefined，
+                        //     VM 的 .catch(noop) 链会炸（实测 "reading 'catch' of undefined"）
+                        var out = null;
+                        if (origTabsUpdate) { try { out = origTabsUpdate(id, props, cb); } catch (e) { out = null; } }
+                        if (!out || typeof out.then !== "function") {
+                            var t = { id: typeof id === "number" ? id : 1, url: u };
+                            if (typeof cb === "function") { try { cb(t); } catch (e2) {} }
+                            out = Promise.resolve(t);
+                        }
+                        return out;
+                    };
+                    chrome.tabs.__syUpdatePatched = true;
+                }
                 if (!chrome.tabs.remove) chrome.tabs.remove = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
-                if (!chrome.tabs.get) chrome.tabs.get = function (id, cb) { var t = { id: id, index: 0, windowId: 1, active: false, url: "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                // ★ windows 补桩（v22）：原生 windows 对象存在但缺 getCurrent 等
+                //     （"有对象无方法"，同 0f 的镜像问题）—— VM 的 qt 用
+                //     windows.getCurrent 解析窗口上下文，缺方法直接 TypeError。
+                if (chrome.windows && !chrome.windows.__syWinPatched) {
+                    var syWinStub = function () { return { id: 1, index: 0, focused: true, type: "normal", state: "normal", incognito: false, alwaysOnTop: false, width: 1200, height: 800, left: 0, top: 0, tabs: [{ id: 1, url: "" }] }; };
+                    var syWinMethod = function (w) { return function (q, cb) { var win = w(); if (typeof q === "function") { try { q(win); } catch (e) {} return; } if (typeof cb === "function") { try { cb(win); } catch (e) {} } return Promise.resolve(win); }; };
+                    if (typeof chrome.windows.getCurrent !== "function") chrome.windows.getCurrent = syWinMethod(syWinStub);
+                    if (typeof chrome.windows.getLastFocused !== "function") chrome.windows.getLastFocused = syWinMethod(syWinStub);
+                    if (typeof chrome.windows.get !== "function") chrome.windows.get = syWinMethod(syWinStub);
+                    if (typeof chrome.windows.getAll !== "function") chrome.windows.getAll = function (q, cb) { var win = syWinStub(); if (typeof q === "function") { try { q([win]); } catch (e) {} return; } if (typeof cb === "function") { try { cb([win]); } catch (e) {} } return Promise.resolve([win]); };
+                    if (typeof chrome.windows.update !== "function") chrome.windows.update = function (id, props, cb) { var win = syWinStub(); if (typeof cb === "function") { try { cb(win); } catch (e) {} } return Promise.resolve(win); };
+                    chrome.windows.__syWinPatched = true;
+                }
+                // ★ get 包装（v22，原生存在也要包）：VM maybeInstallUserJs 的
+                //     getTab(tabId) 在合成 tabId（出箱/派发用 id=1）上原生恒 reject
+                //     "No such tab" → await 抛 → confirmInstall 永不执行。失败兜底
+                //     返回最小假 tab，语义对齐"页签存在但无导航信息"。
+                if (chrome.tabs && !chrome.tabs.__syGetPatched) {
+                    var origTabsGet = typeof chrome.tabs.get === "function" ? chrome.tabs.get.bind(chrome.tabs) : null;
+                    chrome.tabs.get = function (id, cb) {
+                        var fake = { id: typeof id === "number" ? id : 1, index: 0, windowId: 1, active: false, pinned: false, incognito: false, url: "", title: "" };
+                        var p = origTabsGet
+                            ? Promise.resolve().then(function () { return origTabsGet(id); }).catch(function () { return fake; })
+                            : Promise.resolve(fake);
+                        if (typeof cb === "function") {
+                            p.then(function (t) { try { cb(t); } catch (e) {} }, function () { try { cb(fake); } catch (e) {} });
+                            return;
+                        }
+                        return p;
+                    };
+                    chrome.tabs.__syGetPatched = true;
+                }
                 if (!chrome.tabs.reload) chrome.tabs.reload = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
                 if (chrome.tabs.TAB_ID_NONE === undefined) chrome.tabs.TAB_ID_NONE = -1;
                 // 5b-2) declarativeNetRequest 虚拟存储：AdGuard 引擎启动会把十几万条
@@ -838,21 +898,30 @@ export class ExtensionHost {
                         var rid = "t" + (++tsmSeq) + "_" + Date.now().toString(36);
                         self.__syTabsOutbox = self.__syTabsOutbox || [];
                         self.__syTabsOutbox.push({ id: rid, tabId: typeof tabId === "number" ? tabId : null, msg: msg === undefined ? null : msg });
-                        if (callback) {
-                            self.__syTabsPending = self.__syTabsPending || {};
-                            self.__syTabsPending[rid] = function (respJson) {
-                                delete self.__syTabsPending[rid];
-                                var resp;
-                                try { resp = respJson == null ? undefined : JSON.parse(respJson); } catch (e3) { resp = undefined; }
-                                try { callback(resp); } catch (e3) {}
-                            };
-                            setTimeout(function () {
-                                if (self.__syTabsPending && self.__syTabsPending[rid]) {
+                        // ★ 恒返回 Promise：VM 的 ft = tabs.sendMessage(...).catch(ht) 直接
+                        //   链式调用，undefined 返回值会让 .catch 炸（实测 .user.js 安装链
+                        //   在 sendTabCmd("Stop") 处 TypeError 整链死）。
+                        return new Promise(function (resolve) {
+                            if (callback) {
+                                self.__syTabsPending = self.__syTabsPending || {};
+                                self.__syTabsPending[rid] = function (respJson) {
                                     delete self.__syTabsPending[rid];
-                                    try { callback(undefined); } catch (e3) {}
-                                }
-                            }, 20000);
-                        }
+                                    var resp;
+                                    try { resp = respJson == null ? undefined : JSON.parse(respJson); } catch (e3) { resp = undefined; }
+                                    try { callback(resp); } catch (e3) {}
+                                    resolve(resp);
+                                };
+                                setTimeout(function () {
+                                    if (self.__syTabsPending && self.__syTabsPending[rid]) {
+                                        delete self.__syTabsPending[rid];
+                                        try { callback(undefined); } catch (e3) {}
+                                        resolve(undefined);
+                                    }
+                                }, 20000);
+                            } else {
+                                resolve(undefined);
+                            }
+                        });
                     };
                     try { Object.defineProperty(chrome.tabs, "sendMessage", { configurable: true, get: function () { return tsm; } }); }
                     catch (e2) { chrome.tabs.sendMessage = tsm; }
