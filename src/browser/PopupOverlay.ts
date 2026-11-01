@@ -10,7 +10,7 @@
 import { IWebviewTag } from "../types";
 import { BROWSER_PARTITION } from "../constants";
 import { injectExtensionPageRuntime, readExtLsSeed, persistExtLs } from "./ext-popup";
-import { beginPopupWorld, evalPopupJs, ICsExtInfo } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInSwByElectronId, ICsExtInfo } from "../extensions/cs-runtime";
 
 export interface PopupOpenOptions {
     extId: string;
@@ -45,6 +45,7 @@ export class ExtensionPopupOverlay {
     private activeOpts: PopupOpenOptions | null = null;
     private navRetries = 0;                    // 原生源导航重试计数（>8 = 放弃走兜底）
     private navTimer: ReturnType<typeof setTimeout> | null = null;
+    private drainTimer: ReturnType<typeof setInterval> | null = null; // 出箱排空泵（popup 打开期间）
     private onClosedCb: (extId: string) => void;
     private onErrorCb: (msg: string) => void;
 
@@ -68,6 +69,25 @@ export class ExtensionPopupOverlay {
         host.className = "sy-ext-popup-overlay";
         host.style.cssText = `position:fixed;z-index:2147483000;width:${POPUP_W}px;height:${POPUP_H}px;display:none;`
             + `background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.28);`;
+        // 调试按钮：点击打开 overlay webview 的 DevTools（定位扩展 React 不挂载等问题）
+        const dbgBtn = document.createElement("button");
+        dbgBtn.textContent = "DT";
+        dbgBtn.title = "打开/关闭 DevTools";
+        dbgBtn.style.cssText = "position:absolute;top:2px;left:2px;z-index:10;width:24px;height:20px;"
+            + "background:#1a73e8;color:#fff;border:none;border-radius:3px;cursor:pointer;"
+            + "font-size:10px;font-weight:bold;line-height:20px;text-align:center;padding:0;opacity:.7;";
+        dbgBtn.addEventListener("click", () => { this.openGuestDevTools(); });
+        host.style.position = "fixed";
+        host.style.overflow = "visible";
+        host.appendChild(dbgBtn);
+        this.tabRoot.appendChild(host);
+        this.host = host;
+        this.attachGuest();
+    }
+
+    /** 新建 guest webview 并挂进 host（首建与死 guest 重建共用） */
+    private attachGuest(): void {
+        if (!this.host || this.vw) return;
         const vw = document.createElement("webview") as unknown as IWebviewTag;
         vw.setAttribute("src", "about:blank");
         vw.setAttribute("partition", BROWSER_PARTITION);
@@ -81,18 +101,6 @@ export class ExtensionPopupOverlay {
             try { vw.useragent = this.userAgent; } catch {}
         }
         vw.style.cssText = "width:100%;height:100%;border:0;";
-        host.appendChild(vw);
-        // 调试按钮：点击打开 overlay webview 的 DevTools（定位扩展 React 不挂载等问题）
-        const dbgBtn = document.createElement("button");
-        dbgBtn.textContent = "DT";
-        dbgBtn.title = "打开/关闭 DevTools";
-        dbgBtn.style.cssText = "position:absolute;top:2px;left:2px;z-index:10;width:24px;height:20px;"
-            + "background:#1a73e8;color:#fff;border:none;border-radius:3px;cursor:pointer;"
-            + "font-size:10px;font-weight:bold;line-height:20px;text-align:center;padding:0;opacity:.7;";
-        dbgBtn.addEventListener("click", () => { this.openGuestDevTools(); });
-        host.style.position = "fixed";
-        host.style.overflow = "visible";
-        host.appendChild(dbgBtn);
         // guest → 宿主通道：F12 开 DevTools；localStorage 垫片快照回灌持久化
         vw.addEventListener("ipc-message", (e: any) => {
             if (e.channel === "sy-open-devtools") {
@@ -113,9 +121,64 @@ export class ExtensionPopupOverlay {
             try { vw.setAttribute("src", "about:blank"); } catch {}
             this.docReady = false;
         });
-        this.tabRoot.appendChild(host);
-        this.host = host;
+        this.host.insertBefore(vw, this.host.firstChild);
         this.vw = vw;
+    }
+
+    /** guest 是否存活：getWebContentsId 拿到 id 后 remote.fromId 必须能取到
+     *  且未销毁。死 guest 的典型症状 = src 赋值触发 handleWebviewAttributeMutation
+     *  → GUEST_VIEW_MANAGER_CALL "Invalid guestInstanceId" 无限刷屏（实测 VM
+     *  popup 关闭再开撞上）。 */
+    private guestAlive(): boolean {
+        const vw = this.vw;
+        if (!vw) return false;
+        try {
+            const id = (vw as any).getWebContentsId?.();
+            if (typeof id !== "number") return false;
+            const remote = (window as any).require?.("@electron/remote");
+            const wc = remote?.webContents?.fromId?.(id);
+            return !!wc && !wc.isDestroyed?.();
+        } catch {
+            return false;
+        }
+    }
+
+    /** 死 guest 重建：换新 webview 元素（Electron 的 webview guest 被销毁后
+     *  元素内残留的 guestInstanceId 永远失效，重设 src 只会无限报错 —— 必须换元素） */
+    private rebuildGuestIfDead(): void {
+        if (!this.host) return;
+        if (this.guestAlive()) return;
+        try { this.vw?.remove(); } catch {}
+        this.vw = null;
+        this.docReady = false;
+        this.attachGuest();
+    }
+
+    /** 出箱排空泵（popup 打开期间每 1.2s 一次）：VM 这类原生消息流（popup 世界
+     *  用 Electron 原生 chrome.runtime.sendMessage → 原生路由到 SW）不经宿主
+     *  hostCall 桥，routeSendMessage 完成点的排空永远不触发 —— SW 侧
+     *  __syTabCreateOutbox 积压（实测齿轮/加号点击 4 条滞留，页面永不打开）。
+     *  泵与桥路由双保险：谁先拿到都行。 */
+    private async drainOutboxOnce(electronId: string): Promise<void> {
+        try {
+            const dr = await evalInSwByElectronId(electronId, "(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()");
+            const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
+            for (const it of (Array.isArray(items) ? items : [])) {
+                const u = String((it && it.url) || "");
+                if (!u) continue;
+                try { (window as any).browserPlugin?.openUrl?.(u, { force: true }); } catch {}
+            }
+        } catch {}
+    }
+
+    private startDrainLoop(electronId: string): void {
+        this.stopDrainLoop();
+        void this.drainOutboxOnce(electronId);
+        this.drainTimer = setInterval(() => void this.drainOutboxOnce(electronId), 1200);
+    }
+
+    private stopDrainLoop(): void {
+        if (this.drainTimer) { clearInterval(this.drainTimer); this.drainTimer = null; }
     }
 
     /** 打开/关闭 overlay webview guest 的 DevTools（DT 按钮与 F12 共用）。
@@ -161,6 +224,8 @@ export class ExtensionPopupOverlay {
     open(opts: PopupOpenOptions): void {
         this.userAgent = opts.userAgent;
         this.ensureWarm();
+        this.rebuildGuestIfDead();
+        this.startDrainLoop(opts.electronId);
         const sameDoc = this.openExtId === opts.extId && this.isOpenFor(opts.extId);
         this.activeOpts = opts;
         this.openExtId = opts.extId;
@@ -281,6 +346,13 @@ export class ExtensionPopupOverlay {
         const extId = this.openExtId;
         this.openExtId = null;
         this.openRequested = false;
+        this.stopDrainLoop();
+        // 关闭瞬间可能仍有在途出箱条目（SW handler 异步完成晚于泵停止）：补两拍
+        if (this.activeOpts?.electronId) {
+            const eid = this.activeOpts.electronId;
+            setTimeout(() => void this.drainOutboxOnce(eid), 2000);
+            setTimeout(() => void this.drainOutboxOnce(eid), 5000);
+        }
         if (this.navTimer) { clearTimeout(this.navTimer); this.navTimer = null; }
         if (!this.host) return;
         try {
@@ -290,8 +362,13 @@ export class ExtensionPopupOverlay {
         try {
             this.host.style.display = "none";
             this.docReady = false;
-            // loadURL 强制真实导航（src 同值重指派会被去重，dom-ready 不触发）
-            if (this.vw) { const lp = this.vw.loadURL?.("about:blank"); if (lp && typeof lp.catch === "function") lp.catch(() => {}); }
+            // loadURL 强制真实导航（src 同值重指派会被去重，dom-ready 不触发）；
+            // 死 guest 跳过导航（loadURL 只会抛 Invalid guestInstanceId）——
+            // 元素留待下次 open 时 rebuildGuestIfDead 换新
+            if (this.vw && this.guestAlive()) {
+                const lp = this.vw.loadURL?.("about:blank");
+                if (lp && typeof lp.catch === "function") lp.catch(() => {});
+            }
         } catch {}
         if (extId) this.onClosedCb(extId);
     }
@@ -302,6 +379,7 @@ export class ExtensionPopupOverlay {
             document.removeEventListener("mousedown", this.onOutsideRef, true);
             window.removeEventListener("keydown", this.onEscRef, true);
         } catch {}
+        this.stopDrainLoop();
         if (this.navTimer) { clearTimeout(this.navTimer); this.navTimer = null; }
         try { this.host?.remove(); } catch {}
         this.host = null;
