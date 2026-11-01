@@ -256,7 +256,10 @@ function userScriptMatches(entry: any, rawUrl: string): boolean {    const match
 
 function safePattern(pattern: string, rawUrl: string): boolean {
     try {
-        return matchesUrlPattern(pattern, rawUrl);
+        // TM 系脚本允许非标准通配 host（实测 SEJ: *://**/*），标准 match pattern
+        // 不认 `**` —— 视同任意主机归一后匹配（否则直装条目永不被注入）
+        const norm = /:\/\/\*\*(?:[/?#]|$)/.test(pattern) ? pattern.replace("://**/", "://*/").replace("://**", "://*") : pattern;
+        return matchesUrlPattern(norm, rawUrl);
     } catch {
         return false;
     }
