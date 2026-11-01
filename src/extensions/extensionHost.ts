@@ -206,12 +206,15 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
-        // v18：tabs.query 过滤语义补全（TM popup 会话解析当前页签依赖）。
+        // v21：+ 0f 事件面补全（notifications/download 等命名空间"有对象无事件"，
+        //       VM sw.js 顶层 browser.notifications.onClicked.addListener TypeError）。
+        // v20：chrome.extension 兼容（0e 节，Violentmonkey SW 启动即死修复）。
+        // v19：TM extdb 启动守卫（脚本主库后端锚定 + 镜像回填，见 0d 节注释）。
         // 尾标记 sy-bg-shim-end 用于换版时从旧文件剥离旧垫片；无尾标记的旧文件
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v18";
+        const SHIM_VER = "v21";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -268,6 +271,186 @@ export class ExtensionHost {
                         oiEmit({ reason: "install" });
                     });
                 } catch (eOi5) {}
+            }
+        } catch (e) {}
+        // 0d) TM extdb 启动守卫：TM 5.5 的脚本主库按 "#storage" 类型标记在两个
+        //     持久后端之间二选一 —— chrome.storage.local（"!extdb.*" 键）与
+        //     IndexedDB("ext","general")，默认 storage.local，读不到标记时即落它。
+        //     本环境实测：扩展重载/clearStorageData(serviceworkers) 会连带清空
+        //     扩展 origin 的 IndexedDB（脚本库丢失事故），而 chrome.storage 键
+        //     幸存 —— 必须确保 TM 启动锚定在 storage.local，且 IndexedDB 路径
+        //     也能看见脚本（双保险）：
+        //     1) 在途拦截 chrome.storage.local.get：结果里 "!extdb.#storage" 若为
+        //        "indexedDB" 就地改写 "storage.local"（回调内同步改写，TM 的
+        //        后端选择读到即生效，无竞态窗口），并异步落盘修正（一次性）；
+        //     2) 镜像 → IndexedDB 兜底回填：镜像有 @uid# 条目而 IndexedDB 没有
+        //        任何 @uid# 键时，剥 "!extdb." 前缀与 {origin,value} 包装写回
+        //        （IndexedDB 已有脚本时不回填，防旧镜像覆盖新数据）。
+        //     启动诊断快照落 self.__syExtDbBoot 供宿主探针读取。
+        try {
+            if (!self.__syExtDbGuard) {
+                self.__syExtDbGuard = true;
+                var EXTDB_PFX = "!extdb.", EXTDB_TYPE = "!extdb.#storage";
+                var stLocal = chrome.storage.local;
+                var extDbDiag = self.__syExtDbBoot = { ts: Date.now(), markerRewritten: 0, backfilled: 0 };
+                try {
+                    if (stLocal && typeof stLocal.get === "function" && !stLocal.__syExtDbGet) {
+                        var origGet = stLocal.get.bind(stLocal);
+                        var fixResult = function (res) {
+                            try {
+                                var t = res && res[EXTDB_TYPE];
+                                var tv = t && typeof t === "object" && "value" in t ? t.value : t;
+                                if (tv === "indexedDB") {
+                                    var wrapped = t && typeof t === "object" && "value" in t;
+                                    if (wrapped) t.value = "storage.local"; else res[EXTDB_TYPE] = "storage.local";
+                                    extDbDiag.markerRewritten++;
+                                    if (!extDbDiag.markerPersisted) {
+                                        extDbDiag.markerPersisted = true;
+                                        var fix = {};
+                                        fix[EXTDB_TYPE] = wrapped ? { origin: (t && t.origin) || "normal", value: "storage.local" } : { origin: "normal", value: "storage.local" };
+                                        try { stLocal.set(fix, function () {}); } catch (eF2) {}
+                                    }
+                                }
+                            } catch (eF) {}
+                            return res;
+                        };
+                        stLocal.get = function (keys, cb) {
+                            if (typeof keys === "function") {
+                                var cb1 = keys; keys = null;
+                                return origGet(null, function (v) { try { cb1(fixResult(v)); } catch (e1) { cb1(v); } });
+                            }
+                            if (typeof cb === "function") return origGet(keys, function (v) { try { cb(fixResult(v)); } catch (e2) { cb(v); } });
+                            var p = origGet(keys, null);
+                            try { if (p && typeof p.then === "function") p = p.then(fixResult); } catch (e3) {}
+                            return p;
+                        };
+                        stLocal.__syExtDbGet = true;
+                    }
+                } catch (eG) { extDbDiag.getWrapErr = String(eG); }
+                try {
+                    stLocal.get(null, function (all) {
+                        try {
+                            var uidN = 0, extN = 0;
+                            for (var k in all) {
+                                if (k.indexOf(EXTDB_PFX) !== 0) continue;
+                                extN++;
+                                if (k.indexOf(EXTDB_PFX + "@uid#") === 0) uidN++;
+                            }
+                            extDbDiag.nMirrorExt = extN;
+                            extDbDiag.nMirrorUid = uidN;
+                            if (!uidN) return;
+                            var rq = indexedDB.open("ext", 1);
+                            rq.onupgradeneeded = function (ev) { try { var d = ev.target.result; if (!d.objectStoreNames.contains("general")) d.createObjectStore("general"); } catch (eU) {} };
+                            rq.onsuccess = function () {
+                                var db = rq.result;
+                                try {
+                                    var tx = db.transaction("general", "readonly");
+                                    var gk = tx.objectStore("general").getAllKeys();
+                                    gk.onsuccess = function () {
+                                        try {
+                                            var hasUid = false, i;
+                                            for (i = 0; i < gk.result.length; i++) { if (String(gk.result[i]).indexOf("@uid#") === 0) { hasUid = true; break; } }
+                                            extDbDiag.idbKeys = gk.result.length;
+                                            if (hasUid) return;
+                                            var tx2 = db.transaction("general", "readwrite");
+                                            var os = tx2.objectStore("general");
+                                            var n = 0;
+                                            for (var k3 in all) {
+                                                if (k3.indexOf(EXTDB_PFX) !== 0) continue;
+                                                var v = all[k3];
+                                                if (v && typeof v === "object" && "value" in v) v = v.value;
+                                                try { os.put(v, k3.slice(EXTDB_PFX.length)); n++; } catch (eP) {}
+                                            }
+                                            extDbDiag.backfilled = n;
+                                        } catch (eS) { extDbDiag.backfillErr = String(eS); }
+                                    };
+                                    gk.onerror = function () { extDbDiag.backfillErr = "getAllKeys failed"; };
+                                } catch (eT) { extDbDiag.backfillErr = String(eT); }
+                            };
+                            rq.onerror = function () { extDbDiag.backfillErr = "idb open failed"; };
+                        } catch (eA) { extDbDiag.backfillErr = String(eA); }
+                    });
+                } catch (eB) {}
+            }
+        } catch (e) {}
+        // 0e) chrome.extension 兼容（v20，Violentmonkey SW 启动即死修复）：VM 2.50
+        //     的 sw.js 顶层 probe chrome.extension.isAllowedFileSchemeAccess /
+        //     isAllowedIncognitoAccess（真实 SW 实证报
+        //     "O.extension.isAllowedIncognitoAccess is not a function" → 顶层
+        //     TypeError → SW 启动即死、has_started_service_worker 恒 false →
+        //     popup 的 OpenDashboard 等消息全部路由到死 SW，设置/加号按钮无反应）。
+        //     Electron 的 chrome.extension 命名空间存在但缺这两个方法 —— 补
+        //     回调+Promise 双语义桩（能力探测语义：无 incognito/文件访问回 false
+        //     即可让扩展初始化走完）。
+        try {
+            if (typeof chrome.extension === "undefined") { try { chrome.extension = {}; } catch (eXt0) {} }
+            if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess !== "function") {
+                chrome.extension.isAllowedFileSchemeAccess = function (cb) { try { if (typeof cb === "function") cb(false); } catch (eXt1) {} return Promise.resolve(false); };
+            }
+            if (chrome.extension && typeof chrome.extension.isAllowedIncognitoAccess !== "function") {
+                chrome.extension.isAllowedIncognitoAccess = function (cb) { try { if (typeof cb === "function") cb(false); } catch (eXt2) {} return Promise.resolve(false); };
+            }
+        } catch (e) {}
+        // 0f) 事件面补全（v21）：求值期实测 chrome.notifications 等**整体缺失**
+        //     （mutProbe 实证：undefined，非"有对象无事件"）——第 1 节的通用壳
+        //     只带 5 个泛型事件（onChanged/onClicked/onCommand/onInstalled/
+        //     onStartup），缺 VM sw.js 顶层要用的 onClosed/onShown 等 →
+        //     browser.notifications.onClosed.addListener 直接 TypeError（SW 启动
+        //     即死第二幕）。本节按命名空间补完整事件面：命名空间缺失则建壳，
+        //     已存在则只补缺失的事件壳。
+        try {
+            var syMkEvent = function () {
+                var fns = [];
+                return {
+                    addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                    removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                    hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
+                };
+            };
+            var syCloneNs = function (ns, name, ev) {
+                var merged = {};
+                try {
+                    var names = Object.getOwnPropertyNames(ns);
+                    for (var iK = 0; iK < names.length; iK++) {
+                        try {
+                            var d = Object.getOwnPropertyDescriptor(ns, names[iK]);
+                            if (d && d.get) Object.defineProperty(merged, names[iK], d);
+                            else if (d) { d.configurable = true; Object.defineProperty(merged, names[iK], d); }
+                        } catch (eC1) {}
+                    }
+                } catch (eC2) {}
+                merged[name] = ev;
+                return merged;
+            };
+            var syEnsureEvent = function (parent, childKey, name) {
+                if (!parent) return;
+                var ns = parent[childKey];
+                if (!ns || typeof ns !== "object" && typeof ns !== "function") {
+                    try { parent[childKey] = {}; } catch (eNs) { return; }
+                    ns = parent[childKey];
+                }
+                var cur = ns[name];
+                if (cur && typeof cur.addListener === "function") return;
+                var ev = syMkEvent();
+                try { Object.defineProperty(ns, name, { configurable: true, get: function () { return ev; } }); } catch (eA) {}
+                if (ns[name] && typeof ns[name].addListener === "function") return;
+                try { ns[name] = ev; } catch (eB) {}
+                if (ns[name] && typeof ns[name].addListener === "function") return;
+                try {
+                    var merged = syCloneNs(ns, name, ev);
+                    try { Object.defineProperty(parent, childKey, { configurable: true, get: function () { return merged; } }); } catch (eD) { try { parent[childKey] = merged; } catch (eE) {} }
+                } catch (eF) {}
+            };
+            var syEventFaces = [
+                ["notifications", "onClicked"], ["notifications", "onClosed"], ["notifications", "onShown"],
+                ["notifications", "onButtonClicked"], ["notifications", "onPermissionLevelChanged"],
+                ["downloads", "onChanged"], ["downloads", "onCreated"], ["downloads", "onErased"],
+                ["alarms", "onAlarm"], ["commands", "onCommand"],
+                ["omnibox", "onInputStarted"], ["omnibox", "onInputChanged"], ["omnibox", "onInputEntered"], ["omnibox", "onInputCancelled"],
+            ];
+            for (var iEF = 0; iEF < syEventFaces.length; iEF++) {
+                var face = syEventFaces[iEF];
+                syEnsureEvent(chrome, face[0], face[1]);
             }
         } catch (e) {}
         // 1) 通用存在性垫片：background 里引用到的缺失命名空间统一补空壳，
