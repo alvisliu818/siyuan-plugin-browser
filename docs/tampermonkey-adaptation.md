@@ -52,9 +52,13 @@
 - fix(browser): P0 启动竞态保守拦截（isManagedExtPage + extensionHost.isLoaded + did-navigate 漏网回收）
 - （29734fc 已提交的不动）
 
-### P4（可选深挖）
+### ~~P4：loadTree `referrer` 缺失上游源头~~（已结案，11-01，结论：不存在运行时变量，无需通用兜底）
 
-loadTree 的 `referrer` 在垫片环境缺失的上游源头（TM options 代码的哪个变量 undefined；真 Chrome 为何恒有值）——找到后可评估是否需要更通用的消息兜底。当前 `__syNormalizeMsg` 兜底已够用。
+浏览器实证（活页面世界包装 `chrome.runtime.sendMessage`/`connect.postMessage` 抓发送栈 + SW 全量消息 spy）：
+- **extension.js 全部 22 处 referrer 均为硬编码字面量**：dashboard 引导 `te({referrer:"options"})`、脚本/回收站 `oe()` 用 "options.scripts"/"options.trash"、tab 配置 "options.scripts.userscripts*"、popup `window.main()` 用 "actions"、editor 路径由字面量拼接（`.storage`/`.treeid`）。editor.js 无 loadTree。真 Chrome 恒有值 = 字面量恒有值。
+- 实测 boot/popup/hash 切换全流程 **0 例缺 referrer**（sendMessage 与 port 双通道 spy 均空——loadTree 走 sendMessage，port spy 落空的原因是端口复用绕过新 wrapper）。
+- **P0 结论修正**：options 页 "An internal error occurred" confirm 的真实触发条件是 `te()` 回调收到**空响应**（`(e=e||{}).items || (e.error ? … : confirm(…))`）——即 SW 冷启动/桥未就绪时请求无响应，与请求 referrer 无关；`pd.level(undefined)` 只在手动构造的无 referrer 探针消息里复现。当时 normalize 与重试窗口同时落地，真正解卡的是后者；normalize 是无害保险。
+- **评估**：不需要更通用的消息兜底——真实发送方全是字面量，通用兜底永不命中，只会掩盖真链路 bug。现有 loadTree 专属 normalize（origin 回退）保留即可。可选观测项（未做）：normalize 命中时打 warn，需垫片 v18→v19 全量重注，收益低。
 
 ## 四、部署/仓库状态
 
