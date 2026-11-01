@@ -120,6 +120,18 @@ loadTree 的 `referrer` 在垫片环境缺失的上游源头（TM options 代码
 
 ## 七、下一会话指引
 
-1. 剩余：P3 按功能拆 commit（见三），清 `E:\HOME\Code\.tmp-deploy`，`E:\HOME\Code\_probe-p2-*.mjs` 可留作回归探针（其余 `_probe-*` 按需清理）。
-2. 可选深挖（P4）：loadTree `referrer` 上游源头；offscreen 桩对 GM_* 更多 API（blob/stream 下载类）的影响——TM SW 的 offscreen 依赖被通用桩吞掉，普通 xhr 走 SW fetch 已通，stream/blob 类可能仍缺。
-3. 真实脚本回归：Dashboard 里 SY-GM-Test 改 @match 多站点试 GM_registerMenuCommand/GM_addStyle/GM_download。
+1. 剩余：清 `E:\HOME\Code\.tmp-deploy`（若复现），`_probe-sej-*.mjs` 留作回归探针。
+2. 真实脚本回归：Dashboard 里 SY-GM-Test / searchEngineJump(27752) 可作回归样本（见下「SEJ 安装实战」）。
+
+## 八、SEJ 安装实战（10-31/11-01，真实 greasyfork 脚本 27752）
+
+**结论：安装+执行+UI 渲染全链路打通**（百度搜索页 133 个 sej 元素，`A.sej-engine sej-drop-list-trigger` 跳转栏完整）。
+
+- **TM 在线安装（Utilities URL 导入）在本环境不可用**：SW 内 `fetch("greasyfork.org")` 直接 "Failed to fetch"（系统代理 ProxyEnable=0，直连被重置；上次会话能走到 ask.html 是因为当时代理开着）。Node 直连同样失败，走代理 127.0.0.1:7897 可达。
+- **替代安装路径（已验证）**：代理下载 .user.js 源码 → TM 编辑器直装（`#nav=new-user-script` → iso 世界 `cm.setValue` → File 菜单 Save）。存储落盘 5 个 key（@meta/@re/@source/@st/@uid）。
+- **@require 缺失非致命**：toGBK.js 下载超时（网络），每页加载有 warning 但脚本照常执行；百度 GBK 相关功能可能受影响。
+- **注册表形态澄清**：`__syUserScriptsReg` 只有 2 个引导条目（page.js/content.js）是**正常形态**——真实用户脚本不走 userScripts 逐条注册，走 content.js 引导的 `prepare` 消息通道由 TM 自己分发。
+- **注入时机坑**：宿主恢复页签的 dom-ready 早于 extensionHost.load() → `injectNativeUserScripts` 因 `!this.loaded` 静默跳过且**不重试**（P0 启动竞态的注入版）；恢复的页签要手动 reload 才注入。另：`void injectForPage()` 的 rejection 被 void 吞，`drain` 抛错无日志——排障时先宿主手动调 `usInjector.injectForPage(webviewEl, url)` 复现。
+- **注入日志在宿主 console**（`[browser-plugin] userScript "..." injected @ url`），不在 webview target——探针别听错地方。
+- **bing 特有问题（站点侧，非适配层）**：cn.bing.com 每次导航后很快弹 `/identity/idtokenv2`（整页替换，脚本栏被冲掉）；SEJ 在 bing 上执行正常（console 实证）。验证 UI 用百度（无重定向）。
+- SW 侧 fetch 失败的产品级思路（未做）：fetch 失败时兜底走 kernelfetch（内核 forwardProxy 已验证可达 greasyfork——Edge CRX 兜底同款）。
