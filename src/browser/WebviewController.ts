@@ -540,17 +540,35 @@ export class WebviewController {
      * 思源分屏/拖动页签会把 panelElement 在 DOM 中搬移，Electron webview 一旦
      * 被重新挂载，内部 guest 即被销毁：页面变白、reload/点击全部无响应。
      * 通过带超时的 executeJavaScript 探测，失败即认为损坏，需要重建。
+     * reason 供健康监测区分两类失败：detached/error ≈ 真搬移/真损坏（重建
+     * 是唯一恢复手段），timeout ≈ 主线程忙导致的探测超时（重建是误伤，
+     * 实测启动恢复期 6 页签同秒误重建）。
      */
-    async isHealthy(timeoutMs = 800): Promise<boolean> {
+    async isHealthy(timeoutMs = 800): Promise<{ ok: boolean; reason: "detached" | "timeout" | "error" | "" }> {
         try {
-            if (!this.webview?.isConnected) return false;
+            if (!this.webview?.isConnected) return { ok: false, reason: "detached" };
             await Promise.race([
                 this.webview.executeJavaScript("1"),
                 new Promise((_, reject) => setTimeout(() => reject(new Error("health check timeout")), timeoutMs)),
             ]);
-            return true;
-        } catch {
-            return false;
+            return { ok: true, reason: "" };
+        } catch (e) {
+            const msg = String((e as Error)?.message || e || "");
+            if (!msg.includes("health check timeout")) return { ok: false, reason: "error" };
+            // 超时宽限重试一次：主线程忙（启动注入/重页面渲染/重定向搅动）会让
+            // 探测排队到秒级，是误重建的主要来源；真损坏（guest 死亡空响）重试
+            // 同样超时——多等 2.5s 不影响定性，误伤概率大幅下降。
+            try {
+                if (!this.webview?.isConnected) return { ok: false, reason: "detached" };
+                await Promise.race([
+                    this.webview.executeJavaScript("1"),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error("health check timeout")), 2500)),
+                ]);
+                return { ok: true, reason: "" };
+            } catch (e2) {
+                const msg2 = String((e2 as Error)?.message || e2 || "");
+                return { ok: false, reason: msg2.includes("health check timeout") ? "timeout" : "error" };
+            }
         }
     }
 

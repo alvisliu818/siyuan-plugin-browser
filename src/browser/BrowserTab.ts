@@ -1200,9 +1200,12 @@ export class BrowserTab {
                 const curUrl = this.controller.getCurrentUrl?.() || "";
                 if (/^chrome-extension:\/\//i.test(curUrl) || this.controller.pendingExtPageUrl) return;
                 const healthy = await this.controller.isHealthy();
-                if (!healthy && !this.disposed && !this.rebuilding) {
-                    // 连续两次失败才判定损坏，避免偶发超时误判
+                if (!healthy.ok && !this.disposed && !this.rebuilding) {
+                    // 连续两次失败才判定损坏，避免偶发超时误判；失败原因入日志
+                    // （detached/error=真搬移，timeout=忙线程误判）——启动期集体
+                    // 重建的定性证据（实测 6 页签同秒 broken，需区分根因）。
                     this.healthFailCount++;
+                    console.warn(`[browser-plugin] health fail #${this.healthFailCount} (${healthy.reason}) url=${curUrl.slice(0, 60)}`);
                     if (this.healthFailCount >= 2) {
                         this.healthFailCount = 0;
                         console.warn("[browser-plugin] webview broken (moved in DOM?), rebuilding");
