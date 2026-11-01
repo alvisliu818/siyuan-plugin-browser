@@ -555,11 +555,14 @@ export class BrowserTab {
             let code = "";
             try {
                 code = await fetchVia(url, 15000);
+                console.info("[browser-plugin] .user.js fetched:", url.slice(0, 60), "len:", code.length);
             } catch (e1) {
+                console.warn("[browser-plugin] .user.js fetch 失败，尝试镜像:", url.slice(0, 60), String(e1?.message || e1).slice(0, 80));
                 // greasyfork 的 update 域直连常见超时：镜像到主站 code 路径
                 const m = url.match(/^https?:\/\/update\.greasyfork\.org\/scripts\/(\d+)\/([^/?#]+\.user\.js)$/i);
                 if (!m) throw e1;
                 code = await fetchVia("https://greasyfork.org/scripts/" + m[1] + "/code/" + m[2], 15000);
+                console.info("[browser-plugin] .user.js 镜像 fetched: len:", code.length);
             }
             const USERSCRIPT_HEAD = new RegExp("==\\s*UserScript\\s*==");
             if (!USERSCRIPT_HEAD.test(code)) throw new Error("内容缺少 ==UserScript== 头，不是用户脚本");
@@ -584,6 +587,7 @@ export class BrowserTab {
             //   存储 @source/@uid（SW eval 曾观测到挂起，加 5s 限时——命中提示
             //   「已安装」跳过确认框，防冗余副本）
             const normSrc = (s: unknown) => String(s || "").replace(/\r\n/g, "\n").trim();
+            console.info("[browser-plugin] .user.js 解析完成:", name, version || "-", "checks 开始");
             try {
                 const regs = host.usInjector?.regs instanceof Map ? host.usInjector.regs : null;
                 if (regs) {
@@ -612,11 +616,13 @@ export class BrowserTab {
                 const entries = JSON.parse(String(r?.value || "[]"));
                 const sameSource = entries.some((x: any) => x.src !== undefined && normSrc(x.src) === normSrc(code));
                 const sameName = entries.some((x: any) => x.uid !== undefined && String(x.uid).trim() === name);
+                console.info("[browser-plugin] .user.js TM 存储比对:", JSON.stringify({ sameSource, sameName }));
                 if (sameSource || sameName) {
                     showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
                     return;
                 }
             } catch {}
+            console.info("[browser-plugin] .user.js checks 完成，未命中已安装 → 弹确认框");
             // 确认弹窗（对齐 TM ask.html 语义）：展示脚本信息，用户点安装才注册
             const aid = "aid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
             this.pendingInstalls.set(aid, {
@@ -699,6 +705,7 @@ export class BrowserTab {
             void this.confirmInstall(aid);
         });
         this.element.appendChild(overlay);
+        console.info("[browser-plugin] .user.js 确认弹窗已展示:", info.name);
     }
 
     /** 用户确认后的注册（原直装逻辑后移至此） */
@@ -761,10 +768,14 @@ export class BrowserTab {
                 if (/^chrome-extension:/i.test(url) || /^data:/i.test(url)) { cb({}); return; }
                 const RT_MAP: Record<string, string> = { mainFrame: "main_frame", subFrame: "sub_frame", xhr: "xmlhttprequest", cspReport: "csp_report", webSocket: "websocket" };
                 const rtDnr = RT_MAP[String(details?.resourceType || "")] || String(details?.resourceType || "") || null;
-                // ★ .user.js 最优先：取消导航（留在 greasyfork 页上）+ 桥派发给
-                //   TM 自己的 onBeforeRequest handler（其异步安装流：自己 fetch
-                //   脚本 → tabs.create 开 ask.html?aid → 出箱多点排空）。
-                //   TM 链条 20s 未走出 ask → 回落宿主确认弹窗（GM 层已支持）。
+                // ★ .user.js 拦截：cancel 导航 + 9s 回落宿主确认弹窗。
+                //   曾尝试真浏览器流程（放行导航让 TM 引导检测 .user.js），但实测
+                //   update.greasyfork.org 在 webview 会话里加载挂死（SW fetch 与
+                //   curl-via-proxy 均 2s 返回，唯独 webview 导航无响应——会话级
+                //   待查），页面 90s 卡死触发重建循环。故维持 cancel + 宿主直装
+                //   （fetch 走 session.fetch + 镜像兜底，实测可装）。
+                //   后续线索：SW fetch 同 URL 200/2s，唯 webview 导航挂——对比
+                //   两者请求头/代理行为可定位。
                 if (/\.user\.js(?:[?#]|$)/i.test(url) && details?.resourceType === "mainFrame" && !/^chrome-extension:/i.test(url) && !/script_installation\.php/i.test(url)) {
                     cb({ cancel: true });
                     this.pendingUserJs = { url, askOpened: false };
@@ -782,11 +793,8 @@ export class BrowserTab {
                             }
                         } catch {}
                     })();
-                    // ★ 合成 webNavigation.onCommitted：TM MV3 的 .user.js 安装检测
-                    //   走导航观察（downloads.onCreated 它根本没注册——实测监听数 0）。
-                    //   导航被 cancel 后 did-navigate 不发生，不补发这条 TM 永远看不到
-                    //   .user.js 导航 → 静默超时。派发内含多点排空（ask.html 开页）。
-                    void this.emitWebNavCommitted(url);
+                    // 合成下载事件保留：TM 若在授予 downloads 可选权限后启用
+                    // downloads.onCreated 检测，此事件立即可用（当前监听数 0，无感）。
                     void (async () => {
                         try { await this.dispatchWrCollect(url, rtDnr, details); } catch {}
                         for (const delay of [1500, 2500, 4000]) {

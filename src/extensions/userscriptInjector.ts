@@ -104,7 +104,17 @@ export class UserscriptInjector {
             return;
         }
         if (!regData?.ok || !regData.reg || typeof regData.reg !== "object") return;
-        this.regs.set(electronId, new Map(Object.entries(regData.reg)));
+        const incoming = new Map(Object.entries(regData.reg));
+        // 防降级：SW 侧注册表为空且版本号 0 = 未水合的启动窗口或存储通道故障
+        // （垫片水合是异步的；storage 读失败时垫片回落 {reg:{},ver:0}）。此时若
+        // 宿主已有非空副本，保留旧值不替换、也不记录版本号 —— 下次 dom-ready
+        // 会重试拉取；否则一次竞态就会把整表清空（实测连引导包副本都丢，
+        // 页面注入全静默）。
+        if (incoming.size === 0 && swVer === 0 && (this.regs.get(electronId)?.size || 0) > 0) {
+            console.log(`[browser-plugin] userScripts registry empty @ v0 (unhydrated?), keep host copy (${electronId.slice(0, 8)})`);
+            return;
+        }
+        this.regs.set(electronId, incoming);
         this.versions.set(electronId, swVer);
         console.log(`[browser-plugin] userScripts registry reconciled (${electronId.slice(0, 8)}): ${Object.keys(regData.reg).length} scripts @ v${swVer}`);
     }
@@ -202,13 +212,7 @@ export class UserscriptInjector {
     };
 `;
                 const wrapped = "(function(){\n" + gmPrelude + "\n" + code + "\n})()";
-                let r = await evalInExtensionWorldBridge(webview, electronId, wrapped).catch(
-                    () => ({ ok: false, error: "bridge failed" }) as { ok: boolean; error?: string }
-                );
-                if (!r.ok) {
-                    // flat CDP 通道失效（跨进程导航后 contextId 变化等）→ HTTP /json 兜底
-                    r = await evalInExtensionWorld(webview, electronId, wrapped);
-                }
+                const r = await this.evalBigCode(webview, electronId, wrapped);
                 if (r.ok) {
                     console.log(`[browser-plugin] userScript "${entry.id}" injected @ ${url.slice(0, 80)}`);
                 } else {
@@ -216,6 +220,35 @@ export class UserscriptInjector {
                 }
             }
         }
+    }
+
+    /** 大脚本注入：≤100KB 直走桥（失败落 HTTP 兜底）；更大分块经世界侧缓冲拼接，
+     *  末尾 eval(self.__syBigBuf) 求值 —— 单条 CDP 求值超大表达式会超时
+     *  （实测 357KB 的 SEJ "CDP 会话超时"，分块后每条传输都很小）。 */
+    private async evalBigCode(webview: IWebviewTag, electronId: string, code: string): Promise<{ ok: boolean; error?: string }> {
+        const BIG = 100_000;
+        if (code.length <= BIG) {
+            let r = await evalInExtensionWorldBridge(webview, electronId, code).catch(
+                () => ({ ok: false, error: "bridge failed" }) as { ok: boolean; error?: string }
+            );
+            if (!r.ok) {
+                // flat CDP 通道失效（跨进程导航后 contextId 变化等）→ HTTP /json 兜底
+                r = await evalInExtensionWorld(webview, electronId, code);
+            }
+            return r;
+        }
+        const CHUNK = 90_000;
+        const bridge = async (expr: string) =>
+            evalInExtensionWorldBridge(webview, electronId, expr).catch(() => ({ ok: false, error: "bridge failed" }) as { ok: boolean; error?: string });
+        const init = await bridge("self.__syBigBuf = ''; 'ok'");
+        if (!init.ok) return init;
+        for (let i = 0; i < code.length; i += CHUNK) {
+            const piece = code.slice(i, i + CHUNK);
+            const r = await bridge(`self.__syBigBuf += ${JSON.stringify(piece)}; 'ok'`);
+            if (!r.ok) return { ok: false, error: `chunk ${Math.floor(i / CHUNK)} failed: ` + (r.error || "") };
+        }
+        const fin = await bridge("eval(self.__syBigBuf); self.__syBigBuf = ''; 'ok'");
+        return fin;
     }
 
     /** 已启用且原生加载的扩展信息（由 ExtensionHost 注入提供） */
