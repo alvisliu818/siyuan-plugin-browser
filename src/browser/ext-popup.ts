@@ -826,6 +826,7 @@ export async function injectExtensionPageRuntime(opts: {
     try {
         const { fs, path } = nodeMods();
         const pageRel = decodeURIComponent(pagePath || "index.html");
+
         const html = readText(fs, path.join(extPath, pageRel));
         if (!html) return { ok: false, error: "页面文件不存在: " + pageRel };
 
@@ -843,6 +844,12 @@ export async function injectExtensionPageRuntime(opts: {
         // CSS 全局生效（本页就是扩展页本身，无需 popup 的 host 作用域）；
         // CSS 里的相对 url() 同步绝对化。
         if (opts.rebuildDom) {
+            // ★ 主世界对话框抑制先行：扩展页重放期任何时序错乱（bridge 报错回退
+            //   主世界 / PRELUDE 未及安装，实测热重载恢复窗口 TM 引导失败的
+            //   "An internal error occurred" 裸 confirm 漏成原生对话框）都不再
+            //   阻塞渲染线程——Electron 原生对话框是同步阻塞的（P0 实测 4 叠框）。
+            //   扩展世界那份在 POPUP_JS_PRELUDE（opts.evalJs 注入），两世界各一份。
+            await webview.executeJavaScript(SUPPRESS_DIALOGS_JS, false).catch(() => {});
             const cssBlocks: string[] = [];
             for (const rel of collectCssHrefs(html)) {
                 const abs = path.join(extPath, resolveRel(rel));
@@ -981,3 +988,19 @@ export async function injectExtensionPageRuntime(opts: {
         return { ok: false, error: String(e?.message || e).slice(0, 300) };
     }
 }
+
+/** 主世界对话框抑制（rebuildDom 先行注入主世界，与 POPUP_JS_PRELUDE 的扩展世界
+ *  版本成对）：时序错乱导致脚本回退主世界 / PRELUDE 未及安装时，TM 引导失败的
+ *  裸 confirm 不再漏成 Electron 原生同步阻塞对话框（P0 实测 4 叠框假死）。 */
+export const SUPPRESS_DIALOGS_JS = `
+(function () {
+    try {
+        window.__syBlockedDialogs = window.__syBlockedDialogs || [];
+        var mk = function (kind) {
+            return function (msg) { try { window.__syBlockedDialogs.push(kind + ": " + msg); } catch (e) {} return kind === "confirm" ? false : undefined; };
+        };
+        window.confirm = mk("confirm");
+        window.alert = mk("alert");
+        window.prompt = mk("prompt");
+    } catch (e) {}
+})()`;
