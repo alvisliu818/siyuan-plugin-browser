@@ -580,27 +580,10 @@ export class BrowserTab {
                 if (pat && !matches.includes(pat)) matches.push(pat);
             }
             if (!matches.length) matches.push("*://*/*");
-            // ★ 已安装检测：与 TM 存储的 @source（全量源码）/@uid（脚本名）比对，
-            //   命中即提示「已安装」并跳过确认框 —— 否则已装脚本重复弹安装框，
-            //   用户再确认会注册出冗余副本（实测 SEJ 装过后仍弹安装框）
+            // ★ 已安装检测：先跑纯宿主侧的直装副本比对（无 SW 依赖），再查 TM
+            //   存储 @source/@uid（SW eval 曾观测到挂起，加 5s 限时——命中提示
+            //   「已安装」跳过确认框，防冗余副本）
             const normSrc = (s: unknown) => String(s || "").replace(/\r\n/g, "\n").trim();
-            try {
-                const expr = "(async () => { const all = await new Promise(res => chrome.storage.local.get(null, res)); " +
-                    "const out = []; for (const k in all) { " +
-                    "if (k.indexOf('!extdb.@source#') === 0) out.push({ src: (all[k] && all[k].value) || '' }); " +
-                    "if (k.indexOf('!extdb.@uid#') === 0) out.push({ uid: (all[k] && all[k].value) || '' }); } " +
-                    "return JSON.stringify(out); })()";
-                const r = await evalInSwByElectronId(tm.electronId, expr);
-                const entries = JSON.parse(String(r?.value || "[]"));
-                const sameSource = entries.some((x: any) => x.src !== undefined && normSrc(x.src) === normSrc(code));
-                const sameName = entries.some((x: any) => x.uid !== undefined && String(x.uid).trim() === name);
-                if (sameSource || sameName) {
-                    showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
-                    return;
-                }
-            } catch {}
-            // 直装副本比对：userScripts 直装条目不写 TM @uid/@source（confirmInstall
-            // 直接进注册表），只能比对注册表条目里的代码
             try {
                 const regs = host.usInjector?.regs instanceof Map ? host.usInjector.regs : null;
                 if (regs) {
@@ -614,6 +597,24 @@ export class BrowserTab {
                             }
                         }
                     }
+                }
+            } catch {}
+            try {
+                const expr = "(async () => { const all = await new Promise(res => chrome.storage.local.get(null, res)); " +
+                    "const out = []; for (const k in all) { " +
+                    "if (k.indexOf('!extdb.@source#') === 0) out.push({ src: (all[k] && all[k].value) || '' }); " +
+                    "if (k.indexOf('!extdb.@uid#') === 0) out.push({ uid: (all[k] && all[k].value) || '' }); } " +
+                    "return JSON.stringify(out); })()";
+                const r = await Promise.race([
+                    evalInSwByElectronId(tm.electronId, expr),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error("已安装检测超时")), 5000)),
+                ]);
+                const entries = JSON.parse(String(r?.value || "[]"));
+                const sameSource = entries.some((x: any) => x.src !== undefined && normSrc(x.src) === normSrc(code));
+                const sameName = entries.some((x: any) => x.uid !== undefined && String(x.uid).trim() === name);
+                if (sameSource || sameName) {
+                    showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
+                    return;
                 }
             } catch {}
             // 确认弹窗（对齐 TM ask.html 语义）：展示脚本信息，用户点安装才注册
@@ -781,6 +782,11 @@ export class BrowserTab {
                             }
                         } catch {}
                     })();
+                    // ★ 合成 webNavigation.onCommitted：TM MV3 的 .user.js 安装检测
+                    //   走导航观察（downloads.onCreated 它根本没注册——实测监听数 0）。
+                    //   导航被 cancel 后 did-navigate 不发生，不补发这条 TM 永远看不到
+                    //   .user.js 导航 → 静默超时。派发内含多点排空（ask.html 开页）。
+                    void this.emitWebNavCommitted(url);
                     void (async () => {
                         try { await this.dispatchWrCollect(url, rtDnr, details); } catch {}
                         for (const delay of [1500, 2500, 4000]) {
@@ -788,7 +794,9 @@ export class BrowserTab {
                             await this.drainWrOutbox();
                         }
                     })();
-                    // TM 链条 20s 未走出 ask → 回落宿主确认弹窗
+                    // TM 链条 9s 未走出 ask → 回落宿主确认弹窗（TM 原生链需要 tab
+                    // 注册表配合，当前环境多数情况走不到 ask —— 9s 已够其 fetch+登记，
+                    // 再等只是让用户干等；宿主弹窗带元数据与已安装检测，体验完整）
                     setTimeout(() => {
                         const pj = this.pendingUserJs;
                         if (pj && pj.url === url && !pj.askOpened) {
@@ -796,7 +804,7 @@ export class BrowserTab {
                             void this.interceptUserScriptInstall(url, "mainFrame", () => {});
                         }
                         if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
-                    }, 20000);
+                    }, 9000);
                     return;
                 }
                 if (this.maybeDispatchWr(url, rtDnr, details, cb)) return;
