@@ -156,3 +156,13 @@
 - **Electron SW 环境事实**：options_ui 字典形态在 getManifest 里保真（字符串形态被丢）；chrome.storage.session 存在；tabs.create 原生是空转桩（resolve 假 tab），垫片 5a 出箱桩因原生存在而不装——VM 走出箱是因为 `if (!chrome.tabs.create)` 条件在其 SW 里成立（原生未暴露 create）。
 - **修复验证链**：SW 起 → handlers 注册（__syOnMessageHandlers 非空）→ 直调 handler({cmd:"OpenDashboard"/"OpenEditor"}) → 出箱含 options URL（含 #scripts/_new/<id> hash）→ 排空 openUrl → 浏览器页签 + webview 加载 options 页 → VM UI 完整渲染（Settings/Backup/Recycle Bin/New/Install from GreasyFork 全在）。
 - **换版注意**：v21 改 shimBody → changedShimCount 触发全扩展 unload + clearStorageData(serviceworkers) + 重载（老流程）。VM 的 userscript 存储在扩展自己的 storage（chrome.storage.local），与 TM 的 !extdb 机制无关，clear 不伤。
+
+## 十、VM .user.js 安装链（2026-11-01，垫片 v22）
+
+greasyfork「安装此脚本」→ 宿主 will-navigate 拦截（cancel）→ 合成 downloads.onCreated + wr 派发 → VM 原生链：onBeforeRequest（非阻塞观察者，返回 `{redirectUrl:"javascript:void 0"}` 哨兵）→ maybeInstallUserJs → sendTabCmd("Stop") → confirmInstall → **tabs.update(1,{url:confirmUrl})** → 出箱 → 排空 → confirm/index.html#<key> 页（VM 自己的安装 UI，与 Edge 一致）。
+
+**六层串联死点**（逐层 unhandledrejection + sw.js 列号取证）：回落链只认 TM 名字；确认页标记只认 ask.html（且 pendingUserJs 被当 Map 调 .values() 的潜伏 TypeError 使标记从未生效）；sendTabCmd 的 tabs.sendMessage 返回 undefined 使 VM 的 `.catch` 链炸；getTab 原生 reject "No such tab"；confirmInstall 的 tabs.update 原生静默 no-op 且返回 undefined；windows.getCurrent 缺失。
+
+**修复落点**：垫片 v22（tabs.get 失败兜底假 tab、tabs.update 带 url 写出箱且恒返回 Promise、windows 五方法补桩、5d tsm 恒返回 Promise）+ BrowserTab（VM 感知回落、markUserJsChainOpened 双安装页识别）。
+
+**方法论**：SW 垫片对"原生存在"的 API 也要包装——Electron 原生 tabs.get/update/windows.getCurrent 在扩展语义下全是残废（reject/静默 no-op/返回 undefined），`if (!chrome.tabs.X)` 的补桩条件在这类 API 上是反模式；VM 代码大量 `.catch` 链式调用，宿主桩必须恒返回 Promise。死点定位靠 `unhandledrejection` 钩子 + 压缩行列号回源码切片。
