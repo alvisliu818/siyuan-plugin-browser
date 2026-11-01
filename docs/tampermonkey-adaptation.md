@@ -139,3 +139,20 @@
 - **注入日志在宿主 console**（`[browser-plugin] userScript "..." injected @ url`），不在 webview target——探针别听错地方。
 - **bing 特有问题（站点侧，非适配层）**：cn.bing.com 每次导航后很快弹 `/identity/idtokenv2`（整页替换，脚本栏被冲掉）；SEJ 在 bing 上执行正常（console 实证）。验证 UI 用百度（无重定向）。
 - SW 侧 fetch 失败的产品级思路（未做）：fetch 失败时兜底走 kernelfetch（内核 forwardProxy 已验证可达 greasyfork——Edge CRX 兜底同款）。
+
+## 九、Violentmonkey 适配（2026-11-01，垫片 v20/v21）
+
+用户移除 TM 改用 Violentmonkey 2.50（Edge 商店版，目录 edge-eeagobfjdenkkddmbclomhiblgggliao-19f6031，electronId lohncnmkmfabdgoifacpkahlnnlhiiai）。症状：popup 点设置/加号无反应，目标页 `extension://<id>/options/index.html` 打不开（该 URL 是 Edge 里的地址形态；本环境是 chrome-extension://）。
+
+**根因（诊断副本法实证，两层串联）**：
+
+1. **chrome.extension.isAllowedIncognitoAccess 缺失**（v20/0e 修）：VM sw.js 顶层 probe 该方法，Electron 的 chrome.extension 命名空间存在但缺它 → 顶层 TypeError → SW 启动即死（Preferences 里 has_started_service_worker 恒 false；主进程日志 "Service worker registration failed. Status code: 15"）→ popup 的 OpenDashboard/OpenEditor 消息全部路由到死 SW。
+2. **chrome.notifications 等命名空间求值期整体缺失**（v21/0f 修）：第 1 节通用壳只有 5 个泛型事件（onChanged/onClicked/onCommand/onInstalled/onStartup），VM 顶层用 browser.notifications.onClosed.addListener → TypeError（SW 启动即死第二幕）。0f 按命名空间补完整事件面（缺失则建壳；已存在则只补缺失事件）。
+
+**调试方法论（本次沉淀）**：
+
+- **诊断副本法**：拷扩展目录 → sw.js 整体包 try/catch（错误落 chrome.storage.local "!sySwErr"）→ 以新目录 loadExtension（**新路径→新 id→新注册**，同路径重载会吃旧脚本缓存——本次最大的弯路）→ startWorkerForScope → CDP 连 SW 读错误。零假阳性，一击必中。
+- **Worker 模拟法不可靠**：stub 忠实度永远差一截（缺 session/缺事件面/缺 getManifest 字段全是假阳性），只适合粗筛，定案必须真实 SW。
+- **Electron SW 环境事实**：options_ui 字典形态在 getManifest 里保真（字符串形态被丢）；chrome.storage.session 存在；tabs.create 原生是空转桩（resolve 假 tab），垫片 5a 出箱桩因原生存在而不装——VM 走出箱是因为 `if (!chrome.tabs.create)` 条件在其 SW 里成立（原生未暴露 create）。
+- **修复验证链**：SW 起 → handlers 注册（__syOnMessageHandlers 非空）→ 直调 handler({cmd:"OpenDashboard"/"OpenEditor"}) → 出箱含 options URL（含 #scripts/_new/<id> hash）→ 排空 openUrl → 浏览器页签 + webview 加载 options 页 → VM UI 完整渲染（Settings/Backup/Recycle Bin/New/Install from GreasyFork 全在）。
+- **换版注意**：v21 改 shimBody → changedShimCount 触发全扩展 unload + clearStorageData(serviceworkers) + 重载（老流程）。VM 的 userscript 存储在扩展自己的 storage（chrome.storage.local），与 TM 的 !extdb 机制无关，clear 不伤。
