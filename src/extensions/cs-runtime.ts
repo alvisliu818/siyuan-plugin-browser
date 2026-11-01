@@ -1051,6 +1051,22 @@ class CsPageSession {
         this.swReplyPumps.set(electronId, entry);
     }
 
+    /** 排空 SW 侧 chrome.tabs.create 出箱 → openUrl 真实开页签 */
+    private async drainTabCreateOutbox(ext: ICsExtInfo): Promise<void> {
+        try {
+            const dr = await this.evalInSw(ext, `(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()`);
+            const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
+            for (const it of (Array.isArray(items) ? items : [])) {
+                const u = String((it && it.url) || "");
+                if (!u) continue;
+                try {
+                    const bp = (window as any).browserPlugin;
+                    if (bp?.openUrl) bp.openUrl(u, { force: true });
+                } catch (e2) {}
+            }
+        } catch {}
+    }
+
     private stopSwReplyPump(electronId: string, entry: { timer: ReturnType<typeof setInterval> }): void {
         clearInterval(entry.timer);
         this.swReplyPumps.delete(electronId);
@@ -1390,18 +1406,12 @@ class CsPageSession {
         // SW 侧 chrome.tabs.create 出箱（垫片 5a）：SW 无法直接开宿主页签，路由期间
         // TM「查找新脚本」/ AdGuard 等经 SW handler 写 __syTabCreateOutbox，这里排空
         // → bp.openUrl 真实开页签。失败静默：条目留在箱里，下次路由再排。
-        try {
-            const dr = await this.evalInSw(ext, `(() => { const o = self.__syTabCreateOutbox || []; self.__syTabCreateOutbox = []; return JSON.stringify(o); })()`);
-            const items = dr && !dr.err && dr.value ? JSON.parse(String(dr.value)) : [];
-            for (const it of (Array.isArray(items) ? items : [])) {
-                const u = String((it && it.url) || "");
-                if (!u) continue;
-                try {
-                    const bp = (window as any).browserPlugin;
-                    if (bp?.openUrl) bp.openUrl(u, { force: true });
-                } catch (e2) {}
-            }
-        } catch (e1) {}
+        // ★ 延时多次排空：TM 安装流（Utilities Install）的 handler 异步下载脚本后
+        //   才 tabs.create 开 ask.html?aid——单次排空在下载完成前跑会丢条目
+        //   （实测 ask 页永不开）。3 次延时覆盖 ~11s 异步窗口。
+        void this.drainTabCreateOutbox(ext);
+        setTimeout(() => void this.drainTabCreateOutbox(ext), 3000);
+        setTimeout(() => void this.drainTabCreateOutbox(ext), 8000);
         try {
             let parsed = JSON.parse(String(r.value));
             // SW 刚被 loadExtension 唤醒时 app 尚在初始化（AdGuard 过滤器加载 5-10s），
