@@ -923,6 +923,16 @@ export class ExtensionHost {
                     dlItems[did] = item;
                     var fns2 = dlFns.onCreated || [];
                     for (var j = 0; j < fns2.length; j++) { try { fns2[j](item); } catch (eDl7) {} }
+                    // ★ 立即补 onChanged → complete：TM 的安装处理在下载完成后才开始
+                    //   （真 Chrome 下载瞬间完成），合成条目停在 in_progress 会让其
+                    //   handler 永远等待（实测 ask.html 永不开）。合成下载没有真实
+                    //   传输过程，直接落到 complete。
+                    item.state = "complete";
+                    item.bytesReceived = 1;
+                    item.totalBytes = 1;
+                    var fns3 = dlFns.onChanged || [];
+                    var delta = { id: did, state: { previous: "in_progress", current: "complete" } };
+                    for (var k = 0; k < fns3.length; k++) { try { fns3[k](delta); } catch (eDl8) {} }
                     return did;
                 };
             }

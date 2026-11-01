@@ -580,6 +580,42 @@ export class BrowserTab {
                 if (pat && !matches.includes(pat)) matches.push(pat);
             }
             if (!matches.length) matches.push("*://*/*");
+            // ★ 已安装检测：与 TM 存储的 @source（全量源码）/@uid（脚本名）比对，
+            //   命中即提示「已安装」并跳过确认框 —— 否则已装脚本重复弹安装框，
+            //   用户再确认会注册出冗余副本（实测 SEJ 装过后仍弹安装框）
+            const normSrc = (s: unknown) => String(s || "").replace(/\r\n/g, "\n").trim();
+            try {
+                const expr = "(async () => { const all = await new Promise(res => chrome.storage.local.get(null, res)); " +
+                    "const out = []; for (const k in all) { " +
+                    "if (k.indexOf('!extdb.@source#') === 0) out.push({ src: (all[k] && all[k].value) || '' }); " +
+                    "if (k.indexOf('!extdb.@uid#') === 0) out.push({ uid: (all[k] && all[k].value) || '' }); } " +
+                    "return JSON.stringify(out); })()";
+                const r = await evalInSwByElectronId(tm.electronId, expr);
+                const entries = JSON.parse(String(r?.value || "[]"));
+                const sameSource = entries.some((x: any) => x.src !== undefined && normSrc(x.src) === normSrc(code));
+                const sameName = entries.some((x: any) => x.uid !== undefined && String(x.uid).trim() === name);
+                if (sameSource || sameName) {
+                    showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
+                    return;
+                }
+            } catch {}
+            // 直装副本比对：userScripts 直装条目不写 TM @uid/@source（confirmInstall
+            // 直接进注册表），只能比对注册表条目里的代码
+            try {
+                const regs = host.usInjector?.regs instanceof Map ? host.usInjector.regs : null;
+                if (regs) {
+                    for (const [, m] of regs) {
+                        for (const [, entry] of m) {
+                            if (!/^sy-install/.test(String(entry?.id || ""))) continue;
+                            const c0 = (entry.js && entry.js[0] && entry.js[0].code) || "";
+                            if (c0 && normSrc(c0) === normSrc(code)) {
+                                showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
+                                return;
+                            }
+                        }
+                    }
+                }
+            } catch {}
             // 确认弹窗（对齐 TM ask.html 语义）：展示脚本信息，用户点安装才注册
             const aid = "aid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
             this.pendingInstalls.set(aid, {
@@ -601,6 +637,12 @@ export class BrowserTab {
                 console.info("[browser-plugin] .user.js 确认弹窗 3 分钟内已展示过，跳过:", dkey.slice(0, 80));
                 this.pendingInstalls.delete(aid);
                 return;
+            }
+            // 清理已脱离 DOM 的旧弹窗：webview 重建/页签搬移会把 overlay 连带 DOM
+            // 一起换掉，残引用会让「已有打开实例」永久为真 —— 后续所有安装确认
+            // 被静默跳过（实测 .user.js 弹窗一泄漏就再也装不上）
+            for (const ov of [...this.pendingInstallDialogs]) {
+                if (!ov.isConnected) this.pendingInstallDialogs.delete(ov);
             }
             if (this.pendingInstallDialogs.size > 0) {
                 console.info("[browser-plugin] .user.js 确认弹窗已有打开实例，跳过叠加");
@@ -671,7 +713,11 @@ export class BrowserTab {
         try {
             const id = "sy-install-" + Date.now().toString(36);
             const tryRegister = async (m: string[]): Promise<string> => {
-                const script = { id, matches: m, js: [{ code }], world: "USER_SCRIPT", runAt: "document_idle" };
+                // ★ 归一非标准通配：TM 系 @match 允许 `*://**/*`（host `**`），
+                //   标准 match pattern 不认 —— 存进注册表后 matches 永不命中，
+                //   脚本静默不注入（实测 SEJ 直装副本失效）。`**` 视同任意主机。
+                const normMatches = m.map((p) => /:\/\/\*\*(?:[/?#]|$)/.test(p) ? p.replace("://**/", "://*/").replace("://**", "://*") : p);
+                const script = { id, matches: normMatches, js: [{ code }], world: "USER_SCRIPT", runAt: "document_idle" };
                 // ★ 传参是 JSON 字符串，SW 侧必须先 JSON.parse —— 否则 register
                 //   收到 string，s.id undefined 被守卫跳过，还报 "ok"（实测踩坑）
                 const expr = "(function (scriptJson) { try { var script = JSON.parse(scriptJson); chrome.userScripts.register(script, function () {}); return 'ok'; } catch (e) { return 'throw:' + e.message; } })(" + JSON.stringify(JSON.stringify(script)) + ")";
@@ -721,6 +767,20 @@ export class BrowserTab {
                 if (/\.user\.js(?:[?#]|$)/i.test(url) && details?.resourceType === "mainFrame" && !/^chrome-extension:/i.test(url) && !/script_installation\.php/i.test(url)) {
                     cb({ cancel: true });
                     this.pendingUserJs = { url, askOpened: false };
+                    // ★ 合成 downloads.onCreated：TM 的安装入口是下载事件（真 Chrome
+                    //   把 .user.js 当下载，TM 观察后自己 fetch URL/登记待装/tabs.create
+                    //   开 ask.html）。只派发 webRequest 不会触发其安装流——实测缺这步
+                    //   TM 链条 20s 静默超时回落、__syDownloadItems 恒空。对全部原生
+                    //   扩展合成（downloads.onCreated 只有 TM 注册，其余扩展无感）。
+                    void (async () => {
+                        try {
+                            const eh = (window as any).browserPlugin?.extensionHost;
+                            const exts = (eh?.list?.() || []).filter((e: any) => e.native && e.electronId);
+                            for (const e of exts) {
+                                await evalInSwByElectronId(e.electronId, `try { self.__syEmitDownload && self.__syEmitDownload(${JSON.stringify(url)}); } catch (e) {}`).catch(() => null);
+                            }
+                        } catch {}
+                    })();
                     void (async () => {
                         try { await this.dispatchWrCollect(url, rtDnr, details); } catch {}
                         for (const delay of [1500, 2500, 4000]) {
