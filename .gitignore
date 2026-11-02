@@ -14,3 +14,14 @@ dist/
 
 # 调试探针（一次性诊断脚本/截图，不入库）
 tools/_*
+
+# 本地诊断与 SiYuan 调试探针（同上，不入库）
+diag/
+
+# Yarn 4 PnP：cache 在 globalFolder（E:/HOME/Code/.yarn-global，不在仓内）；
+# 解析映射与解包产物本地再生成，不入库。
+.pnp.cjs
+.pnp.loader.mjs
+.yarn/install-state.gz
+.yarn/unplugged/
+.yarn/releases/

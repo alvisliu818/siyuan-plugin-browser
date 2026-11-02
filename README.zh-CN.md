@@ -30,12 +30,12 @@
 ### 从本地源码
 
 1. 将项目克隆 / 复制到 `<workspace>/data/plugins/siyuan-plugin-browser/`
-2. 运行 `pnpm install && pnpm run build`（生成 `.src/` 目录）
+2. 运行 `yarn install && yarn run build`（生成 `.src/` 目录）
 3. 重启思源，在 **设置 → 集市 → 已下载** 中启用插件
 
 ### 从 zip 安装
 
-1. 运行 `pnpm run build` 生成 `dist/package.zip`
+1. 运行 `yarn run build` 生成 `dist/package.zip`
 2. 通过 **集市 → 已下载 → 从本地安装** 导入
 
 ## 架构

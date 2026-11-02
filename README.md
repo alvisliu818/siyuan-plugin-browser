@@ -30,12 +30,12 @@ A full-featured browser inside [SiYuan Note](https://b3log.org/siyuan), powered 
 ### From local source
 
 1. Clone / copy this project to `<workspace>/data/plugins/siyuan-plugin-browser/`
-2. Run `pnpm install && pnpm run build` (produces `.src/`)
+2. Run `yarn install && yarn run build` (produces `.src/`)
 3. Restart SiYuan, enable the plugin in **Settings → Bazaar → Downloaded**.
 
 ### From zip
 
-1. Run `pnpm run build` to generate `dist/package.zip`.
+1. Run `yarn run build` to generate `dist/package.zip`.
 2. Install via **Bazaar → Downloaded → Install from local**.
 
 ## Architecture
