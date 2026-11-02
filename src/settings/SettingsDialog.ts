@@ -135,6 +135,10 @@ export class SettingsDialog {
                 <input id="sb-preload" type="checkbox" ${s.enablePreload ? "checked" : ""} />
             </div>
             <div class="b3-form__row">
+                <label>扩展面板 DevTools 调试</label>
+                <input id="sb-popup-devtools" type="checkbox" ${s.popupDevtools ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row">
                 <label>${this.i18n.excerptNotebook}</label>
                 <select id="sb-excerpt-nb">
                     <option value="">(${this.i18n.excerptNotebook})</option>
@@ -220,6 +224,7 @@ export class SettingsDialog {
                 proxyMode: ((root.querySelector("#sb-proxy-mode") as HTMLSelectElement)?.value || "system") as ProxyMode,
                 proxyCustomUrl: (root.querySelector("#sb-proxy-url") as HTMLInputElement)?.value.trim() || "",
                 enablePreload: (root.querySelector("#sb-preload") as HTMLInputElement).checked,
+            popupDevtools: (root.querySelector("#sb-popup-devtools") as HTMLInputElement).checked,
                 excerptNotebook: (root.querySelector("#sb-excerpt-nb") as HTMLSelectElement).value,
                 excerptParentPath: (root.querySelector("#sb-excerpt-path") as HTMLInputElement).value.trim() || "/",
                 excerptTags: (root.querySelector("#sb-excerpt-tags") as HTMLInputElement).value.trim(),

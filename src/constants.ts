@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     homepage: "https://www.bing.com",
     searchEngine: "bing",
     customSearchUrl: "",
+    popupDevtools: false,
     historyLimit: 5000,
     recordHistory: true,
     downloadTarget: "assets",

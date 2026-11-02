@@ -60,10 +60,16 @@ function rewriteCssUrls(css: string, electronId: string): string {
 
 /**
  * 从完整 html 里取 <body>…</body> 的内容；没有 body 标签就整个返回。
+ * 无 </body> 闭合标签时（实测 VM popup/index.html：`<body><script…>` 后直接
+ * 结束）取 <body> 之后全部 —— 否则 fallback 整个文档，body 重建会把 META/
+ * LINK/SCRIPT 全灌进 body（2026-11-02 实测 VM 面板被 rebuild 洗空）。
  */
 function extractBody(html: string): string {
     const m = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-    return m ? m[1] : html;
+    if (m) return m[1];
+    const m2 = html.match(/<body[^>]*>([\s\S]*)$/i);
+    if (m2) return m2[1];
+    return html;
 }
 
 /** 取 body 开标签上的属性串（class/id/style 等）——整页重建时需要原样保留 */
@@ -82,14 +88,16 @@ function extractTitle(html: string): string {
 function collectScriptSrcs(html: string): Array<{ kind: "src" | "inline"; value: string }> {
     // 新标签页/选项页适配：除了外链 <script src>，内联脚本也要按文档顺序
     // 收集 —— 小型扩展（及手写页）用内联脚本调 chrome.*，漏掉即整页空转
+    // 属性值必须兼容无引号写法（实测 VM popup/index.html：`<script
+    // src=/popup/index.js>` 无引号 —— 只匹配引号形态会漏光全部脚本，重放空转）
     const out: Array<{ kind: "src" | "inline"; value: string }> = [];
     const re = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
     let m: RegExpExecArray | null;
     while ((m = re.exec(html))) {
         const attrs = m[1] || "";
         const body = m[2] || "";
-        const srcMatch = attrs.match(/\ssrc\s*=\s*(["'])([^"']+)\1/i);
-        if (srcMatch) out.push({ kind: "src", value: srcMatch[2] });
+        const srcMatch = attrs.match(/\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i);
+        if (srcMatch) out.push({ kind: "src", value: srcMatch[1] ?? srcMatch[2] ?? srcMatch[3] });
         else if (body.trim()) out.push({ kind: "inline", value: body });
     }
     return out;
@@ -97,16 +105,20 @@ function collectScriptSrcs(html: string): Array<{ kind: "src" | "inline"; value:
 
 /** 收集 html 里 <link rel=stylesheet> 引用的本地 css 文件相对路径 */
 function collectCssHrefs(html: string): string[] {
+    // 同样兼容无引号属性（实测 VM popup/index.html：`<link href=/popup/index.css
+    // rel=stylesheet>`）
+    const attrVal = (s: string, name: string): string | null => {
+        const m = s.match(new RegExp("\\s" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s\"'>]+))", "i"));
+        return m ? (m[1] ?? m[2] ?? m[3]) : null;
+    };
     const out: string[] = [];
-    const re = /<link[^>]*\srel\s*=\s*(["'])stylesheet\1[^>]*\shref\s*=\s*(["'])([^"']+)\2[^>]*>/gi;
+    const re = /<link\b([^>]*)>/gi;
     let m: RegExpExecArray | null;
     while ((m = re.exec(html))) {
-        out.push(m[3]);
-    }
-    // 属性顺序相反的写法（href 在 rel 前）
-    const re2 = /<link[^>]*\shref\s*=\s*(["'])([^"']+)\1[^>]*\srel\s*=\s*(["'])stylesheet\3[^>]*>/gi;
-    while ((m = re2.exec(html))) {
-        if (!out.includes(m[2])) out.push(m[2]);
+        const attrs = m[1] || "";
+        const rel = attrVal(attrs, "rel");
+        const href = attrVal(attrs, "href");
+        if (rel && href && /stylesheet/i.test(rel) && !out.includes(href)) out.push(href);
     }
     return out;
 }
@@ -578,6 +590,7 @@ export async function showExtensionPopupInPage(opts: {
         const baseDir = path.dirname(popupPath).replace(/\\/g, "/");
         const resolveRel = (rel: string): string => {
             if (/^(https?:|data:|chrome-extension:)/i.test(rel)) return rel;
+            if (rel.startsWith("/")) return rel.slice(1); // 根相对（相对扩展根，实测 VM src=/popup/index.js）
             const norm = rel.replace(/^\.\//, "");
             return baseDir && baseDir !== "." ? `${baseDir}/${norm}` : norm;
         };
@@ -834,6 +847,7 @@ export async function injectExtensionPageRuntime(opts: {
         const baseDir = path.dirname(pageRel).replace(/\\/g, "/");
         const resolveRel = (rel: string): string => {
             if (/^(https?:|data:|chrome-extension:)/i.test(rel)) return rel;
+            if (rel.startsWith("/")) return rel.slice(1); // 根相对（相对扩展根，实测 VM src=/popup/index.js）
             const norm = rel.replace(/^\.\//, "");
             return baseDir && baseDir !== "." ? `${baseDir}/${norm}` : norm;
         };
@@ -895,6 +909,9 @@ export async function injectExtensionPageRuntime(opts: {
             }
         }
         b.innerHTML = P.bodyHtml;
+        // ★ 主世界钝化并入同一 JS turn（rebuild 尾部）：杜绝"rebuild 完成 →
+        //   NEUTRALIZE 注入"间隙里主世界迟到回调抢先渲染的窗口
+        ${NEUTRALIZE_MAINWORLD_JS}
         return true;
     } catch (e) { return "ERR:" + (e && e.message || e); }
 })()`;
@@ -906,6 +923,7 @@ export async function injectExtensionPageRuntime(opts: {
 
         const jsSources: string[] = [];
         const jsRels: string[] = [];
+        const remoteSrcs: string[] = [];
         for (const item of scriptItems) {
             if (item.kind === "src") {
                 const rel = resolveRel(item.value);
@@ -917,6 +935,13 @@ export async function injectExtensionPageRuntime(opts: {
                     // 生成相邻字符串字面量（实测 TM extension.js line 611 语法错误）
                     jsSources.push(js);
                     jsRels.push(rel);
+                } else if (!rel.includes("*")) {
+                    // SW 动态伺服脚本（磁盘不存在，实测 VM get-data.js?popup：由
+                    // service worker 按 query 生成，给 window 播种 BGDATA 快照）。
+                    // 原生文档由 <script src> 直接请求 SW；重建后 innerHTML 插入
+                    // 的标签不执行 → 按 HTML 顺序 fetch+eval 补执行（fetch 走
+                    // chrome-extension:// 同源，SW 伺服语义与原生一致）。
+                    remoteSrcs.push(rel);
                 }
             } else {
                 jsSources.push(item.value);
@@ -949,6 +974,27 @@ export async function injectExtensionPageRuntime(opts: {
             } catch {}
         }
         await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
+        // SW 动态伺服脚本补执行（垫片就位后、页面脚本重放前，保持 HTML 顺序）。
+        // 两段式：主世界原生 fetch（SW 的 fetch handler 伺服 —— 与原生 <script
+        // src> 完全同语义；主世界钝化只废 DOM API 不动 fetch）拿到代码文本，
+        // 再回扩展世界 (0,eval) 于 global scope 执行。不能走垫片 extfetch：它
+        // 只读扩展目录磁盘文件，SW 动态生成的内容（VM get-data.js?popup 播种
+        // BGDATA）磁盘上不存在。
+        for (const rel of remoteSrcs) {
+            const url = "chrome-extension://" + electronId + "/" + String(rel).replace(/^\//, "");
+            let code: string | null = null;
+            try {
+                code = await webview.executeJavaScript(
+                    "fetch(" + JSON.stringify(url) + ", { cache: 'no-cache' }).then(function (r) { return r.ok ? r.text() : Promise.reject(new Error('http ' + r.status)); })",
+                    false,
+                ) as unknown as string | null;
+            } catch {}
+            if (typeof code === "string" && code.length > 0) {
+                try {
+                    await opts.evalJs("(0, eval)(" + JSON.stringify(code) + "); 'ok'", rel);
+                } catch {}
+            }
+        }
         // 合并单次求值：对齐 Chrome 的多 <script> 语义（同一全局词法作用域，
         // 传统多文件扩展的顶层函数跨文件可见）。逐文件独立求值会把 lib 的
         // 顶层函数锁进各自作用域，后续文件全局不可见（实测 SiYuan Clip 面板
@@ -1002,5 +1048,66 @@ export const SUPPRESS_DIALOGS_JS = `
         window.confirm = mk("confirm");
         window.alert = mk("alert");
         window.prompt = mk("prompt");
+    } catch (e) {}
+})()`;
+
+/**
+ * 主世界 DOM API 钝化（由 rebuildDom 的 rebuild 脚本在尾部同一 JS turn 内联执行，
+ * 见下方 rebuild 模板中的 ${NEUTRALIZE_MAINWORLD_JS}）。
+ *
+ * 动机：Electron 原生加载扩展页时主世界会原生执行页面脚本（chrome.* 部分可用，
+ * 实测 SiYuan Clip 主世界 bootstrapPopup 挂在 chrome.storage 回调上）——重放前
+ * 的 body 重建洗得掉已渲染的 UI，洗不掉**未来的迟到回调**：隔离世界重放完成
+ * 后主世界回调才 resolve，renderPopup 再跑一遍（insertAdjacentHTML 插空壳、
+ * getElementById 锚定文档序第一的容器）→ 双份"发送到思源"（2026-11-02 实测，
+ * 完整重启后依旧复现）。
+ *
+ * 手段：把主世界的查找/挂载类 DOM API 全部钝化。挂起的异步回调要么 null 解引用
+ * 抛错进扩展自己的 catch，要么 no-op —— 渲染不再发生。扩展隔离世界不受影响
+ * （每个 JS 世界的 DOM 包装对象相互独立，见 POPUP_JS_PRELUDE 同款依据）。
+ *
+ * 两个时序都收敛到单套 UI：
+ * - 主世界回调先完成 → body 重建已洗掉 → 重放一套
+ * - 钝化先执行 → 主世界回调渲染失效 → 重放一套
+ */
+export const NEUTRALIZE_MAINWORLD_JS = `
+(function () {
+    try {
+        if (window.__syMainworldNeutralized) return;
+        window.__syMainworldNeutralized = true;
+        var noop = function () {};
+        var nullFn = function () { return null; };
+        var emptyArrFn = function () { return []; };
+        var doc = document;
+        try { doc.getElementById = nullFn; } catch (e) {}
+        try { doc.querySelector = nullFn; } catch (e) {}
+        try { doc.querySelectorAll = emptyArrFn; } catch (e) {}
+        try { doc.getElementsByClassName = emptyArrFn; } catch (e) {}
+        try { doc.getElementsByTagName = emptyArrFn; } catch (e) {}
+        try { doc.getElementsByName = emptyArrFn; } catch (e) {}
+        try { doc.createElement = function (t) { return doc.createElementNS ? doc.createElementNS("http://www.w3.org/1999/xhtml", t) : null; }; } catch (e) {}
+        try { doc.addEventListener = noop; } catch (e) {}
+        var neutralizeMount = function (el) {
+            if (!el) return;
+            try { el.appendChild = function (n) { return n; }; } catch (e) {}
+            try { el.prepend = noop; } catch (e) {}
+            try { el.append = noop; } catch (e) {}
+            try { el.insertBefore = function (n) { return n; }; } catch (e) {}
+            try { el.insertAdjacentHTML = noop; } catch (e) {}
+            try { el.removeChild = function (n) { return n; }; } catch (e) {}
+            try {
+                var d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "innerHTML") || Object.getOwnPropertyDescriptor(el, "innerHTML");
+                if (d && d.set) {
+                    Object.defineProperty(el, "innerHTML", {
+                        configurable: true,
+                        get: function () { return d.get.call(this); },
+                        set: noop,
+                    });
+                }
+            } catch (e) {}
+        };
+        neutralizeMount(doc.body);
+        neutralizeMount(doc.documentElement);
+        neutralizeMount(doc.head);
     } catch (e) {}
 })()`;

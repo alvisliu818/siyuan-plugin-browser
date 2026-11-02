@@ -708,6 +708,15 @@ export class ExtensionHost {
                         if (done) return;
                         done = true;
                         var list = (nativeList && nativeList.slice && nativeList.slice()) || [];
+                        // 扩展自身页面（popup/options 真源 webview）不是"用户页签"：
+                        // Electron 原生 query 会把扩展 popup webview 当 active 页签
+                        // 返回且排最前（实测），TM getActiveTab 取第一个 → 面板把
+                        // 扩展页当当前页 → getFailureReason 判 noninjectable →
+                        // "cannot run userscripts"（首启实测根因）。一律剔除。
+                        list = list.filter(function (t) { return !/^chrome-extension:\\/\\//i.test(t.url || ""); });
+                        // 原生对同一 webview 可能返回重复条目（实测 baidu ×2）→ 去重
+                        var seenTabs = {};
+                        list = list.filter(function (t) { var k = String(t.id) + "|" + (t.url || ""); if (seenTabs[k]) return false; seenTabs[k] = 1; return true; });
                         var fed = self.__syLastFedTab;
                         if (fed && !list.some(function (t) { return String(t.id) === String(fed.id); })) list = list.concat([fed]);
                         var p = props || {};
@@ -1082,6 +1091,14 @@ export class ExtensionHost {
                                 for (var i = 0; i < details.js.length; i++) {
                                     jsCode += (details.js[i] && details.js[i].code) || "";
                                 }
+                            }
+                            // 可注入性探针短路（VM isInjectable 发 code:'true' 并要求
+                            // [0].result===true）：宿主对每个 http(s) 页无条件建 VM
+                            // 内容世界，探针恒可执行 —— 直接断言成功。恒回 null 会让
+                            // initPopup 判 noninjectable → 面板 "cannot run userscripts"
+                            // + 空列表（首启实测必然复现，非时序问题）。
+                            if (jsCode === "true") {
+                                return Promise.resolve([{ result: true }]);
                             }
                             if (jsCode) {
                                 self.__syUsExecOutbox = self.__syUsExecOutbox || [];

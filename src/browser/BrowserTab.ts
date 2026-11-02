@@ -17,7 +17,7 @@ import { closeExtensionPopupInPage, injectExtensionPageRuntime, POPUP_JS_PRELUDE
 import { ExtensionPopupOverlay } from "./PopupOverlay";
 import { dnrBlocker } from "./dnrEngine";
 import { evalInExtensionWorld } from "../extensions/sw-bridge";
-import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup, evalInSwByElectronId } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup, evalInSwByElectronId, precacheSetPopupForPopup } from "../extensions/cs-runtime";
 import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 浏览器页签实例依赖 */
@@ -1085,6 +1085,41 @@ export class BrowserTab {
             });
             this.extPopup.installGlobalListeners();
         }
+        // popup 打开前置：先填 VM 的 SetPopup 缓存（真 Chrome 由 webRequest
+        // prefetch 触发，垫片无此事件 → popup 脚本列表恒空），必须在 popup 页
+        // get-data.js 请求前完成。precache 内部会重试到数据真正就位（冷 SW +
+        // VM init 可达数秒），这里放宽限时只为 SW 彻底挂死时面板仍能打开。
+        // 数据若迟到（8s 限时超时）：落地时重载面板文档重拉数据 —— 列表
+        // 无条件最终一致显示，不依赖任何时序运气。
+        if (ext.electronId) {
+            const pp = precacheSetPopupForPopup(ext.electronId, String(this.webview.getURL?.() || ""));
+            const ready = await Promise.race([pp.then(() => true), new Promise((r2) => setTimeout(() => r2(false), 8000))]);
+            this.extPopup.open({
+                extId,
+                anchorRect: { right: r.right, bottom: r.bottom },
+                extPath: ext.path,
+                electronId: ext.electronId,
+                popupPath: ext.popupPath,
+                name: ext.name,
+                version: ext.version,
+                defaultLocale: ext.defaultLocale,
+                contentScripts: ext.contentScripts,
+                optionsPath: (ext as any).optionsPath,
+                userAgent: this.settings.userAgent,
+                // 锚定页：overlay 真实源架构下垫片世界 tabs.query 的"当前页签"
+                // （不传则 AdGuard 的 tab 上下文塌成扩展页 → 弹窗端口回包永空）
+                anchorTab: {
+                    url: String(this.webview.getURL?.() || ""),
+                    title: String((this.webview as any).getTitle?.() || document.title || ""),
+                },
+            });
+            if (!ready) {
+                void pp.then(() => {
+                    if (this.extPopup?.isOpenFor(extId)) this.extPopup.refreshForData();
+                });
+            }
+            return;
+        }
         this.extPopup.open({
             extId,
             anchorRect: { right: r.right, bottom: r.bottom },
@@ -1097,8 +1132,6 @@ export class BrowserTab {
             contentScripts: ext.contentScripts,
             optionsPath: (ext as any).optionsPath,
             userAgent: this.settings.userAgent,
-            // 锚定页：overlay 真实源架构下垫片世界 tabs.query 的"当前页签"
-            // （不传则 AdGuard 的 tab 上下文塌成扩展页 → 弹窗端口回包永空）
             anchorTab: {
                 url: String(this.webview.getURL?.() || ""),
                 title: String((this.webview as any).getTitle?.() || document.title || ""),

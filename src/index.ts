@@ -18,6 +18,7 @@ import { BookmarksDock } from "./docks/BookmarksDock";
 import { HistoryDock } from "./docks/HistoryDock";
 import { DownloadsDock } from "./docks/DownloadsDock";
 import { SettingsDialog } from "./settings/SettingsDialog";
+import { setPopupDevtoolsEnabled } from "./browser/PopupOverlay";
 import { registerShortcuts } from "./commands/shortcuts";
 import { ExtensionHost } from "./extensions/extensionHost";
 import { buildEdgeStoreHelperScript, isEdgeAddonsSiteUrl } from "./extensions/edgeStoreHelper";
@@ -105,6 +106,11 @@ export default class BrowserPlugin extends Plugin {
         // showExtIcon/showXxxDock 开关，注册发生在 onload；onLayoutReady 才加载的话
         // 注册时拿到的还是默认值，用户关掉的图标会先注册出来（思源会 await onload）。
         await this.settingsStore.load();
+        // 扩展面板 DevTools 调试开关（设置 → 浏览器 → "扩展面板 DevTools 调试"）
+        try { setPopupDevtoolsEnabled(!!this.settingsStore.get().popupDevtools); } catch {}
+        this.settingsStore.onChange(() => {
+            try { setPopupDevtoolsEnabled(!!this.settingsStore.get().popupDevtools); } catch {}
+        });
 
         // 注册自定义页签类型
         this.addTab({

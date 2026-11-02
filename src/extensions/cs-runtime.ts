@@ -91,6 +91,13 @@ export interface ICsExtInfo {
      * （BrowserTab）必须把锚定页 URL/标题显式传进来。
      */
     anchorTab?: { url: string; title: string } | null;
+    /**
+     * 完整 manifest 对象（宿主侧从扩展目录磁盘读取）。垫片
+     * chrome.runtime.getManifest() 必须返回完整 manifest —— 扩展页面脚本会
+     * 深挖字段（实测 VM popup/index.js 读 manifest.options_ui.page / icons，
+     * 精简版返回值让 bundle 开头即 TypeError，面板白屏）。
+     */
+    manifestJson?: Record<string, any>;
 }
 
 /** 宿主能力提供者（extensionHost 实现），避免模块循环依赖 */
@@ -118,6 +125,117 @@ export function initCsRuntime(host: ICsRuntimeHost): void {
 export async function evalInSwByElectronId(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
     if (!manager) return { err: "cs-runtime manager 未初始化" };
     return await manager.evalInSwAny(electronId, expr);
+}
+
+/** popup 打开前置：伪装 content 桥身份直发一条 SetPopup 命令，填 VM 的
+ *  cache['SetPopup'+tabId]。VM popup 的脚本列表来自 initPopup 的
+ *  cache.pop('SetPopup'+tabId)，而 content 侧只在 isPopupShown=true 时才发
+ *  SetPopup（真 Chrome 由 webRequest onBeforeRequest → prefetchSetPopup →
+ *  PopupShown 触发）—— Electron 垫片无 webRequest 事件 → 缓存恒空；且
+ *  BGDATA.popup 恒为 truthy 数组使 InitPopup 兜底永不走 → popup 列表永远空。
+ *  宿主在 popup 页发起 get-data.js 请求前补发，对齐真 Chrome 的 prefetch 时序。
+ *
+ *  消息/发送者形状对齐 VM handleCommandMessage({cmd,data,url,top}, src)：
+ *  - msg.url → src.url（getScriptsByURL 按 src.url 匹配脚本）
+ *  - msg.top=1 → src.top（kTop，主框架；跳过 handleCommandMessage 的 src.tab=false 分支）
+ *  - src.tab={id:1,url}（SetPopup 取 tabId 建缓存键 SetPopup1，与垫片 tabs.query 固定 id 对齐）
+ *  - src.frameId=0（augmentSetPopup 以 src[kFrameId] 为缓存子键，popup 读 [0]） */
+/** 返回首发（feed tab + GetMoreIds + SetPopup 填缓存）完成的 promise：
+ *  调用方（openExtensionPopup）必须等它落地再开面板 —— 冷 SW 上 SW 唤醒+VM
+ *  init 可达数秒，popup 页 get-data.js 的 BGDATA fetch 会抢先，__syLastFedTab
+ *  和 SetPopup 缓存都没就位 → "cannot run" + 空列表（首启实测复现）。
+ *  后续补打（ERR_ABORTED 重载覆盖）不包含在内，仍 fire-and-forget。 */
+export function precacheSetPopupForPopup(electronId: string, pageUrl: string): Promise<void> {
+    try {
+        if (!manager || !electronId || !pageUrl || !/^https?:/i.test(pageUrl)) return Promise.resolve();
+        const fire = async (first: boolean): Promise<string> => {
+            try {
+                // 三步链（对齐真 Chrome 冷启动时序：prefetchSetPopup → 页面 SetPopup）：
+                // 1) 喂 __syLastFedTab —— SW 闲置被 Chromium 回收后内存态全丢，冷 SW 里
+                //    initPopup 的 getActiveTab 拿空 url → getFailureReason 判 noninjectable
+                //    → 面板 "cannot run userscripts"（用户实测间歇复发的根因：热 SW 全绿、
+                //    冷 SW 必挂）。precache 是面板打开前宿主最后一次触碰 SW 的点，在此恢复。
+                // 2) GetMoreIds —— 真列表数据 = 页面桥的 bridge.ids（页面 SetPopup payload），
+                //    冷 SW 时页面侧已同步的 ids 同样丢失；GetMoreIds 按 url 现算。
+                //    own 命令要求 sender.url 以扩展根开头（background/index.js:44-46），
+                //    故此调用以 popup 页身份发包；SetPopup 再切回页面身份（augmentSetPopup
+                //    按 src.url 匹配脚本）。
+                // 3) SetPopup —— 用真实 ids 填 VM 的 SetPopup1 缓存（popup 页 BGDATA 读）。
+                const extUrl = "chrome-extension://" + electronId + "/popup/index.html";
+                const pageSender = JSON.stringify({ id: electronId, url: pageUrl, tab: { id: 1, url: pageUrl }, frameId: 0 });
+                const expr = `(async () => {
+                    const fns = self.__syOnMessageHandlers || [];
+                    if (!fns.length) return "nohandlers";
+                    // VM 打包 SW handler 的回包协议（diaglog 实锤）：同步返回恒为 true
+                    // （Chrome onMessage 异步回包语义），真实结果经第 3 参 sendResponse
+                    // 以 [result, error] 对送达，且在内部 promise settle 后才回调 ——
+                    // await fn(...) 只拿到 true，必须捕获回调并轮询等它落地。
+                    let resp = null;
+                    let got = false;
+                    const sr = function (v) { got = true; resp = v; };
+                    const call = async (fn, msg, sender) => {
+                        resp = null; got = false;
+                        let sync = null;
+                        try { sync = fn(msg, sender, sr); } catch (e) { return [null, e]; }
+                        try { if (sync && typeof sync.then === "function") sync = await sync; } catch (e) { return [null, e]; }
+                        for (let i = 0; i < 150 && !got; i++) await new Promise(r => setTimeout(r, 20));
+                        if (got) return resp;
+                        return [sync !== true ? sync : null, null];
+                    };
+                    self.__syLastFedTab = ${JSON.stringify({ id: 1, active: true, windowId: 1, url: pageUrl, title: "" })};
+                    let ids = null;
+                    for (const fn of fns) {
+                        try {
+                            const [val] = await call(fn, { cmd: "GetMoreIds", data: { url: ${JSON.stringify(pageUrl)}, top: 1, ids: {} }, url: ${JSON.stringify(extUrl)}, top: 1 }, ${pageSender});
+                            if (val && typeof val === "object" && Object.keys(val).length) { ids = val; break; }
+                        } catch (e) {}
+                    }
+                    const msg = { cmd: "SetPopup", data: { ids: ids || {}, injectInto: "auto", menus: {} }, url: ${JSON.stringify(pageUrl)}, top: 1 };
+                    let err = "";
+                    for (const fn of fns) {
+                        try {
+                            const [, cbErr] = await call(fn, msg, ${pageSender});
+                            if (cbErr) err = String((cbErr && cbErr.message) || cbErr);
+                        } catch (e) { err = String((e && e.message) || e); }
+                    }
+                    return err ? "err:" + err : "ok ids=" + (ids ? Object.keys(ids).length : 0);
+                })()`;
+                const r = await evalInSwByElectronId(electronId, expr);
+                const res = r.err ? "err:" + r.err : String(r.value ?? "");
+                if (first || res && !/^ok ids=/.test(res)) {
+                    console.log("[browser-plugin] precache SetPopup:", res, "url:", String(pageUrl).slice(0, 80));
+                }
+                return res;
+            } catch (e: any) {
+                if (first) console.warn("[browser-plugin] precache SetPopup err:", String(e?.message || e));
+                return "err:" + String(e?.message || e);
+            }
+        };
+        // 首发重试循环：冷 SW 上 VM init 未完成时 handlers 还没注册（首发拿
+        // "nohandlers" 立即返回）→ 调用方放行面板 → popup 页 BGDATA fetch 抢跑
+        // → "cannot run" + 空列表（完整重启首点实测竞态）。必须重试到数据真正
+        // 就位（"ok ids="）再 resolve，面板打开时序以本 promise 为准。
+        const firstP = (async () => {
+            const deadline = Date.now() + 10_000;
+            let first = true;
+            let res = "";
+            while (Date.now() < deadline) {
+                res = await fire(first);
+                first = false;
+                if (/^ok ids=/.test(res)) break;
+                await new Promise((r) => setTimeout(r, 600));
+            }
+            return res;
+        })();
+        // 数据就位后的补打：popup webview ERR_ABORTED 重载后 get-data.js 会重新
+        // fetch（cache.pop 又空了），补打保证任一次文档加载都拿得到缓存
+        void firstP.then(() => {
+            let n = 0;
+            const t = setInterval(() => { void fire(false); if (++n >= 5) clearInterval(t); }, 600);
+        });
+        return firstP.then(() => {});
+    } catch {}
+    return Promise.resolve();
 }
 
 export function ensureCsRuntime(webview: IWebviewTag): void {
@@ -280,7 +398,11 @@ class CsRuntimeManager {
         try {
             const exts = this.host.listNativeExts().filter((e) => e.popupPath);
             for (const ext of exts) {
-                s.feedTabEventToSw(ext, { url: pageUrl, title: "" }).catch(() => {});
+                // tab 形状必须齐（id/active/windowId）：垫片 tabs.query 对
+                // {active:true, currentWindow:true} 的查询按 p.active 过滤
+                // __syLastFedTab（5-pre 补全），缺 active 的 tab 会被丢弃 →
+                // 首启时 getActiveTab 仍空 → "cannot run"
+                s.feedTabEventToSw(ext, { id: 1, url: pageUrl, title: "", active: true, windowId: 1 }).catch(() => {});
             }
         } catch {}
     }
@@ -915,7 +1037,7 @@ class CsPageSession {
             // 文件返回。base64 传输保证二进制（WASM/图片）不损坏，Response 从
             // 字节构造后 text()/json()/arrayBuffer() 全兼容。
             const url = String((args && args.url) || "");
-            const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)(\/[^?#]*)?$/i);
+            const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)(\/[^?#\s]*)?(\?[^#\s]*)?$/i);
             if (!m) return { err: "extfetch: bad url" };
             const eid = m[1];
             const rel = decodeURIComponent((m[2] || "/").slice(1));
@@ -2142,6 +2264,8 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         // 弹窗锚定页（overlay 真实源架构）：tabs.query 的"当前页签"优先取它，
         // 见 ICsExtInfo.anchorTab 注释
         anchorTab: ext.anchorTab || null,
+        // 完整 manifest（getManifest 垫片返回值；扩展页面脚本深挖字段必需）
+        manifest: ext.manifestJson || null,
     });
     const messagesJson = JSON.stringify(messages || {});
     return `
@@ -2352,7 +2476,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         //（错误走 reject），恒为 undefined —— 显式预置，避免扩展代码访问时
         // 掉进通用桩代理（[sy-ext-shim] chrome.runtime.lastError 未实现 warn）
         lastError: undefined,
-        getManifest: function () { return { manifest_version: 3, name: EXT.name, version: EXT.version }; },
+        getManifest: function () { return EXT.manifest || { manifest_version: 3, name: EXT.name, version: EXT.version }; },
         getURL: function (p) { return "chrome-extension://" + EXT.id + "/" + String(p || "").replace(/^\\//, ""); },
         onMessage: (function () {
             var fns = [];

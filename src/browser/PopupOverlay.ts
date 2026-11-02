@@ -31,8 +31,18 @@ export interface PopupOpenOptions {
     onError: (msg: string) => void;
 }
 
-const POPUP_W = 360;
+// 320 = VM popup 的自然宽度（style.css body{width:320px}，真 Chrome 弹窗同宽）。
+// 面板 360 时 guest 里 @media(min-width:360px) 因滚动条占位不命中，body 仍 320
+// → 右侧 40px 空白（用户实测"右侧多余 padding"）。初值 320（VM 自然宽度）；
+// 打开后按 guest 内容实测宽度自适应（320-480 夹紧）——共享 overlay 的其他
+// 扩展面板（如思源剪藏，自然宽度 >320）不再被压窄（用户实测"面板没显示全"）。
+let popupW = 320;
 const POPUP_H = 520;
+/** 扩展面板 DevTools 调试开关（设置项 popupDevtools）：关 = 隐藏 DT 按钮、F12 转发不响应 */
+let popupDevtoolsEnabled = false;
+export function setPopupDevtoolsEnabled(v: boolean): void {
+    popupDevtoolsEnabled = v;
+}
 
 export class ExtensionPopupOverlay {
     private tabRoot: HTMLElement;
@@ -67,7 +77,7 @@ export class ExtensionPopupOverlay {
         if (this.host) return;
         const host = document.createElement("div");
         host.className = "sy-ext-popup-overlay";
-        host.style.cssText = `position:fixed;z-index:2147483000;width:${POPUP_W}px;height:${POPUP_H}px;display:none;`
+        host.style.cssText = `position:fixed;z-index:2147483000;width:${popupW}px;height:${POPUP_H}px;display:none;`
             + `background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,.28);`;
         // 调试按钮：点击打开 overlay webview 的 DevTools（定位扩展 React 不挂载等问题）
         const dbgBtn = document.createElement("button");
@@ -104,6 +114,7 @@ export class ExtensionPopupOverlay {
         // guest → 宿主通道：F12 开 DevTools；localStorage 垫片快照回灌持久化
         vw.addEventListener("ipc-message", (e: any) => {
             if (e.channel === "sy-open-devtools") {
+                if (!popupDevtoolsEnabled) return;
                 this.openGuestDevTools();
             } else if (e.channel === "sy-ext-ls-write") {
                 try {
@@ -220,6 +231,22 @@ export class ExtensionPopupOverlay {
         try { this.vw.useragent = ua; } catch {}
     }
 
+    /** 按当前 popupW 设置 host 宽度并重算定位（open 与自适应调宽共用） */
+    private applySize(): void {
+        if (!this.host) return;
+        this.host.style.width = popupW + "px";
+        const a = this.activeOpts?.anchorRect;
+        if (a) {
+            const left = Math.max(8, Math.min(a.right - popupW, (window.innerWidth || 800) - popupW - 8));
+            const top = Math.max(8, Math.min(a.bottom + 6, (window.innerHeight || 600) - POPUP_H - 8));
+            this.host.style.left = left + "px";
+            this.host.style.top = top + "px";
+        }
+        // DT 调试按钮随设置显隐（设置切换后下次打开/自适应时刷新）
+        const b = this.host.querySelector("button");
+        if (b) (b as HTMLElement).style.display = popupDevtoolsEnabled ? "" : "none";
+    }
+
     /** 打开（已开同一扩展 = no-op；已开其他扩展 = 切换文档） */
     open(opts: PopupOpenOptions): void {
         this.userAgent = opts.userAgent;
@@ -230,11 +257,7 @@ export class ExtensionPopupOverlay {
         this.activeOpts = opts;
         this.openExtId = opts.extId;
         // 定位：右缘对齐图标右缘，顶缘在图标下方；越界收回窗口内
-        const a = opts.anchorRect;
-        const left = Math.max(8, Math.min(a.right - POPUP_W, (window.innerWidth || 800) - POPUP_W - 8));
-        const top = Math.max(8, Math.min(a.bottom + 6, (window.innerHeight || 600) - POPUP_H - 8));
-        this.host!.style.left = left + "px";
-        this.host!.style.top = top + "px";
+        this.applySize();
         this.host!.style.display = "";
         if (this.userAgent) this.applyUserAgent(this.userAgent);
         if (sameDoc) return; // 同一扩展已显示（注入完成过）——保持现状
@@ -260,11 +283,15 @@ export class ExtensionPopupOverlay {
             //   src 赋值 —— 轮询重试直到 getURL 到位；8 次后放弃并归位 about:blank
             //   触发 dom-ready 走重建兜底。
             try { this.vw!.src = extUrl; } catch {}
+            let loadTicks = 0;
             const navTick = () => {
                 const vw = this.vw;
                 if (!vw || this.openExtId !== opts.extId || !this.openRequested) return;
                 let cur = ""; try { cur = vw.getURL?.() || ""; } catch {}
                 if (cur === extUrl) return; // 到位，等 dom-ready 注入
+                // 加载进行中 → 只等待，不重设 src（重设会 abort 在途加载 →
+                // ERR_ABORTED → 永远到不了位的活锁；实测 800ms 轮询连打 3 次 abort）
+                try { if (vw.isLoading?.()) { loadTicks++; if (loadTicks < 25) this.navTimer = setTimeout(navTick, 800); return; } } catch {}
                 this.navRetries++;
                 if (this.navRetries > 8) {
                     try { const lp = vw.loadURL?.("about:blank"); if (lp && typeof lp.catch === "function") lp.catch(() => {}); } catch {}
@@ -294,6 +321,15 @@ export class ExtensionPopupOverlay {
         this.openRequested = false;
         try {
             const pagePath = String(opts.popupPath).replace(/^\.\//, "");
+            // 完整 manifest（垫片 getManifest 返回值）：扩展页面脚本深挖字段
+            // （实测 VM popup/index.js 读 manifest.options_ui.page / icons），
+            // 精简版返回值让 bundle 开头即 TypeError → 面板白屏
+            let manifestJson: Record<string, any> | undefined;
+            try {
+                const nm = (window as any).require("fs") as typeof import("fs");
+                const np = (window as any).require("path") as typeof import("path");
+                manifestJson = JSON.parse(nm.readFileSync(np.join(opts.extPath, "manifest.json"), "utf8"));
+            } catch {}
             const extInfo: ICsExtInfo = {
                 electronId: opts.electronId,
                 path: opts.extPath,
@@ -308,18 +344,23 @@ export class ExtensionPopupOverlay {
                 // 锚定页 = tabs.query 的"当前页签"（真实源架构下必传，否则
                 // AdGuard 的 tab 上下文塌成扩展页、弹窗端口回包永空）
                 anchorTab: opts.anchorTab || null,
+                manifestJson,
             };
             const out = await injectExtensionPageRuntime({
                 webview: vw,
                 extPath: opts.extPath,
                 electronId: opts.electronId,
                 pagePath,
-                // 原生加载：location/存储/DOM 全是真语义，不重建不伪装不垫片；
-                // about:blank 兜底：重建 DOM + 伪装 location + localStorage 垫片
-                //（不透明源原生被拒 → AdGuard popup React init 崩溃不挂载的根因），
-                // 垫片写入经 ipc 回灌宿主 localStorage 持久化
+                // 原生加载时 location/存储是真语义，不伪装不垫片；但 DOM 重建恒开：
+                // Electron 原生加载扩展页时主世界会先跑一遍页面脚本（实测 SiYuan
+                // Clip：主世界 chrome.storage.sync 可用 → bootstrapPopup 成功渲染
+                // 一套 UI），隔离世界重放第二遍就叠加成双份"发送到思源"。旧的
+                // 重放前清理只洗 #root/#root-portal（VM 挂载点），body 直插挂载的
+                // 扩展（Clip）洗不到。重建 body = 恒从页面初始静态状态重放（原生
+                // <link> CSS 与 origin 级 localStorage 均不受影响）。
+                rebuildDom: true,
+                // about:blank 兜底路径仍需 location 伪装（原生加载时 location 是真语义，无需）
                 spoofLocationUrl: nativeLoad ? undefined : "chrome-extension://" + opts.electronId + "/" + pagePath,
-                rebuildDom: !nativeLoad,
                 lsSeed: nativeLoad ? null : readExtLsSeed(opts.electronId),
                 begin: () => beginPopupWorld(vw, extInfo),
                 evalJs: (src2, relPath) => {
@@ -334,11 +375,46 @@ export class ExtensionPopupOverlay {
             if (!out.ok) {
                 this.onErrorCb(`打开「${opts.name}」面板失败: ${out.error}`);
                 this.close();
+            } else {
+                // popup 页原生扩展 API 补丁（主世界，扩展文档就位后）：
+                // 1) 消费 lastError —— VM 面板经原生 chrome.tabs.sendMessage 通知页签，
+                //    页签接收端在自建世界（原生 content script 已清空）→ 原生恒置
+                //    lastError 无人读 → "Unchecked runtime.lastError: Receiving end
+                //    does not exist" 刷屏（CDP 实测来源 popup/index.html）。包装
+                //    callback 读掉 lastError，仅消告警不改语义（VM 自身已 catch）。
+                //    注：打开瞬间的首帧调用在补丁前，漏 1-2 条属预期。
+                // 2) 隐藏"快速安装"入口（menu-find：GreasyFork/OpenUserJS 按站点找脚本）。
+                try {
+                    await vw.executeJavaScript("(() => { try { if (self.__syPopupHostPatched) return 'done'; self.__syPopupHostPatched = 1; const wrap = (o, k) => { try { const orig = o && o[k]; if (typeof orig !== 'function' || orig.__syPatched) return; const w = function (...a) { for (let i = a.length - 1; i >= 0; i--) { if (typeof a[i] === 'function') { const cb = a[i]; a[i] = function (...ca) { try { void chrome.runtime.lastError; } catch (e) {} try { cb.apply(this, ca); } catch (e2) {} }; break; } } return orig.apply(this, a); }; w.__syPatched = 1; o[k] = w; } catch (e) {} }; if (self.chrome && chrome.tabs) wrap(chrome.tabs, 'sendMessage'); if (self.chrome && chrome.runtime) wrap(chrome.runtime, 'sendMessage'); const st = document.createElement('style'); st.textContent = '.menu-find{display:none !important}'; (document.head || document.documentElement).appendChild(st); return 'ok'; } catch (e) { return 'err:' + e.message; } })()", false);
+                } catch {}
+                // 宽度自适应：按 guest 内容实测宽度调面板（320-480 夹紧）。
+                // 共享 overlay 下不同扩展面板自然宽度不同（VM=320、思源剪藏更宽），
+                // 固定 320 会把宽面板压窄（"面板没显示全"）。延迟一拍等渲染稳定。
+                setTimeout(() => {
+                    void (async () => {
+                        try {
+                            if (!this.vw || !this.isOpenFor(opts.extId)) return;
+                            const m = await this.vw.executeJavaScript("Math.ceil(Math.max(document.body ? document.body.scrollWidth : 0, document.documentElement ? document.documentElement.scrollWidth : 0))", false);
+                            const w = Math.max(320, Math.min(480, Math.ceil(Number(m) || 0)));
+                            if (w && Math.abs(w - popupW) > 2) {
+                                popupW = w;
+                                this.applySize();
+                            }
+                        } catch {}
+                    })();
+                }, 400);
             }
         } catch (e) {
             this.onErrorCb(`打开「${opts.name}」面板失败: ${e instanceof Error ? e.message : e}`);
             this.close();
         }
+    }
+
+    /** 数据迟到补拉：面板已打开但数据未就位（precache 落地晚于 open）时
+     *  重载 popup 文档，让它重新 fetch BGDATA —— 列表无条件最终一致显示 */
+    refreshForData(): void {
+        if (!this.openExtId || !this.vw) return;
+        try { this.vw.reload(); } catch {}
     }
 
     /** 关闭 = 隐藏 + 导航 about:blank（文档与世界销毁，进程温热） */

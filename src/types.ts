@@ -85,6 +85,8 @@ export interface BrowserSettings {
     proxyCustomUrl: string;
     /** 是否启用 webview preload 注入 */
     enablePreload: boolean;
+    /** 扩展面板 DevTools 调试开关（true=面板显示 DT 按钮且 F12 可开 DevTools） */
+    popupDevtools: boolean;
     /** 摘录保存的笔记本 ID */
     excerptNotebook: string;
     /** 摘录保存路径（人类可读路径，默认根 "/"/，支持 {{...}} sprig 模板） */
