@@ -45,6 +45,13 @@ export class WebviewController {
     private lastEdgeInstallTime = 0;
     /** 最近一次已知的主框架 URL（webview 损坏后 getURL() 不可靠，重建时用它恢复） */
     private lastKnownUrl = "";
+    /**
+     * 当前是否停在「加载失败页」（showLoadFailedPage 把 src 换成 data: 错误页）。
+     * 失败页上健康探测的 executeJavaScript 可能超时，但这不是 guest 损坏 ——
+     * rebuild 只会重新加载同一个不可达地址，造成循环洗白 + 抢焦点。
+     * 宿主 startHealthMonitor 据此跳过自动重建；成功导航到非 data: 页时清除。
+     */
+    lastLoadFailure: {url: string; error: string; at: number} | null = null;
     /** 是否有导航正在进行（健康监测在加载期间跳过，避免误判） */
     private loading = false;
     /** 本次 loading 的开始时间（卡死看门狗用：did-stop-loading 丢失时判定卡死） */
@@ -209,6 +216,8 @@ export class WebviewController {
         this.on("did-navigate", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            // 成功导航到真实页面即脱离失败页（错误页自身是 data:，不算）
+            if (url && !url.startsWith("data:")) this.lastLoadFailure = null;
             // 改道落地的 about:blank（含 hash 后缀 —— 伪装 location 的 hash 写穿透
             // 会改真实 URL）：lastKnownUrl 保持目标 URL，地址栏也按目标 URL 语义上报
             //（健康监测 skip 条件与 rebuildWebview 恢复都依赖它）
@@ -231,6 +240,7 @@ export class WebviewController {
         this.on("did-navigate-in-page", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            if (url && !url.startsWith("data:")) this.lastLoadFailure = null;
             if (this.pendingExtPageUrl && /^about:blank/i.test(url)) {
                 this.callbacks.onUrlChange(this.pendingExtPageUrl);
                 return;
@@ -799,5 +809,8 @@ export class WebviewController {
         <p><a href="${url}">${url}</a></p>
         </body></html>`;
         this.webview.src = "data:text/html;charset=utf-8," + encodeURIComponent(html);
+        // 放在设置 src 之后：即便导航事件顺序有变把标记清掉，这里兜底重设。
+        // 失败页的 data: 导航不会清除它（清除条件排除了 data:）。
+        this.lastLoadFailure = {url: url || this.lastKnownUrl || "", error, at: Date.now()};
     }
 }

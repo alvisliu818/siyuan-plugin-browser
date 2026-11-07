@@ -20,6 +20,16 @@ import { evalInExtensionWorld } from "../extensions/sw-bridge";
 import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup, evalInSwByElectronId, precacheSetPopupForPopup } from "../extensions/cs-runtime";
 import type { IExtensionMenuItem } from "./contextMenu";
 
+/** 脚本源安装失败提示去重：布局恢复常一次拉起多个残留 .user.js 页签，
+ *  同一 host 30s 内只弹一次，避免刷屏。 */
+const userJsFailureNoticeAt = new Map<string, number>();
+function notifyUserJsFailure(host: string, text: string): void {
+    const now = Date.now();
+    if (now - (userJsFailureNoticeAt.get(host) || 0) < 30_000) return;
+    userJsFailureNoticeAt.set(host, now);
+    showMessage(text, 5000, "error");
+}
+
 /** 浏览器页签实例依赖 */
 export interface BrowserTabDeps {
     i18n: Record<string, string>;
@@ -86,6 +96,8 @@ export class BrowserTab {
     }
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
     private healthFailCount = 0;
+    /** 自动重建退避：60s 内最多 3 次，兜住任何未知原因的重建循环 */
+    private rebuildTimes: number[] = [];
     /** Electron 默认 UA（懒捕获：构造时 webview 可能尚未 attach） */
     private defaultUserAgent = "";
     /** 当前是否处于商店伪装 UA 态（离开商店时恢复默认） */
@@ -698,6 +710,8 @@ export class BrowserTab {
                     // ② 原生链回落：预取内容喂给垫片 fetch 钩子 → VM 自取秒回 →
                     //    confirm 页 → 按设置自动点「安装」
                     let vmProbeName = "";
+                    /** 宿主预取失败原因（脚本源不可达时用它给准确提示、缩短空等） */
+                    let prefetchFailure = "";
                     try {
                         const code = await this.fetchViaSession(url, 15000);
                         const r = await evalInSwByElectronId(vm.electronId,
@@ -707,18 +721,28 @@ export class BrowserTab {
                         vmProbeName = mn ? mn[1].trim() : decodeURIComponent((url.split("?")[0].split("/").pop() || "")).replace(/\.user\.js$/i, "") || "userscript";
                         console.info("[browser-plugin] .user.js 预取已喂给 VM SW");
                     } catch (e0) {
-                        console.warn("[browser-plugin] .user.js 宿主预取失败，回落 VM 自取:", String(e0?.message || e0).slice(0, 80));
+                        prefetchFailure = String(e0?.message || e0);
+                        console.warn("[browser-plugin] .user.js 宿主预取失败，回落 VM 自取:", prefetchFailure.slice(0, 80));
                     }
                     await evalInSwByElectronId(vm.electronId, `try { self.__syEmitDownload && self.__syEmitDownload(${JSON.stringify(url)}); } catch (e) {}`).catch(() => null);
                     this.pendingUserJs = { url, askOpened: false };
                     try { await this.dispatchWrCollect(url, "main_frame", { url, resourceType: "mainFrame", type: "mainFrame" }); } catch {}
-                    for (const delay of [1500, 3000, 5000, 7000]) {
+                    // 脚本源已经拿不到时，VM 自取同样拿不到，没必要再空等 16.5s
+                    for (const delay of (prefetchFailure ? [800, 1500] : [1500, 3000, 5000, 7000])) {
                         await new Promise((r) => setTimeout(r, delay));
                         await this.drainWrOutbox();
                         if (this.pendingUserJs && this.pendingUserJs.askOpened) { console.info("[browser-plugin] .user.js VM confirm 已打开"); break; }
                     }
                     if (this.pendingUserJs && this.pendingUserJs.url === url && !this.pendingUserJs.askOpened) {
-                        showMessage("Violentmonkey 安装页未打开（脚本源不可达或网络代理未开）", 5000, "error");
+                        let host = url.slice(0, 60);
+                        try { host = new URL(url).host; } catch { /* 非标准 URL 用截断原文 */ }
+                        // 旧提示把「本地服务没起」和「代理没开」混为一谈（实测
+                        // 7897 代理在监听时也会弹）。这里按预取结果给准确原因。
+                        const reason = prefetchFailure
+                            ? `脚本源 ${host} 不可达（${prefetchFailure.slice(0, 60)}）`
+                            : "Violentmonkey 安装确认页未打开";
+                        notifyUserJsFailure(host,
+                            `${reason}：请先启动本地脚本服务；若该地址需走代理，再检查代理设置`);
                     } else if (this.pendingUserJs && this.pendingUserJs.askOpened) {
                         // confirm 页已在本 webview 打开 → 按设置自动确认
                         void this.autoConfirmVmInstall(vmProbeName);
@@ -1488,6 +1512,15 @@ export class BrowserTab {
                 if (/^chrome-extension:\/\//i.test(curUrl) || this.controller.pendingExtPageUrl) return;
                 const healthy = await this.controller.isHealthy();
                 if (!healthy.ok && !this.disposed && !this.rebuilding) {
+                    // 停在「加载失败页」(目标地址不可达，例如本地 .user.js 脚本源
+                    // 服务没启动)：webview 没坏，rebuild 只会重新加载同一个不可达
+                    // 地址，形成 失败→探测超时→重建→再失败 的循环，还会把活动页签
+                    // 抢走。静默跳过，等用户导航/刷新成功（did-navigate 清标记）
+                    // 后自动恢复健康监测。
+                    if (this.controller.lastLoadFailure) {
+                        this.healthFailCount = 0;
+                        return;
+                    }
                     // 连续两次失败才判定损坏，避免偶发超时误判；失败原因入日志
                     // （detached/error=真搬移，timeout=忙线程误判）——启动期集体
                     // 重建的定性证据（实测 6 页签同秒 broken，需区分根因）。
@@ -1511,6 +1544,15 @@ export class BrowserTab {
      */
     private async rebuildWebview(): Promise<void> {
         if (this.disposed || this.rebuilding) return;
+        // 退避：60s 内超过 3 次自动重建直接跳过。加载失败页已在健康监测里
+        // 单独拦掉，这里兜住其余未知循环（真损坏仍可手动刷新/重开页签恢复）。
+        const now = Date.now();
+        this.rebuildTimes = this.rebuildTimes.filter(t => now - t < 60_000);
+        if (this.rebuildTimes.length >= 3) {
+            console.warn("[browser-plugin] rebuild backoff: 3 rebuilds in 60s, skipped");
+            return;
+        }
+        this.rebuildTimes.push(now);
         this.rebuilding = true;
         try {
             const savedUrl = this.controller.getCurrentUrl();
