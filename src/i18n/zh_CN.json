@@ -149,5 +149,7 @@
   "adBlockRules": "自定义广告规则",
   "adBlockRulesDesc": "广告过滤为元素隐藏（注入 CSS），不做网络拦截；内置规则覆盖常见广告网络与 tgb.cn 等站点。修改后刷新页签生效。规则语法与 Adblock 一致：##选择器 全站生效；域名##选择器 仅该站点（含子域名）生效；域名#@#选择器 为例外。可直接粘贴 EasyList China 等公开列表的元素隐藏（##）规则。",
   "excerptNotebookInvalid": "摘录保存笔记本不存在或已关闭，请到插件设置中重新选择",
-  "excerptNotebookStale": "已失效，请重新选择"
+  "excerptNotebookStale": "已失效，请重新选择",
+  "vmAutoConfirm": "暴力猴安装自动确认",
+  "vmAutoConfirmDesc": "点击脚本站的「安装」后自动在暴力猴确认页点「安装」，无需再手动确认；关闭后保持暴力猴原生手动确认流程"
 }

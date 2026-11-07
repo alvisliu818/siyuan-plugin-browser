@@ -32,6 +32,7 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     recordHistory: true,
     downloadTarget: "assets",
     userAgent: "",
+    vmAutoConfirm: true,
     proxyMode: "system" as ProxyMode,
     proxyCustomUrl: "",
     enablePreload: true,

@@ -102,6 +102,10 @@ export class SettingsDialog {
                 <input id="sb-record-history" type="checkbox" ${s.recordHistory ? "checked" : ""} />
             </div>
             <div class="b3-form__row">
+                <label title="${this.i18n.vmAutoConfirmDesc}">${this.i18n.vmAutoConfirm}</label>
+                <input id="sb-vm-auto-confirm" type="checkbox" ${s.vmAutoConfirm !== false ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row">
                 <label>${this.i18n.downloadTarget}</label>
                 <select id="sb-download-target">
                     <option value="assets" ${s.downloadTarget === "assets" ? "selected" : ""}>${this.i18n.downloadAssets}</option>
@@ -219,6 +223,7 @@ export class SettingsDialog {
                 customSearchUrl: (root.querySelector("#sb-custom-search") as HTMLInputElement)?.value.trim() || "",
                 historyLimit: parseInt((root.querySelector("#sb-history-limit") as HTMLInputElement).value, 10) || 5000,
                 recordHistory: (root.querySelector("#sb-record-history") as HTMLInputElement).checked,
+                vmAutoConfirm: (root.querySelector("#sb-vm-auto-confirm") as HTMLInputElement)?.checked !== false,
                 downloadTarget: (root.querySelector("#sb-download-target") as HTMLSelectElement).value as DownloadTarget,
                 userAgent: (root.querySelector("#sb-useragent") as HTMLInputElement).value.trim(),
                 proxyMode: ((root.querySelector("#sb-proxy-mode") as HTMLSelectElement)?.value || "system") as ProxyMode,

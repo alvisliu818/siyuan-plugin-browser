@@ -491,7 +491,15 @@ class CsRuntimeManager {
     async evalInSwAny(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
         for (const s of this.sessions.values()) {
             if (!s.alive) continue;
-            const r = await s.evalInSw({ electronId } as ICsExtInfo, expr);
+            // ★ 死 session（webview 重建后旧 CDP flat session 失效）上的 eval
+            //   会**永久挂起**且不返回 SW_FLAT_UNAVAILABLE → 主窗口兜底永远走
+            //   不到，所有依赖 SW eval 的链路整条卡死（实测 .user.js 安装链
+            //   挂在重建后的首次 eval）。每通道 15s 竞速超时 → 视同不可用换
+            //   下一个通道/兜底；SW 存活时正常 eval 远快于该上限，无副作用。
+            const r = await Promise.race([
+                s.evalInSw({ electronId } as ICsExtInfo, expr),
+                new Promise<{ err: string }>((resolve) => setTimeout(() => resolve({ err: SW_FLAT_UNAVAILABLE + " (eval 15s timeout)" }), 15000)),
+            ]);
             if (r.err !== SW_FLAT_UNAVAILABLE || r.value !== undefined) return r;
             // 该会话两条通道都不可用 → 换下一个
         }

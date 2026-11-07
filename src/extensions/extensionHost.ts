@@ -252,6 +252,27 @@ export class ExtensionHost {
             } catch (e) {}
             return msg;
         };
+        // 0b2) fetch 预取钩子（暴力猴安装提速）：宿主在拦截 .user.js 导航后把
+        //     脚本内容写进 __syPrefetched[uri]（分区 session 直取 + 镜像，比 VM
+        //     SW 自身的 fetch 快且稳），这里包一层 fetch —— VM 拉取脚本时命中
+        //     预取即本地 Response 秒回，原生安装链（解析→confirm 页）照常跑，
+        //     只是去掉了最慢的一环。映射为空时透传原生 fetch，其他扩展零影响。
+        if (!self.__syFetchPrefetchWrapped && typeof self.fetch === "function") {
+            self.__syFetchPrefetchWrapped = true;
+            self.__syPrefetched = self.__syPrefetched || {};
+            var syOrigFetch = self.fetch.bind(self);
+            self.fetch = function (input, init) {
+                try {
+                    var u = typeof input === "string" ? input : (input && input.url) || "";
+                    if (u && self.__syPrefetched && self.__syPrefetched[u]) {
+                        var body = self.__syPrefetched[u];
+                        delete self.__syPrefetched[u];
+                        return Promise.resolve(new Response(body, { status: 200, headers: { "Content-Type": "text/javascript; charset=utf-8" } }));
+                    }
+                } catch (e) {}
+                return syOrigFetch(input, init);
+            };
+        }
         // 0c) onInstalled 收集 + 真首次放行：Electron 每次 loadExtension（含本
         //     插件启动时的 removeExtension+loadExtension 保活/重载）都以
         //     reason=install 派发 onInstalled —— 实测 TM 据此每次启动都开

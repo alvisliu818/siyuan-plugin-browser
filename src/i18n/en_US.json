@@ -149,5 +149,7 @@
   "interceptAllLinksDesc": "When on, every http(s) link clicked inside SiYuan notes (body links, database links, Ctrl+click) opens in this browser plugin; domains in the excluded list still open in the system browser.",
   "newTabExt": "New tab extension",
   "newTabExtNone": "(off, open homepage)",
-  "newTabExtDesc": "Set an extension with a \"new tab\" page (e.g. Momentum, Infinity) as the default new-tab page. The extension must be installed and enabled; choose \"(off)\" to fall back to the homepage setting."
+  "newTabExtDesc": "Set an extension with a \"new tab\" page (e.g. Momentum, Infinity) as the default new-tab page. The extension must be installed and enabled; choose \"(off)\" to fall back to the homepage setting.",
+  "vmAutoConfirm": "Violentmonkey Auto-confirm Install",
+  "vmAutoConfirmDesc": "Automatically click Install on the Violentmonkey confirmation page; turn off to keep the native manual confirmation"
 }

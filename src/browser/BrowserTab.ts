@@ -524,6 +524,63 @@ export class BrowserTab {
         } catch {}
     }
 
+    /** 分区 session fetch（代理/cookie 与页面一致），带超时放弃。供 .user.js
+     *  安装链的宿主预取与 TM 直装共用。update 域失败时调用方自行镜像。 */
+    private async fetchViaSession(u: string, ms: number): Promise<string> {
+        // ★ webview tag 的 getWebContents 是 **异步** API——同步调用恒 undefined
+        //   会静默落到 remoteSession 兜底（实测该兜底走系统代理 404 掉
+        //   127.0.0.1 本地源，而 webview 真实 session 直连正常）
+        let ses: any = null;
+        try { const wc = await (this.webview as any)?.getWebContents?.(); ses = wc?.session || null; } catch {}
+        if (!ses) ses = remoteSession(BROWSER_PARTITION);
+        // ★ ses.fetch（Electron net）不接受 AbortSignal——用 Promise.race
+        //   超时放弃慢请求（后台连接自行终止即可）
+        const doReq = async (): Promise<string> => {
+            const r = ses && ses.fetch ? await ses.fetch(u, { credentials: "include" }) : await fetch(u, { credentials: "include" });
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return await r.text();
+        };
+        let timer: any = null;
+        const timeoutP = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("fetch 超时 " + ms + "ms")), ms); });
+        try { return await Promise.race([doReq(), timeoutP]); } finally { clearTimeout(timer); }
+    }
+
+    /** 暴力猴 confirm 页自动确认：轮询所有活跃浏览器页签的 webview，找到
+     *  **本脚本**的 VM confirm 页（tabs.update 出箱会开在新页签；重载会恢复
+     *  旧 confirm 页 —— 页面文本含脚本名才能认准目标，否则会点到旧页的
+     *  reinstall）后等 #confirm 可点（Vue 异步渲染 + 解析期间 disabled）即点。
+     *  设置 vmAutoConfirm=false 时保持原生手动确认。 */
+    private async autoConfirmVmInstall(name: string): Promise<void> {
+        console.info("[browser-plugin] VM autoConfirm 启动:", name, "vmAutoConfirm=", this.settings.vmAutoConfirm);
+        if (this.settings.vmAutoConfirm === false) return;
+        const bp = (window as any).browserPlugin;
+        if (!bp?.getOpenedTab) return;
+        for (let i = 0; i < 16; i++) {
+            await new Promise((r) => setTimeout(r, 700));
+            const tabs = (bp.getOpenedTab()?.["browser-tab"] || []) as any[];
+            for (const t of tabs) {
+                const wv = t?.element ? t.element.querySelector("webview") : null;
+                if (!wv || !String(wv.src || "").includes("confirm/index.html")) continue;
+                try {
+                    const r = await wv.executeJavaScript(`(function () {
+                        var name = ${JSON.stringify(name)};
+                        if (name && document.body && document.body.innerText.indexOf(name) < 0) return "not-mine";
+                        var b = document.getElementById("confirm");
+                        if (!b) return "no-button";
+                        if (b.disabled) return "disabled";
+                        b.click();
+                        return "clicked";
+                    })()`, false);
+                    if (r === "clicked") {
+                        console.info("[browser-plugin] VM confirm 自动点击完成:", name);
+                        showMessage("Violentmonkey 已自动确认安装: " + name, 2500, "info");
+                        return;
+                    }
+                } catch {}
+            }
+        }
+    }
+
     /** .user.js 导航 → 油猴安装：宿主拦下导航（Electron 无阻塞 webRequest，
      *  TM MV3 自己也不再有该能力），下载脚本内容并解析 ==UserScript== 头，
      *  注册进油猴扩展的 userScripts 注册表（垫片持久化，宿主注入器自动在
@@ -544,58 +601,145 @@ export class BrowserTab {
                     showMessage("未找到油猴扩展，无法安装脚本", 4000, "error");
                     return;
                 }
-                // VM 自有安装链（webRequest 观察者 + confirm/index.html#key 页）：
-                // 走到这里 = 9s 窗口内 VM 链条未走出 confirm（其 SW fetch 常慢于窗口）。
-                // 再给一轮合成下载事件 + wr 派发 + 多点排空，confirm 出现即止；
-                // 仍失败才按实际装的管理器提示。
+                // VM 安装（两段式）：
+                //   ① 宿主直装（首选）：分区 session 下载（+greasyfork 镜像）→
+                //      解析 ==UserScript== 头 → 在 VM SW 内**直接调 VM 自己的
+                //      ParseScript 命令**（sender 伪装成 confirm 页——该页到 SW
+                //      的原生消息通道在本环境挂死，ParseScript 永不返回，手动
+                //      确认也是坏的）→ VM 写自己的 scr:/code:/mod: 库，schema 与
+                //      内存一致性全部由 VM 保证 → 存储复核。
+                //   ② 原生链回落（直装失败时）：预取内容喂给垫片 fetch 钩子 →
+                //      VM 自取秒回 → confirm 页 → 按设置自动点「安装」。
                 showMessage("已交给 Violentmonkey 处理安装…", 3000, "info");
-                console.info("[browser-plugin] .user.js 交由 VM 安装链重试:", url.slice(0, 80));
                 void (async () => {
                     try {
-                        await evalInSwByElectronId(vm.electronId, `try { self.__syEmitDownload && self.__syEmitDownload(${JSON.stringify(url)}); } catch (e) {}`).catch(() => null);
-                        this.pendingUserJs = { url, askOpened: false };
-                        try { await this.dispatchWrCollect(url, "main_frame", { url, resourceType: "mainFrame", type: "mainFrame" }); } catch {}
-                        for (const delay of [1500, 3000, 5000, 7000]) {
-                            await new Promise((r) => setTimeout(r, delay));
-                            await this.drainWrOutbox();
-                            if (this.pendingUserJs && this.pendingUserJs.askOpened) { console.info("[browser-plugin] .user.js VM confirm 已打开"); break; }
+                        let code = "";
+                        try {
+                            code = await this.fetchViaSession(url, 15000);
+                            console.info("[browser-plugin] .user.js 宿主下载 fetched:", url.slice(0, 60), "len:", code.length);
+                        } catch (e0) {
+                            // greasyfork 的 update 域直连常见超时：镜像到主站 code 路径
+                            const m = url.match(/^https?:\/\/update\.greasyfork\.org\/scripts\/(\d+)\/([^/?#]+\.user\.js)$/i);
+                            if (!m) throw e0;
+                            code = await this.fetchViaSession("https://greasyfork.org/scripts/" + m[1] + "/code/" + m[2], 15000);
+                            console.info("[browser-plugin] .user.js 镜像 fetched: len:", code.length);
                         }
-                        if (this.pendingUserJs && this.pendingUserJs.url === url && !this.pendingUserJs.askOpened) {
-                            showMessage("Violentmonkey 安装页未打开（脚本源不可达或网络代理未开）", 5000, "error");
+                        if (!/==\s*UserScript\s*==/.test(code)) throw new Error("内容缺少 ==UserScript== 头");
+                        const meta = (k: string): string => {
+                            const mm = code.match(new RegExp("//\\s*@" + k + "\\s+([^\\r\\n]+)", "i"));
+                            return mm ? mm[1].trim() : "";
+                        };
+                        const fname = decodeURIComponent((url.split("?")[0].split("/").pop() || "")).replace(/\.user\.js$/i, "");
+                        const name = meta("name") || fname || "userscript";
+                        console.info("[browser-plugin] .user.js 下载后: 解析完成, name=", name);
+                        // 已安装检测（源码归一比对，防重复副本）
+                        const normSrc = (s: unknown) => String(s || "").replace(/\r\n/g, "\n").trim();
+                        console.info("[browser-plugin] .user.js 已安装检测开始");
+                        try {
+                            const dumpExpr = "chrome.storage.local.get(null).then(v => JSON.stringify(Object.keys(v).filter(k => k.indexOf('code:') === 0).map(k => String(v[k]).slice(0, 4000))))";
+                            const rd = await Promise.race([
+                                evalInSwByElectronId(vm.electronId, dumpExpr).catch(() => null),
+                                new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+                            ]);
+                            console.info("[browser-plugin] .user.js 已安装检测 race settled");
+                            const srcs = rd ? JSON.parse(String(rd.value || "[]")) : [];
+                            if (srcs.some((s: string) => normSrc(s) === normSrc(code))) {
+                                showMessage("该脚本已安装，无需重复安装: " + name, 4000, "info");
+                                return;
+                            }
+                        } catch {}
+                        // ① 直装：SW 内调 VM 的 onMessage 处理器(ParseScript)
+                        const installExpr = `(async () => {
+                            const code = ${JSON.stringify(code)};
+                            const uri = ${JSON.stringify(url)};
+                            const name = ${JSON.stringify(name)};
+                            const fns = self.__syOnMessageHandlers || [];
+                            if (!fns.length) return JSON.stringify({ok: false, err: "no handlers"});
+                            const before = await chrome.storage.local.get(null);
+                            let nBefore = 0;
+                            for (const k in before) if (k.indexOf("scr:") === 0) nBefore++;
+                            const src = { id: chrome.runtime.id, origin: "chrome-extension://" + chrome.runtime.id,
+                                url: "chrome-extension://" + chrome.runtime.id + "/confirm/index.html#host", tlsChannelId: "" };
+                            const msg = { cmd: "ParseScript", data: { code: code, url: uri, from: "", require: [], cache: [], reloadTab: false, bumpDate: true } };
+                            await new Promise((resolve) => {
+                                let done = false;
+                                const fin = () => { if (!done) { done = true; resolve(); } };
+                                setTimeout(fin, 15000);
+                                for (const fn of fns) {
+                                    try {
+                                        const r = fn(msg, src, () => fin());
+                                        if (r && r.then) r.then(() => fin()).catch(() => fin());
+                                    } catch (e) { fin(); }
+                                }
+                            });
+                            const after = await chrome.storage.local.get(null);
+                            let nAfter = 0, found = false;
+                            for (const k in after) {
+                                if (k.indexOf("scr:") === 0) nAfter++;
+                                if (k.indexOf("code:") === 0 && String(after[k]).indexOf(name) >= 0) found = true;
+                            }
+                            return JSON.stringify({ok: found || nAfter > nBefore, nBefore: nBefore, nAfter: nAfter, found: found});
+                        })()`;
+                        console.info("[browser-plugin] .user.js 直装 eval 发起");
+                        const ir = await Promise.race([
+                            evalInSwByElectronId(vm.electronId, installExpr),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error("直装超时")), 25000)),
+                        ]);
+                        const parsed = JSON.parse(String(ir?.value || "{}"));
+                        if (parsed.ok) {
+                            showMessage("已通过 Violentmonkey 安装: " + name, 3500, "info");
+                            console.info("[browser-plugin] .user.js VM 直装完成:", JSON.stringify(parsed));
+                            return;
                         }
-                        if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
-                    } catch {}
+                        throw new Error("直装未复核命中: " + String(ir?.value || "").slice(0, 120));
+                    } catch (eDirect) {
+                        console.warn("[browser-plugin] .user.js VM 直装失败，回落原生链:", String(eDirect?.message || eDirect).slice(0, 100));
+                    }
+                    // ② 原生链回落：预取内容喂给垫片 fetch 钩子 → VM 自取秒回 →
+                    //    confirm 页 → 按设置自动点「安装」
+                    let vmProbeName = "";
+                    try {
+                        const code = await this.fetchViaSession(url, 15000);
+                        const r = await evalInSwByElectronId(vm.electronId,
+                            "self.__syPrefetched = self.__syPrefetched || {}; self.__syPrefetched[" + JSON.stringify(url) + "] = " + JSON.stringify(code) + "; true");
+                        if (r.err) throw new Error(r.err);
+                        const mn = code.match(/\/\/\s*@name\s+([^\r\n]+)/i);
+                        vmProbeName = mn ? mn[1].trim() : decodeURIComponent((url.split("?")[0].split("/").pop() || "")).replace(/\.user\.js$/i, "") || "userscript";
+                        console.info("[browser-plugin] .user.js 预取已喂给 VM SW");
+                    } catch (e0) {
+                        console.warn("[browser-plugin] .user.js 宿主预取失败，回落 VM 自取:", String(e0?.message || e0).slice(0, 80));
+                    }
+                    await evalInSwByElectronId(vm.electronId, `try { self.__syEmitDownload && self.__syEmitDownload(${JSON.stringify(url)}); } catch (e) {}`).catch(() => null);
+                    this.pendingUserJs = { url, askOpened: false };
+                    try { await this.dispatchWrCollect(url, "main_frame", { url, resourceType: "mainFrame", type: "mainFrame" }); } catch {}
+                    for (const delay of [1500, 3000, 5000, 7000]) {
+                        await new Promise((r) => setTimeout(r, delay));
+                        await this.drainWrOutbox();
+                        if (this.pendingUserJs && this.pendingUserJs.askOpened) { console.info("[browser-plugin] .user.js VM confirm 已打开"); break; }
+                    }
+                    if (this.pendingUserJs && this.pendingUserJs.url === url && !this.pendingUserJs.askOpened) {
+                        showMessage("Violentmonkey 安装页未打开（脚本源不可达或网络代理未开）", 5000, "error");
+                    } else if (this.pendingUserJs && this.pendingUserJs.askOpened) {
+                        // confirm 页已在本 webview 打开 → 按设置自动确认
+                        void this.autoConfirmVmInstall(vmProbeName);
+                    }
+                    if (this.pendingUserJs && this.pendingUserJs.url === url) this.pendingUserJs = null;
                 })();
                 return;
             }
             // 下载脚本内容：★ 必须走浏览器分区的 session.fetch（代理/cookie 与
             // 页面一致）——渲染进程默认 fetch 走思源会话，实测 update/greasyfork
             // 全部超时而分区网络正常。update 域失败时镜像到主站 code 路径。
-            const ses = (() => {
-                try { return (this.webview as any)?.getWebContents?.()?.session || null; } catch { return null; }
-            })() || remoteSession(BROWSER_PARTITION);
-            const fetchVia = async (u: string, ms: number): Promise<string> => {
-                // ★ ses.fetch（Electron net）不接受 AbortSignal——用 Promise.race
-                //   超时放弃慢请求（后台连接自行终止即可）
-                const doReq = async (): Promise<string> => {
-                    const r = ses && ses.fetch ? await ses.fetch(u, { credentials: "include" }) : await fetch(u, { credentials: "include" });
-                    if (!r.ok) throw new Error("HTTP " + r.status);
-                    return await r.text();
-                };
-                let timer: any = null;
-                const timeoutP = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error("fetch 超时 " + ms + "ms")), ms); });
-                try { return await Promise.race([doReq(), timeoutP]); } finally { clearTimeout(timer); }
-            };
             let code = "";
             try {
-                code = await fetchVia(url, 15000);
+                code = await this.fetchViaSession(url, 15000);
                 console.info("[browser-plugin] .user.js fetched:", url.slice(0, 60), "len:", code.length);
             } catch (e1) {
                 console.warn("[browser-plugin] .user.js fetch 失败，尝试镜像:", url.slice(0, 60), String(e1?.message || e1).slice(0, 80));
                 // greasyfork 的 update 域直连常见超时：镜像到主站 code 路径
                 const m = url.match(/^https?:\/\/update\.greasyfork\.org\/scripts\/(\d+)\/([^/?#]+\.user\.js)$/i);
                 if (!m) throw e1;
-                code = await fetchVia("https://greasyfork.org/scripts/" + m[1] + "/code/" + m[2], 15000);
+                code = await this.fetchViaSession("https://greasyfork.org/scripts/" + m[1] + "/code/" + m[2], 15000);
                 console.info("[browser-plugin] .user.js 镜像 fetched: len:", code.length);
             }
             const USERSCRIPT_HEAD = new RegExp("==\\s*UserScript\\s*==");

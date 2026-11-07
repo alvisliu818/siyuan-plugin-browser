@@ -66,6 +66,13 @@ export default class BrowserPlugin extends Plugin {
         // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
         (window as any).browserPlugin = this;
 
+        // 诊断口：在指定扩展的 SW 上下文里求值表达式（控制台/探针排障用，
+        // 例：dump 暴力猴存储 chrome.storage.local.get(null)）。仅主窗口可用。
+        (window as any).browserPlugin.diagEvalInSw = async (electronId: string, expr: string) => {
+            const {evalInSwByElectronId} = await import("./extensions/cs-runtime");
+            return evalInSwByElectronId(electronId, expr);
+        };
+
         // 陈旧句柄 rejection 兜底：webview 重建（崩溃恢复/分屏搬移）与扩展 SW
         // 休眠会让缓存的 CDP flat session / remote 句柄短暂失效，相关调用方
         // 均有重试与降级（实测失效后下一轮即自愈，功能不受影响），这些

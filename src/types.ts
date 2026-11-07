@@ -79,6 +79,8 @@ export interface BrowserSettings {
     downloadTarget: DownloadTarget;
     /** User-Agent 覆盖（空表示使用默认） */
     userAgent: string;
+    /** 暴力猴安装确认页自动点击「安装」（默认开；关闭后保持 VM 原生手动确认） */
+    vmAutoConfirm: boolean;
     /** 代理模式（webview 独立 session，需显式 setProxy 才能吃到代理） */
     proxyMode: ProxyMode;
     /** 自定义代理地址（proxyMode === "custom" 时使用），如 http://127.0.0.1:7890、socks5://127.0.0.1:7891 */
