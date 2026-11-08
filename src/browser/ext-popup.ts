@@ -748,11 +748,11 @@ export async function showExtensionPopupInPage(opts: {
             //   逐文件新建会把 webpack 的 chunk/runtime 拆散到多个世界）。
             if (opts.begin) await opts.begin();
             // 每个文件执行前伪造 document.currentScript（webpack/rspack publicPath 检测依赖它）
-            await opts.evalJs!(POPUP_JS_PRELUDE, "__prelude__");
+            await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
             for (let i = 0; i < jsSources.length; i++) {
                 const relLabel = String((scriptItems[i] && (scriptItems[i].kind === "src" ? scriptItems[i].value : "inline#" + i)) || "script" + i);
                 try {
-                    await opts.evalJs!(wrapLocation(jsSources[i], relLabel), relLabel);
+                    await opts.evalJs(wrapLocation(jsSources[i], relLabel), relLabel);
                 } catch (e: any) {
                     const err = "popup 脚本执行失败[" + i + "](" + relLabel + "): " + String(e?.message || e).slice(0, 200);
                     dbg2({ ok: false, error: err });
@@ -762,7 +762,7 @@ export async function showExtensionPopupInPage(opts: {
             // DOMContentLoaded 兜底：重放注入时文档已就绪，DOMContentLoaded 不会再触发，
             // 扩展在它的回调里做的初始化/监听注册会永久错过 —— 每世界补发一次。
             try {
-                await opts.evalJs!(
+                await opts.evalJs(
                     `(function () {
                         if (document.readyState === "loading") return "loading";
                         if (self.__syDomReadyDispatched) return "already";

@@ -12,10 +12,7 @@
     "forceConsistentCasingInFileNames": true,
     "experimentalDecorators": true,
     "jsx": "preserve",
-    "baseUrl": ".",
-    "paths": {
-      "siyuan": ["./src/siyuan-shim"]
-    }
+    "baseUrl": "."
   },
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules"]

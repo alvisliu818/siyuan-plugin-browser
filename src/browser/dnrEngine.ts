@@ -149,7 +149,7 @@ export class DnrBlocker {
                 if (cond.tabIds || cond.requestMethods) { this.skipped++; continue; }
                 let uf = String(cond.urlFilter || "");
                 if (uf === "dummy.rule.adguard.com") { this.skipped++; continue; } // 占位规则
-                const rts: Set<string> | null = Array.isArray(cond.resourceTypes) && cond.resourceTypes.length
+                const rts = Array.isArray(cond.resourceTypes) && cond.resourceTypes.length
                     ? new Set(cond.resourceTypes.map((x: any) => String(x)))
                     : null;
                 const dt = cond.domainType === "firstParty" || cond.domainType === "thirdParty" ? cond.domainType : null;
@@ -194,7 +194,7 @@ export class DnrBlocker {
                         rule.paths = [norm.replace(/\*+$/, "").replace(/\/{2,}/g, "/")];
                     } else {
                         // 路径中段含 *：转约束分组正则池（domain 字面 + 其余走通配转换）
-                        this.addGroupSource(isAllow, this.escapeRe(domain) + this.dnrToRegexSource(pathPart.replace(/^\^/, "")), rts, dt);
+                        this.addGroupSource(isAllow, escapeRe(domain) + this.dnrToRegexSource(pathPart.replace(/^\^/, "")), rts, dt);
                         continue;
                     }
                     entry.rules.push(rule);
@@ -268,8 +268,8 @@ export class DnrBlocker {
             return false;
         }
         const rtDnr = resourceType ? (RT_MAP[resourceType] || resourceType) : null;
-        const rtsOk = (set: Set<string> | null | undefined): boolean => !set || !rtDnr || set.has(rtDnr);
-        const dtOk = (dt: string | null | undefined): boolean => {
+        const rtsOk = (set: Set<string> | null): boolean => !set || !rtDnr || set.has(rtDnr);
+        const dtOk = (dt: string | null): boolean => {
             if (!dt) return true;
             if (!refHost) return false; // 有 firstParty/thirdParty 条件但拿不到 referrer → fail-open
             return dt === "firstParty" ? sameSite(refHost, host) : !sameSite(refHost, host);

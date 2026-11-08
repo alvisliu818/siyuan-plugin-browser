@@ -444,7 +444,7 @@ export class BrowserTab {
             }).catch(() => null));
         }
         if (!tasks.length) return null;
-        const results = await Promise.all(tasks.map((t) => Promise.race([t, new Promise<null>((res) => setTimeout(() => res(null), 6000))])));
+        const results = await Promise.all(tasks.map((t) => Promise.race([t, new Promise((res) => setTimeout(() => res(null), 6000))])));
         for (const r of results) {
             if (!r) continue;
             if (r.cancel || r.redirectUrl) return r;
@@ -655,7 +655,7 @@ export class BrowserTab {
                             const dumpExpr = "chrome.storage.local.get(null).then(v => JSON.stringify(Object.keys(v).filter(k => k.indexOf('code:') === 0).map(k => String(v[k]).slice(0, 4000))))";
                             const rd = await Promise.race([
                                 evalInSwByElectronId(vm.electronId, dumpExpr).catch(() => null),
-                                new Promise<null>((resolve) => setTimeout(() => resolve(null), 5000)),
+                                new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
                             ]);
                             console.info("[browser-plugin] .user.js 已安装检测 race settled");
                             const srcs = rd ? JSON.parse(String(rd.value || "[]")) : [];
@@ -699,7 +699,7 @@ export class BrowserTab {
                         console.info("[browser-plugin] .user.js 直装 eval 发起");
                         const ir = await Promise.race([
                             evalInSwByElectronId(vm.electronId, installExpr),
-                            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("直装超时")), 25000)),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error("直装超时")), 25000)),
                         ]);
                         const parsed = JSON.parse(String(ir?.value || "{}"));
                         if (parsed.ok) {
@@ -708,7 +708,7 @@ export class BrowserTab {
                             return;
                         }
                         throw new Error("直装未复核命中: " + String(ir?.value || "").slice(0, 120));
-                    } catch (eDirect: any) {
+                    } catch (eDirect) {
                         console.warn("[browser-plugin] .user.js VM 直装失败，回落原生链:", String(eDirect?.message || eDirect).slice(0, 100));
                     }
                     // ② 原生链回落：预取内容喂给垫片 fetch 钩子 → VM 自取秒回 →
@@ -724,7 +724,7 @@ export class BrowserTab {
                         const mn = code.match(/\/\/\s*@name\s+([^\r\n]+)/i);
                         vmProbeName = mn ? mn[1].trim() : decodeURIComponent((url.split("?")[0].split("/").pop() || "")).replace(/\.user\.js$/i, "") || "userscript";
                         console.info("[browser-plugin] .user.js 预取已喂给 VM SW");
-                    } catch (e0: any) {
+                    } catch (e0) {
                         prefetchFailure = String(e0?.message || e0);
                         console.warn("[browser-plugin] .user.js 宿主预取失败，回落 VM 自取:", prefetchFailure.slice(0, 80));
                     }
@@ -762,7 +762,7 @@ export class BrowserTab {
             try {
                 code = await this.fetchViaSession(url, 15000);
                 console.info("[browser-plugin] .user.js fetched:", url.slice(0, 60), "len:", code.length);
-            } catch (e1: any) {
+            } catch (e1) {
                 console.warn("[browser-plugin] .user.js fetch 失败，尝试镜像:", url.slice(0, 60), String(e1?.message || e1).slice(0, 80));
                 // greasyfork 的 update 域直连常见超时：镜像到主站 code 路径
                 const m = url.match(/^https?:\/\/update\.greasyfork\.org\/scripts\/(\d+)\/([^/?#]+\.user\.js)$/i);
@@ -817,7 +817,7 @@ export class BrowserTab {
                     "return JSON.stringify(out); })()";
                 const r = await Promise.race([
                     evalInSwByElectronId(tm.electronId, expr),
-                    new Promise<never>((_, rej) => setTimeout(() => rej(new Error("已安装检测超时")), 5000)),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error("已安装检测超时")), 5000)),
                 ]);
                 const entries = JSON.parse(String(r?.value || "[]"));
                 const sameSource = entries.some((x: any) => x.src !== undefined && normSrc(x.src) === normSrc(code));

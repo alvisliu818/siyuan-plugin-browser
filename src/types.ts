@@ -152,10 +152,7 @@ export interface IWebviewTag extends HTMLElement {
     downloadURL(url: string, options?: { filename?: string }): void;
     findInPage(text: string, options?: { forward?: boolean; findNext?: boolean; matchCase?: boolean }): void;
     stopFindInPage(action: "clearSelection" | "keepSelection" | "activateSelection"): void;
-    openDevTools(options?: any): void;
-    isDevToolsOpened(): boolean;
-    closeDevTools(): void;
-    isLoading?(): boolean;
+    openDevTools(): void;
     goBack(): void;
     goForward(): void;
     capturePage(): Promise<{ dataURL: string }>;
