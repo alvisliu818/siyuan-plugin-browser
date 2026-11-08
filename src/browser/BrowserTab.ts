@@ -19,6 +19,7 @@ import { dnrBlocker } from "./dnrEngine";
 import { evalInExtensionWorld } from "../extensions/sw-bridge";
 import { beginPopupWorld, evalPopupJs, evalInExtensionWorldBridge, feedTabEventForPopup, evalInSwByElectronId, precacheSetPopupForPopup } from "../extensions/cs-runtime";
 import type { IExtensionMenuItem } from "./contextMenu";
+import {registerWebRequestHandler, unregisterWebRequestHandlers, type IWebRequestHandler} from "../utils/disposal";
 
 /** 脚本源安装失败提示去重：布局恢复常一次拉起多个残留 .user.js 页签，
  *  同一 host 30s 内只弹一次，避免刷屏。 */
@@ -63,6 +64,9 @@ export class BrowserTab {
     private deps: BrowserTabDeps;
     private settings: BrowserSettings;
     private disposed = false;
+    /** 本页签注册到 Electron session 的 webRequest 回调（关闭页签时只摘自己这几个） */
+    private wrSession: any = null;
+    private wrHandlers: IWebRequestHandler[] = [];
     /** webview 重建中标记（防止重复重建） */
     private rebuilding = false;
     /** 扩展整页垫片注入中（maybeInjectExtensionPage）：重建式注入是受控的重活
@@ -964,7 +968,8 @@ export class BrowserTab {
         // 0. 网络层拦截：①webRequest 阻塞桥（扩展监听器 filter 命中才派发，
         //    TM 的 .user.js 安装由此原生走通）；②.user.js 宿主直装兜底；
         //    ③DNR 规则引擎（AdGuard 官方规则集，惰性加载）。
-        session.webRequest.onBeforeRequest((details: any, cb: (r: any) => void) => {
+        this.wrSession = session;
+        this.wrHandlers.push(registerWebRequestHandler(session, "onBeforeRequest", (details: any, cb: (r: any) => void) => {
             try {
                 const url = details?.url || "";
                 if (/^chrome-extension:/i.test(url) || /^data:/i.test(url)) { cb({}); return; }
@@ -1024,9 +1029,9 @@ export class BrowserTab {
                 }
             } catch {}
             cb({});
-        });
+        }));
         // 1. 响应头：移除站点安全限制（CSP / X-Frame-Options）
-        session.webRequest.onHeadersReceived((details: any, cb: (r: any) => void) => {
+        this.wrHandlers.push(registerWebRequestHandler(session, "onHeadersReceived", (details: any, cb: (r: any) => void) => {
             try {
                 // Electron 的 responseHeaders 是 Record<string, string[]>；
                 // 之前把值再包一层数组 → 嵌套数组（Set-Cookie 等多值头被写坏，
@@ -1046,10 +1051,10 @@ export class BrowserTab {
             } catch {
                 cb({});
             }
-        });
+        }));
         // 2. 请求头：商店域名 UA 伪装 + Referer 注入（绕过 CDN 防盗链）
         //    站点 CDN 检测到空 Referer 会返回 403（X-Error-Info: EmptyReferer）
-        session.webRequest.onBeforeSendHeaders((details: any, cb: (r: any) => void) => {
+        this.wrHandlers.push(registerWebRequestHandler(session, "onBeforeSendHeaders", (details: any, cb: (r: any) => void) => {
             const reqUrl = details.url || "";
             if (!/^https?:\/\//i.test(reqUrl)) {
                 cb({});
@@ -1086,7 +1091,7 @@ export class BrowserTab {
             } catch {
                 cb({});
             }
-        });
+        }));
         console.log("[browser-plugin] webRequest registered (CSP strip + referer inject)");
     }
 
@@ -1768,6 +1773,13 @@ export class BrowserTab {
             (window as any).browserPlugin?.extensionHost?.disposeCsRuntime?.(this.webview);
         } catch {}
         this.controller.dispose();
+        // 只摘本页签注册的 3 个 webRequest 回调，不影响同轮其它页签；
+        // 热重载换届时由 disposeAllGlobal() 兜底清空 session 上全部残留。
+        if (this.wrSession) {
+            unregisterWebRequestHandlers(this.wrSession, this.wrHandlers);
+            this.wrHandlers = [];
+            this.wrSession = null;
+        }
         this.element.remove();
     }
 }

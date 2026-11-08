@@ -3,6 +3,24 @@ const webpack = require("webpack");
 const MiniCssExtractPlugin = require("mini-css-extract-plugin");
 const CopyPlugin = require("copy-webpack-plugin");
 
+/**
+ * 热重载根治（与 siyuan-virtual-tree 同一套思路）：
+ *
+ * 思源用 window.eval 加载插件，热重载会在同一页面重新求值整份 bundle。
+ * 当前产物是单 bundle（esbuild-loader 把 import() 降级成同步 require），
+ * 但一旦将来出现异步分块，webpack 的 jsonp runtime 会对全局 chunk 数组
+ * 反复包 push 拦截，旧 runtime 闭包无法 GC（virtual-tree 实测第 2 次热重载
+ * 即 4.8GB 卡死）。另外本项目真正的泄漏是挂在 window / document /
+ * Electron session 上的资源，故 banner 主要任务是「换届清理」。
+ */
+const CHUNK_LOADING_GLOBAL = "webpackChunksiyuan_plugin_browser";
+const RELOAD_BANNER = `(function(){
+var g=typeof self!=="undefined"?self:globalThis;
+try{if(g.__syBrowserDisposeAllGlobal)g.__syBrowserDisposeAllGlobal();}catch(e){}
+var a=g[${JSON.stringify(CHUNK_LOADING_GLOBAL)}];
+if(Array.isArray(a)){a.length=0;a.push=Array.prototype.push;}
+})();`;
+
 module.exports = (env, argv) => {
     const isProd = argv.mode === "production";
     return {
@@ -15,6 +33,14 @@ module.exports = (env, argv) => {
             libraryTarget: "commonjs2",
             libraryExport: "default",
             clean: false,
+            // 显式固定 jsonp 全局名，与 RELOAD_BANNER 里的 key 同源。
+            chunkLoadingGlobal: CHUNK_LOADING_GLOBAL,
+        },
+        optimization: {
+            // 锁死单 bundle 语义：esbuild-loader 目前把 import() 降级为同步
+            // require，若将来 loader/target 变化产生真正 split point，
+            // jsonp runtime 会立刻回来并带回全局数组累积问题。
+            splitChunks: false,
         },
         resolve: {
             extensions: [".ts", ".js", ".json"],
@@ -68,6 +94,13 @@ module.exports = (env, argv) => {
             ],
         },
         plugins: [
+            // raw + entryOnly：banner 必须是可执行代码（不是注释），且只能出现在
+            // 入口 chunk —— kernel.js 由另一份配置独立编译，不受影响。
+            new webpack.BannerPlugin({
+                banner: RELOAD_BANNER,
+                raw: true,
+                entryOnly: true,
+            }),
             new webpack.DefinePlugin({
                 "process.env.NODE_ENV": JSON.stringify(argv.mode),
             }),

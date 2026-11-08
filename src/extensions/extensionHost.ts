@@ -2258,6 +2258,9 @@ export class ExtensionHost {
         };
         tick();
         this.swKeepAliveTimer = setInterval(tick, 20000);
+        // 热重载换届：这个 20s interval 挂在旧 ExtensionHost 上，
+        // stopSwKeepAlive() 以前全仓没有调用点，每轮 eval 都会多留一个。
+        (window as any).__syBrowserOnDispose?.(() => this.stopSwKeepAlive());
     }
 
     stopSwKeepAlive(): void {

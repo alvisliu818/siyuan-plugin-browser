@@ -27,6 +27,7 @@ import { uid } from "./utils/dom";
 import { buildAdBlockCss } from "./browser/adblock";
 import { applyProxyToSession } from "./browser/proxy";
 import BUILTIN_ADBLOCK_RULES from "./assets/adblock-rules.txt";
+import {disposeAllGlobal, onDispose} from "./utils/disposal";
 import "./index.scss";
 
 /**
@@ -61,6 +62,18 @@ export default class BrowserPlugin extends Plugin {
     private originalShellOpenExternal: ((url: string, opts?: any) => Promise<void>) | null = null;
 
     async onload(): Promise<void> {
+        // 换届自愈（入口 banner 已先跑一次）：摘掉上一轮 bundle 残留在
+        // window / document / Electron session 上的监听器与定时器。
+        disposeAllGlobal();
+        // 万一 onunload 没被思源调用，换届时也要把两个全局 patch 还原，
+        // 否则 window.open / shell.openExternal 会被逐层叠加。
+        onDispose(() => {
+            if (this.originalWindowOpen) {
+                window.open = this.originalWindowOpen;
+                this.originalWindowOpen = null;
+            }
+            try { this.unpatchShellOpenExternal(); } catch {}
+        });
         // 全局引用必须在 onload 最早建立：Dock/页签的 init() 在布局构建期执行，
         // 早于 onLayoutReady；若等到 onLayoutReady 才赋值，Dock init 时拿到 undefined
         // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
@@ -86,7 +99,7 @@ export default class BrowserPlugin extends Plugin {
             "No webContents with given id",
         ];
         let lastStaleWarn = 0;
-        window.addEventListener("unhandledrejection", (ev) => {
+        const onUnhandledRejection = (ev: any) => {
             try {
                 const reason: any = (ev as PromiseRejectionEvent).reason;
                 const msg = String((reason && (reason.message || reason)) || "");
@@ -100,7 +113,9 @@ export default class BrowserPlugin extends Plugin {
                     console.debug("[browser-plugin] 陈旧句柄 rejection 已忽略（重试自愈，30s 限频）:", msg.slice(0, 120));
                 }
             } catch {}
-        });
+        };
+        window.addEventListener("unhandledrejection", onUnhandledRejection);
+        onDispose(() => window.removeEventListener("unhandledrejection", onUnhandledRejection));
 
         // 初始化 stores
         this.bookmarksStore = new BookmarksStore(this);
@@ -255,12 +270,14 @@ export default class BrowserPlugin extends Plugin {
         this.registerDownloadsDock();
 
         // 监听 Dock 打开事件（来自工具栏菜单和快捷键）
-        document.addEventListener("sy-browser-open-dock", (e: Event) => {
+        const onOpenDock = (e: Event) => {
             const detail = (e as CustomEvent).detail;
             if (detail?.type === "bookmarks") this.openDock(DOCK_BOOKMARKS);
             else if (detail?.type === "history") this.openDock(DOCK_HISTORY);
             else if (detail?.type === "downloads") this.openDock(DOCK_DOWNLOADS);
-        });
+        };
+        document.addEventListener("sy-browser-open-dock", onOpenDock);
+        onDispose(() => document.removeEventListener("sy-browser-open-dock", onOpenDock));
 
         // eventBus：在链接右键菜单加入"在浏览器插件中打开"
         this.eventBus.on("open-menu-link", (e: any) => {
@@ -593,6 +610,11 @@ export default class BrowserPlugin extends Plugin {
             document.addEventListener("click", this.globalLinkHandler, true);
             // 中键 auxclick 也拦截（部分浏览器 click 不触发中键）
             document.addEventListener("auxclick", this.globalLinkHandler as any, true);
+            const linkHandler = this.globalLinkHandler;
+            onDispose(() => {
+                document.removeEventListener("click", linkHandler, true);
+                document.removeEventListener("auxclick", linkHandler as any, true);
+            });
             console.log("[browser-plugin] global link interceptor enabled (shell.openExternal + window.open + click)");
         } else if (!enabled && this.globalLinkHandler) {
             // 恢复 window.open
@@ -1225,19 +1247,26 @@ export default class BrowserPlugin extends Plugin {
         // 让其用最终图标构成重算边距（实测 v3.8.7 有效）：500ms 一个 tick 派发，
         // 共 20 次（centerLayout 就绪前派发无效，就绪后分屏头部也可能晚几拍挂载，
         // 故就绪后继续派发兜底；重算是幂等操作，重复派发与非融合顶栏下均无副作用）。
+        const nudgeTimers: number[] = [];
         const nudgeTopBar = (tries = 0) => {
             if (tries >= 20) return;
-            window.setTimeout(() => {
+            nudgeTimers.push(window.setTimeout(() => {
                 if ((window as any).siyuan?.layout?.centerLayout) {
                     window.dispatchEvent(new Event("siyuan-topbar-change"));
                 }
                 nudgeTopBar(tries + 1);
-            }, 500);
+            }, 500));
         };
         nudgeTopBar();
+        onDispose(() => {
+            for (const t of nudgeTimers) window.clearTimeout(t);
+            nudgeTimers.length = 0;
+        });
     }
 
     onunload(): void {
+        // 摘掉本轮登记的全部宿主级资源（入口 banner 会在下一轮再兜一次）
+        disposeAllGlobal();
         // 恢复图标显隐（移除注入样式与 body class）
         document.body.classList.remove(
             "sy-browser-hide-ext-icon",
@@ -1254,6 +1283,8 @@ export default class BrowserPlugin extends Plugin {
         this.unpatchShellOpenExternal();
         if (this.globalLinkHandler) {
             document.removeEventListener("click", this.globalLinkHandler, true);
+            // 之前只删了 click，auxclick 残留会让中键点击继续命中旧插件实例
+            document.removeEventListener("auxclick", this.globalLinkHandler as any, true);
             this.globalLinkHandler = null;
         }
         // 销毁所有页签实例
