@@ -166,7 +166,7 @@ export function nodeWsSession(wsUrl: string, timeoutMs = 10000): Promise<INodeWs
                     if (m.id && pending.has(m.id)) {
                         const fn = pending.get(m.id);
                         pending.delete(m.id);
-                        fn(m);
+                        fn!(m);
                         return;
                     }
                     listeners.forEach((fn) => {

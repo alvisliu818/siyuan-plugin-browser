@@ -359,7 +359,7 @@ export default class BrowserPlugin extends Plugin {
             callback: () => {
                 this.showExtensionTopMenu();
             },
-        });
+        } as any);
     }
 
     private registerBookmarksDock(): void {

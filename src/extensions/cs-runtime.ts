@@ -498,7 +498,7 @@ class CsRuntimeManager {
             //   下一个通道/兜底；SW 存活时正常 eval 远快于该上限，无副作用。
             const r = await Promise.race([
                 s.evalInSw({ electronId } as ICsExtInfo, expr),
-                new Promise<{ err: string }>((resolve) => setTimeout(() => resolve({ err: SW_FLAT_UNAVAILABLE + " (eval 15s timeout)" }), 15000)),
+                new Promise<{ value?: any; err: string }>((resolve) => setTimeout(() => resolve({ err: SW_FLAT_UNAVAILABLE + " (eval 15s timeout)" }), 15000)),
             ]);
             if (r.err !== SW_FLAT_UNAVAILABLE || r.value !== undefined) return r;
             // 该会话两条通道都不可用 → 换下一个
@@ -585,7 +585,7 @@ class CsPageSession {
     private attached = false;
     private ctxToExt = new Map<number, string>();
     /** SW→CS 回程泵（electronId → 轮询状态）：routeSendMessage 派发后限时运行 */
-    private swReplyPumps = new Map<string, { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }>();
+    private swReplyPumps = new Map<string, { deadline: number; busy: boolean; failCount: number; timer: ReturnType<typeof setInterval> }>();
     /** 大消息分块缓冲：id → 分块数组（binding 通道挂大 payload，CS 切块过桥、此处拼装） */
     private bigMsgBuffers = new Map<string, { parts: (string | null)[]; received: number; total: number; ts: number }>();
 
@@ -941,7 +941,7 @@ class CsPageSession {
         } catch {
             return;
         }
-        let electronId = this.ctxToExt.get(ctxId);
+        let electronId: string | null | undefined = this.ctxToExt.get(ctxId);
         if (!electronId) {
             electronId = this.popupCtxs.get(ctxId) || null;
             if (!electronId) {
@@ -1225,7 +1225,7 @@ class CsPageSession {
         this.swReplyPumps.delete(electronId);
     }
 
-    private async pumpSwReplies(electronId: string, entry: { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }): Promise<void> {
+    private async pumpSwReplies(electronId: string, entry: { deadline: number; busy: boolean; failCount: number; timer: ReturnType<typeof setInterval> }): Promise<void> {
         if (Date.now() > entry.deadline || !this.alive || !this.contentWorlds.has(electronId)) {
             this.stopSwReplyPump(electronId, entry);
             return;
@@ -1394,7 +1394,7 @@ class CsPageSession {
             let title = String(data.title || "") || "Untitled";
             title = title.replace(/[\\/]/g, "／") || "Untitled";
             let clipTemplate = clipTemplateCache.get(ext.electronId) || CLIP_DEFAULT_TEMPLATE;
-            this.evalInSw(ext.electronId, `(async () => JSON.stringify(await chrome.storage.local.get(["clipTemplate"])))()`).then((rr) => {
+            this.evalInSw(ext.electronId as any, `(async () => JSON.stringify(await chrome.storage.local.get(["clipTemplate"])))()`).then((rr) => {
                 if (rr && !rr.err) {
                     try {
                         const parsed = JSON.parse(String(rr.value || "{}"));
@@ -1500,7 +1500,7 @@ class CsPageSession {
             }
         } catch (e: any) {
             nativeLog("EXCEPTION after copy: " + String(e?.message || e).slice(0, 150));
-            try { await sendTipText(String(e?.message || e).slice(0, 120)); } catch (e2) { nativeLog("error tip dispatch failed: " + String(e2?.message || e2).slice(0, 100)); }
+            try { await sendTipText(String(e?.message || e).slice(0, 120)); } catch (e2: any) { nativeLog("error tip dispatch failed: " + String(e2?.message || e2).slice(0, 100)); }
         }
     }
 
