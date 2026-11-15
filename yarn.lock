@@ -2884,22 +2884,22 @@ __metadata:
     npm-run-all: "npm:^4.1.5"
     sass: "npm:^1.83.0"
     sass-loader: "npm:^17.0.0"
-    siyuan: "npm:1.2.2"
+    siyuan: "npm:1.2.3"
     typescript: "npm:^5.6.3"
     webpack: "npm:^5.107.2"
     webpack-cli: "npm:^7.0.3"
   languageName: unknown
   linkType: soft
 
-"siyuan@npm:1.2.2":
-  version: 1.2.2
-  resolution: "siyuan@npm:1.2.2"
+"siyuan@npm:1.2.3":
+  version: 1.2.3
+  resolution: "siyuan@npm:1.2.3"
   dependencies:
     "@dop251/types-goja_nodejs-buffer": "npm:latest"
     "@dop251/types-goja_nodejs-global": "npm:latest"
     "@dop251/types-goja_nodejs-url": "npm:latest"
     zod: "npm:latest"
-  checksum: 10c0/75488565f2f9e809fb852df14b2881313a96ae2560a845f41d5a9356e2f93094bad2af2c6786f27b739aee2bdda91b7823b7535fde5affc93777809d3dafc9b3
+  checksum: 10c0/943bb111e1f8c53b1712a5f128aa312d8b994e90be27ca182e2ac33c38ee7df218fd9759caae5b95d5e4245db914f6f8116cb8a5847400da4933d90824d1b46e
   languageName: node
   linkType: hard
 

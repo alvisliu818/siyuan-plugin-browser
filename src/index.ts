@@ -28,6 +28,20 @@ import { uid } from "./utils/dom";
 import { buildAdBlockCss } from "./browser/adblock";
 import { applyProxyToSession } from "./browser/proxy";
 import BUILTIN_ADBLOCK_RULES from "./assets/adblock-rules.txt";
+
+// siyuan npm 包（1.2.2）的 addTopBar 类型漏了 id 选项；运行时支持（带 id 时顶栏
+// 条目 key 为 plugin:<插件>:<id>，排序/显隐记忆更稳定），此处补一个带 id 的重载。
+declare module "siyuan" {
+    interface Plugin {
+        addTopBar(options: {
+            id?: string;
+            icon: string;
+            title: string;
+            callback: (event: MouseEvent) => void;
+            position?: "right" | "left";
+        }): HTMLElement;
+    }
+}
 import {disposeAllGlobal, onDispose} from "./utils/disposal";
 import "./index.scss";
 
@@ -143,7 +157,7 @@ export default class BrowserPlugin extends Plugin {
         this.addTab({
             type: TAB_TYPE,
             init(): void {
-                const data = (this.data || {}) as IBrowserTabData;
+                const data = ((this as any).data || {}) as IBrowserTabData;
                 console.log("[browser-plugin] tab init, data:", JSON.stringify(data), "this.id:", (this as any).id);
                 const plugin = (window as any).browserPlugin as BrowserPlugin;
                 const tab = new BrowserTab(
@@ -241,7 +255,7 @@ export default class BrowserPlugin extends Plugin {
                 // 之前用 (this as any).id（undefined）落到 uid() 随机 key，
                 // 导致 getActiveBrowserTab() 永远查不到实例、"替换当前页"等行为失效。
                 plugin.tabInstances.set((this as any).tab?.id || uid(), tab);
-                this.element.appendChild(tab.element);
+                (this as any).element.appendChild(tab.element);
                 // 移除默认的 iconBrowser SVG（即使 icon 未设置，思源也可能生成占位）
                 try {
                     const graphic = (this as any).tab?.headElement?.querySelector(".item__graphic");

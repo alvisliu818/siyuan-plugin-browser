@@ -3,18 +3,6 @@ import type { BrowserSettings, IWebviewTag } from "../types";
 import { AnnotationStore, type AnnotationPageInfo } from "../storage/annotationStore";
 import annotationScriptSource from "../assets/annotationScript.js";
 
-// siyuan npm 包（1.2.2）的类型声明滞后于运行时：openWindow 自思源 3.1 起已在
-// 插件 API 对象中提供（app/src/plugin/API.ts），此处补声明以便类型安全地调用。
-declare module "siyuan" {
-    export function openWindow(options: {
-        doc?: { id: string };
-        position?: { x: number; y: number };
-        width?: number;
-        height?: number;
-        alwaysOnTop?: boolean;
-    }): void;
-}
-
 /**
  * 网页标注：选中文字 → 悬浮小气泡点「标注」→ 在思源生成/追加标注块。
  *

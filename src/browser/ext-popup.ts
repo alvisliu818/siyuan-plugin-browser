@@ -740,7 +740,7 @@ export async function showExtensionPopupInPage(opts: {
             dbg2({ ok: false, error: "popup 注入失败" });
             return { ok: false, error: "popup 注入失败" };
         }
-        if (useEvalJs) {
+        if (opts.evalJs) {
             // 按(html 顺序)逐文件执行 —— 每文件等价于真实浏览器的独立 script 标签
             // （webpack chunk push → runtime 初始化消化的模式依赖这个语义）。
             // 重声明问题已由「每次打开新建 popup 世界」根治，无需打包。

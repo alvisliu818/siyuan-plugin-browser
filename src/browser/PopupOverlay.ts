@@ -28,7 +28,6 @@ export interface PopupOpenOptions {
     /** 弹窗锚定页（tabs.query 的"当前页签"语义；overlay 真实源架构下必须
      * 显式传入，否则垫片世界把扩展页自己喂给 SW，AdGuard tab 上下文塌掉） */
     anchorTab?: { url: string; title: string };
-    onError: (msg: string) => void;
 }
 
 // 320 = VM popup 的自然宽度（style.css body{width:320px}，真 Chrome 弹窗同宽）。
@@ -219,7 +218,7 @@ export class ExtensionPopupOverlay {
             console.warn("[browser-plugin] DT remote path failed:", e);
         }
         try {
-            if (vw.isDevToolsOpened()) { vw.closeDevTools(); } else { vw.openDevTools({ mode: "detach" } as any); }
+            if (vw.isDevToolsOpened()) { vw.closeDevTools(); } else { vw.openDevTools({ mode: "detach" }); }
         } catch (e) {
             console.warn("[browser-plugin] DT webview path failed:", e);
             this.onErrorCb("打开 DevTools 失败: " + (e instanceof Error ? e.message : e));
