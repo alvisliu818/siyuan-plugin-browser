@@ -151,5 +151,16 @@
   "newTabExtNone": "(off, open homepage)",
   "newTabExtDesc": "Set an extension with a \"new tab\" page (e.g. Momentum, Infinity) as the default new-tab page. The extension must be installed and enabled; choose \"(off)\" to fall back to the homepage setting.",
   "vmAutoConfirm": "Violentmonkey Auto-confirm Install",
-  "vmAutoConfirmDesc": "Automatically click Install on the Violentmonkey confirmation page; turn off to keep the native manual confirmation"
+  "vmAutoConfirmDesc": "Automatically click Install on the Violentmonkey confirmation page; turn off to keep the native manual confirmation",
+  "annotate": "Annotate",
+  "annotateSelection": "Annotate selected text",
+  "annotatePage": "Annotate this page (no selection)",
+  "openAnnotationDoc": "Open annotation document",
+  "annotationCreated": "Annotated",
+  "annotationFailed": "Annotation failed",
+  "annotationNotebook": "Annotation notebook",
+  "annotationNotebookRequired": "Select an annotation notebook in plugin settings first",
+  "annotationParentPath": "Annotation path",
+  "annotationParentPathDesc": "Annotation documents are saved under this path: path → site domain → page annotation document. Select text on a page and click Annotate to write into the document; reopening the page restores highlight positions, and hovering a highlight shows the bound SiYuan block content.",
+  "annotationNoDoc": "No annotation document for this page yet"
 }

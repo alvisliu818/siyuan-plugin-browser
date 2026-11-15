@@ -12,6 +12,7 @@ export type ToolbarAction =
     | "home"
     | "submit"
     | "toggleBookmark"
+    | "annotate"
     | "findInPage"
     | "openExternal";
 
@@ -79,6 +80,7 @@ export class Toolbar {
                 <button class="sy-browser-btn" data-act="reload" title="${this.i18n.reload}">⟳</button>
                 <button class="sy-browser-btn" data-act="home" title="${this.i18n.home}">⌂</button>
                 <input class="sy-browser-urlbar" type="text" placeholder="${this.i18n.addressBar}" spellcheck="false" />
+                <button class="sy-browser-btn" data-act="annotate" title="${this.i18n.annotate || "标注"}">✎</button>
                 <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">☆</button>
                 <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">🔍</button>
                 <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">↗</button>
@@ -117,6 +119,9 @@ export class Toolbar {
                     break;
                 case "bookmark":
                     this.cb.onAction("toggleBookmark");
+                    break;
+                case "annotate":
+                    this.cb.onAction("annotate", { x: btn.getBoundingClientRect().right, y: btn.getBoundingClientRect().bottom });
                     break;
                 case "find":
                     this.toggleFindbar(true);

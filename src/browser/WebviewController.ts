@@ -28,6 +28,10 @@ export class WebviewController {
         onInspect: () => void;
         onFindResult?: (activeMatch: number, matches: number) => void;
         onExcerpt?: (mode: "article" | "part") => void;
+        /** 页内标注创建事件（guest 脚本选区气泡触发，轮询通道） */
+        onAnnCreate?: (payload: { quote?: string; prefix?: string; suffix?: string }) => void;
+        /** 点击高亮 → 宿主打开思源弹框（guest 轮询通道） */
+        onAnnOpen?: (payload: { id?: string; x?: number; y?: number }) => void;
         /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
         /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
@@ -554,14 +558,14 @@ export class WebviewController {
      * 是唯一恢复手段），timeout ≈ 主线程忙导致的探测超时（重建是误伤，
      * 实测启动恢复期 6 页签同秒误重建）。
      */
-    async isHealthy(timeoutMs = 800): Promise<{ ok: boolean; reason: "detached" | "timeout" | "error" | "" }> {
+    async isHealthy(timeoutMs = 800): Promise<{ ok: boolean; reason: "detached" | "timeout" | "error" | ""; w?: number; h?: number }> {
         try {
             if (!this.webview?.isConnected) return { ok: false, reason: "detached" };
-            await Promise.race([
-                this.webview.executeJavaScript("1"),
+            const r = await Promise.race([
+                this.webview.executeJavaScript("({w:window.innerWidth,h:window.innerHeight})"),
                 new Promise((_, reject) => setTimeout(() => reject(new Error("health check timeout")), timeoutMs)),
             ]);
-            return { ok: true, reason: "" };
+            return { ok: true, reason: "", w: r?.w, h: r?.h };
         } catch (e) {
             const msg = String((e as Error)?.message || e || "");
             if (!msg.includes("health check timeout")) return { ok: false, reason: "error" };
@@ -570,11 +574,11 @@ export class WebviewController {
             // 同样超时——多等 2.5s 不影响定性，误伤概率大幅下降。
             try {
                 if (!this.webview?.isConnected) return { ok: false, reason: "detached" };
-                await Promise.race([
-                    this.webview.executeJavaScript("1"),
+                const r2 = await Promise.race([
+                    this.webview.executeJavaScript("({w:window.innerWidth,h:window.innerHeight})"),
                     new Promise((_, reject) => setTimeout(() => reject(new Error("health check timeout")), 2500)),
                 ]);
-                return { ok: true, reason: "" };
+                return { ok: true, reason: "", w: r2?.w, h: r2?.h };
             } catch (e2) {
                 const msg2 = String((e2 as Error)?.message || e2 || "");
                 return { ok: false, reason: msg2.includes("health check timeout") ? "timeout" : "error" };
@@ -783,7 +787,7 @@ export class WebviewController {
             } catch { return; }
             try {
                 this.webview
-                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null})")
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null})")
                     .then((r: any) => {
                         if (r && r.t) {
                             this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
@@ -791,6 +795,12 @@ export class WebviewController {
                         } else if (r && r.e) {
                             this.webview.executeJavaScript("window.__syEdgeInstall = null").catch(() => {});
                             this.triggerEdgeInstall(String(r.e), "inject-poll");
+                        } else if (r && r.a) {
+                            this.webview.executeJavaScript("window.__syAnnCreate = null").catch(() => {});
+                            this.callbacks.onAnnCreate?.(r.a);
+                        } else if (r && r.o) {
+                            this.webview.executeJavaScript("window.__syAnnOpen = null").catch(() => {});
+                            this.callbacks.onAnnOpen?.(r.o);
                         }
                     })
                     .catch(() => {});

@@ -12,6 +12,7 @@ export const STORAGE_KEYS = {
     history: "history.json",
     downloads: "downloads.json",
     settings: "settings.json",
+    annotations: "annotations.json",
 } as const;
 
 /** 内置搜索引擎列表 */
@@ -37,6 +38,8 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     proxyCustomUrl: "",
     enablePreload: true,
     excerptNotebook: "",
+    annotationNotebook: "",
+    annotationParentPath: "/网页标注",
     excerptParentPath: "/",
     excerptTags: "",
     excerptAssets: true,

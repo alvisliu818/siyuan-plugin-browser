@@ -12,6 +12,7 @@ import { BookmarksStore } from "./storage/bookmarksStore";
 import { HistoryStore } from "./storage/historyStore";
 import { DownloadsStore } from "./storage/downloadsStore";
 import { SettingsStore } from "./storage/settingsStore";
+import { AnnotationStore } from "./storage/annotationStore";
 import { BrowserTab } from "./browser/BrowserTab";
 import type { IBrowserTabData, IWebviewTag, BrowserSettings, ProxyMode } from "./types";
 import { BookmarksDock } from "./docks/BookmarksDock";
@@ -45,6 +46,7 @@ export default class BrowserPlugin extends Plugin {
     historyStore!: HistoryStore;
     downloadsStore!: DownloadsStore;
     settingsStore!: SettingsStore;
+    annotationStore!: AnnotationStore;
     /** Chrome 扩展宿主（content script 注入） */
     extensionHost!: ExtensionHost;
     /** 浏览器页签实例表：tabId → BrowserTab */
@@ -60,6 +62,8 @@ export default class BrowserPlugin extends Plugin {
     private originalWindowOpen: typeof window.open | null = null;
     /** 原始 shell.openExternal 引用（patch 思源直调的系统浏览器打开路径，用于恢复） */
     private originalShellOpenExternal: ((url: string, opts?: any) => Promise<void>) | null = null;
+    /** 标注文档链接点击路由（思源文档内点击标注块链接 → 浏览器插件打开并定位标注） */
+    private annLinkHandler: ((e: MouseEvent) => void) | null = null;
 
     async onload(): Promise<void> {
         // 换届自愈（入口 banner 已先跑一次）：摘掉上一轮 bundle 残留在
@@ -122,6 +126,7 @@ export default class BrowserPlugin extends Plugin {
         this.historyStore = new HistoryStore(this);
         this.downloadsStore = new DownloadsStore(this);
         this.settingsStore = new SettingsStore(this);
+        this.annotationStore = new AnnotationStore(this);
         this.extensionHost = new ExtensionHost(this);
 
         // 设置必须在 onload 内完成加载：顶栏图标与 Dock 的注册与否取决于
@@ -147,6 +152,7 @@ export default class BrowserPlugin extends Plugin {
                         settings: plugin.settingsStore,
                         history: plugin.historyStore,
                         bookmarks: plugin.bookmarksStore,
+                        annotations: plugin.annotationStore,
                         openUrlInNewTab: (url) => plugin.openUrl(url),
                         startDownload: (url, name) => plugin.startDownload(url, name),
                         onTabTitleChange: (title) => {
@@ -308,6 +314,32 @@ export default class BrowserPlugin extends Plugin {
 
         // 构建设置页（显示在思源「设置 → 插件」中）
         this.buildSettingPage();
+
+        // 标注文档链接跳转：在思源文档里点击标注块链接（url 带 #syann=<id> 片段）
+        // → 用浏览器插件打开该网页并滚动到对应标注高亮。必须注册在全局链接拦截器
+        // 之前（同为 document 捕获，注册序即执行序），标注链接强制走插件。
+        this.annLinkHandler = (e: MouseEvent) => {
+            if (e.button !== 0 && e.button !== 1) return;
+            const target = e.target as HTMLElement | null;
+            if (!target || typeof target.closest !== "function") return;
+            const el = target.closest('a[href*="#syann="], [data-href*="#syann="]') as HTMLElement | null;
+            if (!el) return;
+            const href = el.getAttribute("data-href") || el.getAttribute("href") || "";
+            if (!href || !/^https?:\/\//i.test(href) || !href.includes("#syann=")) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            const tab = this.getActiveBrowserTab();
+            if (tab) this.openUrlInCurrent(href, { force: true });
+            else this.openUrl(href, { force: true });
+        };
+        document.addEventListener("click", this.annLinkHandler, true);
+        document.addEventListener("auxclick", this.annLinkHandler as any, true);
+        onDispose(() => {
+            if (this.annLinkHandler) {
+                document.removeEventListener("click", this.annLinkHandler, true);
+                document.removeEventListener("auxclick", this.annLinkHandler as any, true);
+            }
+        });
 
         // 根据设置初始化全局链接拦截
         this.updateGlobalLinkInterceptor();
@@ -1078,6 +1110,54 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
+        // 标注保存笔记本
+        setting.addItem({
+            title: this.i18n.annotationNotebook || "标注保存笔记本",
+            direction: "row",
+            description: "网页标注保存到该笔记本，结构为：标注存放路径 → 网站域名 → 网页标注文档。选中网页文字点「标注」即写入对应文档。",
+            createActionElement: () => {
+                const sel = document.createElement("select");
+                sel.className = "b3-select";
+                const emptyOpt = document.createElement("option");
+                emptyOpt.value = "";
+                emptyOpt.textContent = "(" + (this.i18n.annotationNotebook || "标注保存笔记本") + ")";
+                if (!s.annotationNotebook) emptyOpt.selected = true;
+                sel.appendChild(emptyOpt);
+                (async () => {
+                    try {
+                        const { listNotebooks } = await import("./browser/excerpt");
+                        const notebooks = await listNotebooks();
+                        for (const nb of notebooks) {
+                            const opt = document.createElement("option");
+                            opt.value = nb.id;
+                            opt.textContent = nb.name;
+                            if (nb.id === s.annotationNotebook) opt.selected = true;
+                            sel.appendChild(opt);
+                        }
+                        if (s.annotationNotebook && !notebooks.some((nb) => nb.id === s.annotationNotebook)) {
+                            const stale = document.createElement("option");
+                            stale.value = s.annotationNotebook;
+                            stale.textContent = this.i18n.excerptNotebookStale || "(已失效，请重新选择)";
+                            stale.selected = true;
+                            sel.appendChild(stale);
+                        }
+                    } catch (e) {
+                        console.warn("[browser-plugin] load notebooks failed:", e);
+                    }
+                })();
+                refs.annotationNotebook = sel;
+                return sel;
+            },
+        });
+
+        // 标注存放路径
+        setting.addItem({
+            title: this.i18n.annotationParentPath || "标注存放路径",
+            direction: "row",
+            description: "标注文档保存在该路径下，结构为：存放路径 → 网站域名 → 网页标注文档；默认 /网页标注。",
+            createActionElement: () => makeInput("annotationParentPath", s.annotationParentPath || "/网页标注", { placeholder: "/网页标注" }),
+        });
+
         // 新标签页扩展（chrome_url_overrides.newtab 页作为新页签默认页）
         setting.addItem({
             title: this.i18n.newTabExt || "新标签页扩展",
@@ -1204,6 +1284,7 @@ export default class BrowserPlugin extends Plugin {
             this.bookmarksStore.load(),
             this.historyStore.load(),
             this.downloadsStore.load(),
+            this.annotationStore.load(),
             this.extensionHost.load(),
         ]);
 
@@ -1281,6 +1362,12 @@ export default class BrowserPlugin extends Plugin {
             this.originalWindowOpen = null;
         }
         this.unpatchShellOpenExternal();
+        // 摘掉标注文档链接点击路由
+        if (this.annLinkHandler) {
+            document.removeEventListener("click", this.annLinkHandler, true);
+            document.removeEventListener("auxclick", this.annLinkHandler as any, true);
+            this.annLinkHandler = null;
+        }
         if (this.globalLinkHandler) {
             document.removeEventListener("click", this.globalLinkHandler, true);
             // 之前只删了 click，auxclick 残留会让中键点击继续命中旧插件实例

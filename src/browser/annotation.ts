@@ -1,0 +1,438 @@
+import { fetchSyncPost, showMessage, openTab, openWindow } from "siyuan";
+import type { BrowserSettings, IWebviewTag } from "../types";
+import { AnnotationStore, type AnnotationPageInfo } from "../storage/annotationStore";
+import annotationScriptSource from "../assets/annotationScript.js";
+
+// siyuan npm 包（1.2.2）的类型声明滞后于运行时：openWindow 自思源 3.1 起已在
+// 插件 API 对象中提供（app/src/plugin/API.ts），此处补声明以便类型安全地调用。
+declare module "siyuan" {
+    export function openWindow(options: {
+        doc?: { id: string };
+        position?: { x: number; y: number };
+        width?: number;
+        height?: number;
+        alwaysOnTop?: boolean;
+    }): void;
+}
+
+/**
+ * 网页标注：选中文字 → 悬浮小气泡点「标注」→ 在思源生成/追加标注块。
+ *
+ * 文档存储结构：标注存放路径（设置）→ 网站域名 → 完整网页的标注文档。
+ * 每条标注 = 文档末尾追加一个引述块（选中文字）+ 一个空段（批注内容，用户书写）；
+ * 不选中内容直接标注 = 只追加一个带时间戳的段（页面级标注）。
+ * 锚点信息（quote/前后文/URL）写在引述块的 custom-syann 自定义属性里，
+ * 重新打开页面时按 SQL 取回并恢复高亮位置；鼠标悬浮高亮显示绑定的思源块内容。
+ */
+export interface AnnCreatePayload {
+    quote?: string;
+    prefix?: string;
+    suffix?: string;
+}
+
+/** 传给页内脚本的标注项 */
+interface AnnItem {
+    id: string;
+    quote: string;
+    prefix: string;
+    suffix: string;
+    /** 绑定的思源块文本（引述块自身/其后批注段） */
+    note: string;
+    created: number;
+    /** 批注内容块 id（引述块后的空段；用户编辑落点）。旧版标注可能缺失 */
+    noteId?: string;
+    /** 锚点块 id（引述块/段落本身） */
+    anchorBlockId?: string;
+}
+
+function htmlUnescape(s: string): string {
+    return String(s)
+        .replace(/&#123;/g, "{")
+        .replace(/&#125;/g, "}")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, "\"")
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, "&");
+}
+
+function joinPath(...parts: string[]): string {
+    const joined = ("/" + parts.filter(Boolean).join("/")).replace(/\/{2,}/g, "/");
+    return joined.length > 1 ? joined.replace(/\/+$/, "") : "/";
+}
+
+function pad2(n: number): string {
+    return n < 10 ? "0" + n : "" + n;
+}
+
+/**
+ * 标注 UI 样式：必须走 webview.insertCSS（宿主侧注入，不受页面 CSP 约束）。
+ * 部分站点用 meta CSP 禁内联 <style>/style 属性，页内脚本注入的样式会整段
+ * 失效——表现为弹框变成普通 div 追加到页面底部（页面流布局）。
+ */
+const ANN_CSS = `
+.sy-ann-hl{background:rgba(255,213,0,.4)!important;border-radius:2px;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone;}
+.sy-ann-hl:hover{background:rgba(255,170,0,.6)!important;}
+.sy-ann-bubble{position:fixed!important;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;}
+.sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}
+.sy-ann-bubble .sy-ann-create{background:#1a73e8;color:#fff;font-weight:600;}
+.sy-ann-pop{position:fixed!important;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.25);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;}
+.sy-ann-pop-quote{font-size:12px;color:#666;border-left:3px solid #f5c542;padding-left:8px;margin-bottom:6px;white-space:pre-wrap;}
+.sy-ann-pop-note{white-space:pre-wrap;}
+.sy-ann-pop-empty{color:#999;font-style:italic;}
+.sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}
+@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}
+.sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}
+`;
+
+export class AnnotationController {
+    /** 本会话已加载的页面标注缓存（urlKey → 标注列表），供点击弹框快速取用 */
+    private pageCache = new Map<string, AnnItem[]>();
+    private popupUrl: string | null = null;
+
+    constructor(
+        private store: AnnotationStore,
+        private i18n: Record<string, string>,
+        private getSettings: () => BrowserSettings,
+    ) {}
+
+    /** dom-ready 注入页内脚本并恢复本页标注高亮 */
+    async onPageReady(webview: IWebviewTag, url: string, title: string): Promise<void> {
+        try {
+            if (!/^https?:\/\//i.test(url)) return;
+            let items: AnnItem[] = [];
+            const urlKey = AnnotationStore.normalizeKey(url);
+            const page = this.store.find(urlKey);
+            if (page?.docId) {
+                items = await this.fetchAnnotations(page.docId);
+            }
+            this.pageCache.set(urlKey, items);
+            const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + ");";
+            // 样式必须先于脚本经 insertCSS 注入（不受页面 meta CSP 限制）；
+            // 页内 ensureStyle 只作兜底
+            try {
+                await webview.insertCSS(ANN_CSS);
+            } catch (e) {
+                console.warn("[browser-plugin] annotation insertCSS failed:", e);
+            }
+            await webview.executeJavaScript(script);
+            // SPA/懒加载正文晚于 dom-ready 渲染：补画两轮（已包裹的标注不会重复包裹）
+            for (const delay of [2000, 5000]) {
+                setTimeout(() => {
+                    webview.executeJavaScript("window.__syAnnRender && window.__syAnnRender()").catch(() => {});
+                }, delay);
+            }
+            // 从标注文档链接跳转而来（url 带 #syann=<id>）：滚动到对应高亮；
+            // 高亮渲染时点不定（懒加载），按间隔重试，页内脚本成功后自动置闩
+            const focusId = AnnotationController.extractFocusId(url);
+            if (focusId) {
+                for (const delay of [600, 1600, 3200, 6500, 10000]) {
+                    setTimeout(() => {
+                        webview.executeJavaScript("window.__syAnnFocus && window.__syAnnFocus(" + JSON.stringify(focusId) + ");").catch(() => {});
+                    }, delay);
+                }
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] annotation inject failed:", e);
+        }
+    }
+
+    /** 从 URL 提取标注定位片段（#syann=<标注id>） */
+    static extractFocusId(url: string): string {
+        const m = /#syann=([\w-]+)/.exec(url || "");
+        return m ? m[1] : "";
+    }
+
+    /** 创建一条标注（quote 为空 = 页面级标注），落库到思源并回填页内高亮 */
+    async create(webview: IWebviewTag, url: string, title: string, payload: AnnCreatePayload): Promise<void> {
+        const i18n = this.i18n;
+        try {
+            if (!/^https?:\/\//i.test(url)) return;
+            const s = this.getSettings();
+            if (!s.annotationNotebook) {
+                showMessage(i18n.annotationNotebookRequired || "请先在插件设置中选择标注保存笔记本", 4000, "error");
+                return;
+            }
+            const urlKey = AnnotationStore.normalizeKey(url);
+            const quote = String(payload?.quote || "").replace(/\s+/g, " ").trim().slice(0, 2000);
+            let page = this.store.find(urlKey);
+            if (!page) {
+                page = await this.ensurePageDoc(url, urlKey, title, s);
+            }
+            if (!page) return;
+
+            const now = Date.now();
+            const annId = "ann-" + now.toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+            const d = new Date();
+            const stamp = d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+            // 标注块 = 思源里的链接：点击跳回原网页。
+            // - 有选区：引述块，链接带 #syann=<id> 片段，打开网页后自动滚动到标注高亮；
+            // - 无选区：页面级标注，块内容即网页链接，点击打开网页。
+            const annUrl = url + "#syann=" + annId;
+            const escMd = (t: string) => t.replace(/([\[\]])/g, "\\$&");
+            // 大纲式结构，一次插入两级 markdown（避免插入后查询的竞态）：
+            //   - [选中文字](链接)     ← 列表项锚点（custom-syann）
+            //       - （批注）          ← 子列表项（noteId，随后清空占位）
+            const anchorMd = quote
+                ? "- [" + escMd(quote) + "](" + annUrl + ")\n    - （批注）"
+                : "- [" + escMd(this.safeTitle(title || url)) + "](" + url + ") - " + stamp + "\n    - （批注）";
+            const ins: any = await fetchSyncPost("/api/block/insertBlock", {
+                parentID: page.docId,
+                dataType: "markdown",
+                data: anchorMd,
+            });
+            if (ins?.code !== 0) throw new Error(ins?.msg || "insertBlock failed");
+            // 从返回的 DOM（ops[0].data）里按 data-type 解析各层级块 id，确定性取 id
+            const ops = (Array.isArray(ins.data) ? ins.data : [ins.data])[0]?.doOperations || [];
+            const html = String(ops[0]?.data || "");
+            const tagRe = /<div\b([^>]*)>/g;
+            const byType: Record<string, string[]> = {};
+            let mm: RegExpExecArray | null;
+            while ((mm = tagRe.exec(html))) {
+                const nid = /data-node-id="([^"]+)"/.exec(mm[1]);
+                const dt = /data-type="([^"]+)"/.exec(mm[1]);
+                if (nid && dt) {
+                    (byType[dt[1]] = byType[dt[1]] || []).push(nid[1]);
+                }
+            }
+            const listId = (byType["NodeList"] || [])[0] || "";
+            const itemsInList = byType["NodeListItem"] || [];
+            const anchorId = itemsInList[0] || listId;
+            const noteItemBlockId = itemsInList[1] || "";
+            if (!anchorId) throw new Error("未返回标注块 id");
+            // 占位清空（保留空列表项，类似 Logseq 新建 bullet）；
+            // 列表项必须用列表语法更新，data:" " 会被内核忽略
+            if (noteItemBlockId) {
+                fetchSyncPost("/api/block/updateBlock", { id: noteItemBlockId, dataType: "markdown", data: "- " }).catch(() => {});
+            }
+            const anchorJson = JSON.stringify({
+                id: annId,
+                url: urlKey,
+                quote,
+                prefix: String(payload?.prefix || "").slice(0, 60),
+                suffix: String(payload?.suffix || "").slice(0, 60),
+                created: now,
+                noteId: noteItemBlockId,
+            });
+            await fetchSyncPost("/api/attr/setBlockAttrs", { id: anchorId, attrs: { "custom-syann": anchorJson } });
+            await this.store.upsert(urlKey, page);
+            if (quote) {
+                const item: AnnItem = {
+                    id: annId,
+                    quote,
+                    prefix: String(payload?.prefix || "").slice(0, 60),
+                    suffix: String(payload?.suffix || "").slice(0, 60),
+                    note: "",
+                    created: now,
+                    noteId: noteItemBlockId || undefined,
+                    anchorBlockId: anchorId,
+                };
+                webview.executeJavaScript("window.__syAnnApply && window.__syAnnApply(" + JSON.stringify([item]) + ");").catch(() => {});
+            }
+            showMessage(i18n.annotationCreated || "已标注", 2000, "info");
+        } catch (e: any) {
+            console.warn("[browser-plugin] annotation create failed:", e);
+            showMessage((i18n.annotationFailed || "标注失败") + ": " + (e?.message || e), 4000, "error");
+        }
+    }
+
+    /** 打开当前页面的标注文档 */
+    async openDoc(url: string): Promise<void> {
+        const page = this.store.find(AnnotationStore.normalizeKey(url));
+        if (!page?.docId) {
+            showMessage(this.i18n.annotationNoDoc || "当前页面还没有标注文档", 3000, "info");
+            return;
+        }
+        try {
+            const plugin = (window as any).browserPlugin;
+            openTab({ app: plugin?.app, doc: { id: page.docId, action: [] } } as any);
+        } catch (e) {
+            console.warn("[browser-plugin] open annotation doc failed:", e);
+        }
+    }
+
+    /**
+     * 点击页内高亮 → 思源原生独立窗口（openWindow）打开批注块。
+     * 窗内为原生 protyle，直接编辑、自动保存；窗口可拖动、可多开、置顶。
+     */
+    async showDialog(webview: IWebviewTag, url: string, payload: { id?: string; x?: number; y?: number }): Promise<void> {
+        try {
+            const urlKey = AnnotationStore.normalizeKey(url);
+            let items = this.pageCache.get(urlKey);
+            if (!items) {
+                const page = this.store.find(urlKey);
+                if (!page?.docId) return;
+                items = await this.fetchAnnotations(page.docId);
+                this.pageCache.set(urlKey, items);
+            }
+            const ann = items.find((i) => i.id === String(payload?.id || ""));
+            if (!ann) {
+                showMessage(this.i18n.annotationNoDoc || "当前页面还没有标注文档", 3000, "info");
+                return;
+            }
+            const page = this.store.find(urlKey);
+
+            // 旧版标注缺批注块：懒补一个（引述标注取锚点后同级段；页面级新建空段）
+            if (!ann.noteId && page?.docId) {
+                if (ann.quote && ann.anchorBlockId) {
+                    try {
+                        const q: any = await fetchSyncPost("/api/query/sql", {
+                            stmt: "SELECT id FROM blocks WHERE root_id='" + page.docId + "' AND parent_id='" + page.docId
+                                + "' AND type='p' AND sort > (SELECT sort FROM blocks WHERE id='" + ann.anchorBlockId + "') LIMIT 1",
+                        });
+                        ann.noteId = String(q?.data?.[0]?.id || "");
+                    } catch {}
+                    // 旧数据 sort 顺序异常（批注段排在引述块前）时：回退到「顶层无
+                    // 标注属性的空段」
+                    if (!ann.noteId) {
+                        try {
+                            const q2: any = await fetchSyncPost("/api/query/sql", {
+                                stmt: "SELECT id FROM blocks WHERE root_id='" + page.docId + "' AND parent_id='" + page.docId
+                                    + "' AND type='p' AND content='' AND ial NOT LIKE '%custom-syann%' AND id != '"
+                                    + ann.anchorBlockId + "' LIMIT 1",
+                            });
+                            ann.noteId = String(q2?.data?.[0]?.id || "");
+                        } catch {}
+                    }
+                } else {
+                    try {
+                        const ins: any = await fetchSyncPost("/api/block/insertBlock", {
+                            parentID: page.docId, dataType: "markdown", data: " ",
+                        });
+                        const n0 = Array.isArray(ins?.data) ? ins.data[0] : ins?.data;
+                        ann.noteId = typeof n0 === "string" ? n0 : String(n0?.doOperations?.[0]?.id || "");
+                    } catch {}
+                }
+                if (ann.noteId && ann.anchorBlockId) {
+                    fetchSyncPost("/api/attr/setBlockAttrs", {
+                        id: ann.anchorBlockId,
+                        attrs: { "custom-syann": JSON.stringify({
+                            id: ann.id, url: urlKey, quote: ann.quote, prefix: ann.prefix,
+                            suffix: ann.suffix, created: ann.created, noteId: ann.noteId,
+                        }) },
+                    }).catch(() => {});
+                }
+            }
+
+            if (!ann.noteId) {
+                showMessage(this.i18n.annotationNoDoc || "缺少批注块", 3000, "error");
+                return;
+            }
+            // 思源原生独立窗口打开批注块（protyle 直接编辑、自动保存）。
+            // 屏幕坐标 = 宿主窗口屏幕位置 + webview 视口偏移 + 页内点击坐标。
+            const width = 560;
+            const height = 480;
+            const wr = webview.getBoundingClientRect();
+            let x = Math.round(window.screenX + wr.left + (payload?.x || 0) + 14);
+            let y = Math.round(window.screenY + wr.top + (payload?.y || 0) - 24);
+            x = Math.min(Math.max(x, 0), window.screen.availWidth - width);
+            y = Math.min(Math.max(y, 0), window.screen.availHeight - height);
+            openWindow({
+                doc: { id: ann.noteId },
+                width,
+                height,
+                position: { x, y },
+                alwaysOnTop: true,
+            });
+        } catch (e) {
+            console.warn("[browser-plugin] annotation editor window failed:", e);
+        }
+    }
+
+    /** 定位/创建页面标注文档（存放路径 → 域名 → 页面标题） */
+    private async ensurePageDoc(url: string, urlKey: string, title: string, s: BrowserSettings): Promise<AnnotationPageInfo | null> {
+        let domain = "";
+        try { domain = new URL(url).hostname; } catch {}
+        const docTitle = this.safeTitle(title || domain || urlKey);
+        const parentPath = (s.annotationParentPath || "/网页标注").trim() || "/网页标注";
+        const hpath = joinPath(parentPath, domain, docTitle);
+        // 先查同路径文档（createDocWithMd 对已存在路径会报错）
+        let docId = "";
+        try {
+            const q: any = await fetchSyncPost("/api/query/sql", {
+                stmt: "SELECT root_id FROM blocks WHERE box='" + s.annotationNotebook.replace(/'/g, "''")
+                    + "' AND hpath='" + hpath.replace(/'/g, "''") + "' AND type='d' LIMIT 1",
+            });
+            docId = String(q?.data?.[0]?.root_id || "");
+        } catch {}
+        if (!docId) {
+            const d = new Date();
+            const md = "- [来源](" + url + ")\n- 创建于 " + d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+            const r: any = await fetchSyncPost("/api/filetree/createDocWithMd", {
+                notebook: s.annotationNotebook,
+                path: hpath,
+                markdown: md,
+            });
+            if (r?.code !== 0) {
+                showMessage((this.i18n.annotationFailed || "标注失败") + ": " + (r?.msg || "createDoc"), 4000, "error");
+                return null;
+            }
+            docId = String(r.data);
+        }
+        const info: AnnotationPageInfo = { docId, title: docTitle, domain, createdAt: Date.now() };
+        await this.store.upsert(urlKey, info);
+        return info;
+    }
+
+    /** 从标注文档取回全部标注锚点（custom-syann 存在锚点块的自定义属性里） */
+    private async fetchAnnotations(docId: string): Promise<AnnItem[]> {
+        try {
+            // 全量取回文档块（新结构锚点=列表项 i，批注=其子块；旧结构=引述 b/段落 p）
+            const r: any = await fetchSyncPost("/api/query/sql", {
+                stmt: "SELECT id, type, content, ial, parent_id FROM blocks WHERE root_id='" + docId + "' ORDER BY sort",
+            });
+            const rows: any[] = r?.data || [];
+            const items: AnnItem[] = [];
+            for (let i = 0; i < rows.length; i++) {
+                const row = rows[i];
+                const m = /custom-syann="([^"]*)"/.exec(String(row.ial || ""));
+                if (!m) continue;
+                let anchor: any;
+                try { anchor = JSON.parse(htmlUnescape(m[1])); } catch { continue; }
+                if (!anchor || typeof anchor !== "object") continue;
+                let note = "";
+                let noteId = String(anchor.noteId || "");
+                if (row.type === "i") {
+                    // 新结构：批注 = 锚点列表项下嵌套列表的列表项
+                    const nestedL = rows.find((c) => c.parent_id === row.id && c.type === "l");
+                    const noteRow = nestedL ? rows.find((c) => c.parent_id === nestedL.id) : null;
+                    if (noteRow) {
+                        note = String(noteRow.content || "");
+                        if (!noteId) noteId = String(noteRow.id || "");
+                    }
+                } else if (row.type === "b") {
+                    // 旧结构：引述块锚点 → 其后的同级空段是批注内容
+                    const nxt = rows[i + 1];
+                    if (nxt && nxt.parent_id === row.parent_id && nxt.type === "p" && !/custom-syann=/.test(String(nxt.ial || ""))) {
+                        note = String(nxt.content || "");
+                        if (!noteId) noteId = String(nxt.id || "");
+                    }
+                } else if (row.type === "p") {
+                    // 旧结构页面级：锚点段落自身即批注
+                    note = String(row.content || "");
+                }
+                items.push({
+                    id: String(anchor.id || row.id),
+                    quote: String(anchor.quote || ""),
+                    prefix: String(anchor.prefix || ""),
+                    suffix: String(anchor.suffix || ""),
+                    note,
+                    created: Number(anchor.created) || 0,
+                    noteId: noteId || undefined,
+                    anchorBlockId: String(row.id || ""),
+                });
+            }
+            return items;
+        } catch (e) {
+            console.warn("[browser-plugin] fetchAnnotations failed:", e);
+            return [];
+        }
+    }
+
+    /** 文档标题清洗（SiYuan 路径段不允许 / \ 等） */
+    private safeTitle(t: string): string {
+        let s = String(t || "").replace(/[\\/:*?"<>|#]/g, " ").replace(/\s+/g, " ").trim();
+        if (!s) s = "未命名页面";
+        return s.slice(0, 60);
+    }
+}

@@ -7,6 +7,10 @@ declare module "*clipScript.js" {
     const content: string;
     export default content;
 }
+declare module "*annotationScript.js" {
+    const content: string;
+    export default content;
+}
 declare module "*adblock-rules.txt" {
     const content: string;
     export default content;

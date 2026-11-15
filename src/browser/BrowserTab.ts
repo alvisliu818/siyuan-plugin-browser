@@ -7,6 +7,8 @@ import { normalizeUrl } from "../utils/url";
 import type { HistoryStore } from "../storage/historyStore";
 import type { BookmarksStore } from "../storage/bookmarksStore";
 import type { SettingsStore } from "../storage/settingsStore";
+import type { AnnotationStore } from "../storage/annotationStore";
+import { AnnotationController, type AnnCreatePayload } from "./annotation";
 import { SettingsDialog } from "../settings/SettingsDialog";
 import { clipToSiYuan } from "./excerpt";
 import { EDGE_UA } from "../extensions/edgeStore";
@@ -37,6 +39,8 @@ export interface BrowserTabDeps {
     settings: SettingsStore;
     history: HistoryStore;
     bookmarks: BookmarksStore;
+    /** 网页标注索引（url → 标注文档 id） */
+    annotations?: AnnotationStore;
     openUrlInNewTab: (url: string) => void;
     /** 触发下载（由 index.ts 注入，调用内核 RPC） */
     startDownload: (url: string, suggestedName?: string) => Promise<void>;
@@ -61,6 +65,7 @@ export class BrowserTab {
     private toolbar: Toolbar;
     private webview: IWebviewTag;
     private controller: WebviewController;
+    private annotation: AnnotationController | null = null;
     private deps: BrowserTabDeps;
     private settings: BrowserSettings;
     private disposed = false;
@@ -90,6 +95,12 @@ export class BrowserTab {
     private wrBridgeCacheAt = 0;
     /** .user.js 待装导航（TM ask.html 开出即置 askOpened；12s 未开走宿主弹窗） */
     private pendingUserJs: { url: string; askOpened: boolean } | null = null;
+    /** webview guest 视口同步（见 setupViewportSync 注释） */
+    private viewportRO: ResizeObserver | null = null;
+    private zoomMO: MutationObserver | null = null;
+    private onWinResize: (() => void) | null = null;
+    private lastViewport = { w: 0, h: 0, z: 1 };
+    private lastNudgeAt = 0;
 
     /** 扩展安装确认页识别：TM = ask.html?aid；VM(Violentmonkey) = confirm/index.html。
      *  出箱排空时据此置 pendingUserJs.askOpened，9s 回落才不会误触发。 */
@@ -113,6 +124,9 @@ export class BrowserTab {
         this.deps = deps;
         this.settings = deps.settings.get();
         this.element = this.buildDom();
+        if (deps.annotations) {
+            this.annotation = new AnnotationController(deps.annotations, deps.i18n, () => this.settings);
+        }
         this.webview = this.element.querySelector("webview") as unknown as IWebviewTag;
         this.toolbar = new Toolbar(deps.i18n, {
             onAction: (action, payload) => this.onToolbarAction(action, payload),
@@ -186,6 +200,12 @@ export class BrowserTab {
                             svgToImg: !!s.excerptExpSvgToImg,
                         },
                     }, this.deps.i18n);
+                },
+                onAnnCreate: (payload: AnnCreatePayload) => {
+                    this.annotation?.create(this.webview, this.controller.getCurrentUrl(), this.controller.getCurrentTitle(), payload);
+                },
+                onAnnOpen: (payload: { id?: string; x?: number; y?: number }) => {
+                    this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
                 },
                 onEdgeInstall: (id: string, source: string) =>
                     this.deps.installEdgeExtension?.(id, source) ?? Promise.resolve(),
@@ -265,11 +285,17 @@ export class BrowserTab {
         this.controller.onDomReady = (wv, url) => {
             deps.injectExtensions?.(wv, url);
             void this.maybeInjectExtensionPage(url);
+            // 网页标注：注入页内脚本 + 恢复本页标注高亮
+            void this.annotation?.onPageReady(wv, url, this.controller.getCurrentTitle());
         };
 
         // 启动 webview 健康监测：思源分屏/拖动页签会搬移 panelElement，
         // Electron webview 被重新挂载后 guest 即损坏（白屏且无响应），需自动重建
         this.startHealthMonitor();
+
+        // guest 视口同步：Electron webview 在容器缩放/祖先 CSS zoom 变化后视口
+        // 停留在旧尺寸（页面按小视口排版、周围露白），显式钉尺寸 + 校验纠正
+        this.setupViewportSync();
 
         // SW 保活（幂等）：浏览器页签存在期间扩展 SW 常驻，popup/消息零唤醒延迟
         // （对齐 Chrome 的"事件即唤醒"；代价是 SW 进程常驻内存）
@@ -1483,6 +1509,79 @@ export class BrowserTab {
         }
     }
 
+    /**
+     * webview guest 视口同步。
+     * Electron <webview> 在容器缩放（分屏拖动/窗口变化）或祖先 CSS zoom
+     * （思源「界面缩放」写在 documentElement 内联样式上）变化后，guest 页面
+     * 视口会停留在旧尺寸 —— 页面按小视口排版，周围露出大块空白。
+     * 三层兜底：
+     * 1. 显式像素尺寸：容器尺寸变化时把 webview 尺寸钉成容器可视大小；
+     * 2. 缩放补偿：容器 visual/layout 比值 z ≠ 1 时给 webview 反向 zoom(1/z)，
+     *    保证 guest 视口 = 实际可视像素；
+     * 3. 视口校验（健康监测内）：guest innerWidth/innerHeight 与目标偏差 >4px
+     *    时抖动 1px 强制 guest 重排（nudgeViewport）。
+     */
+    private setupViewportSync(): void {
+        try {
+            this.viewportRO = new ResizeObserver(() => this.syncViewport());
+            this.viewportRO.observe(this.element);
+            const container = this.element.querySelector(".sy-browser-content");
+            if (container) this.viewportRO.observe(container);
+        } catch {}
+        this.onWinResize = () => this.syncViewport();
+        window.addEventListener("resize", this.onWinResize);
+        // 思源界面缩放（documentElement style.zoom 内联修改）时重新同步
+        try {
+            this.zoomMO = new MutationObserver(() => this.syncViewport(true));
+            this.zoomMO.observe(document.documentElement, { attributes: true, attributeFilter: ["style", "class"] });
+        } catch {}
+        this.syncViewport(true);
+    }
+
+    private syncViewport(force = false): void {
+        if (this.disposed) return;
+        const container = this.element.querySelector(".sy-browser-content") as HTMLElement | null;
+        const wv = this.webview as unknown as HTMLElement | null;
+        if (!container || !wv) return;
+        const rect = container.getBoundingClientRect();
+        const w = Math.floor(rect.width);
+        const h = Math.floor(rect.height);
+        if (w <= 0 || h <= 0) return;
+        // 祖先 CSS zoom / transform 缩放比值：getBoundingClientRect 含缩放，offsetWidth 不含
+        const layoutW = container.offsetWidth || w;
+        const z = layoutW > 0 ? rect.width / layoutW : 1;
+        if (!force && this.lastViewport.w === w && this.lastViewport.h === h && Math.abs(this.lastViewport.z - z) < 0.01) return;
+        this.lastViewport = { w, h, z };
+        // 摘掉 flex 主轴尺寸控制（flex:1 的 basis 0 会忽略 width），让显式像素尺寸生效，
+        // nudgeViewport 的 ±1px 抖动才能真正改变布局
+        wv.style.flex = "0 0 auto";
+        wv.style.zoom = z === 1 ? "" : String(1 / z);
+        wv.style.width = w + "px";
+        wv.style.height = h + "px";
+    }
+
+    /** guest 视口与目标尺寸不一致时，抖动 1px 强制 guest 重排（10s 节流防循环） */
+    private nudgeViewport(): void {
+        const now = Date.now();
+        if (now - this.lastNudgeAt < 10_000) return;
+        this.lastNudgeAt = now;
+        const t = this.lastViewport;
+        const wv = this.webview as unknown as HTMLElement | null;
+        if (!t.w || !wv) return;
+        console.warn("[browser-plugin] guest viewport desynced, nudging:", JSON.stringify(t));
+        try {
+            wv.style.width = t.w + 1 + "px";
+            wv.style.height = t.h + 1 + "px";
+            void wv.offsetHeight;
+            setTimeout(() => {
+                try {
+                    wv.style.width = t.w + "px";
+                    wv.style.height = t.h + "px";
+                } catch {}
+            }, 80);
+        } catch {}
+    }
+
     private startHealthMonitor(): void {
         if (this.healthTimer) return;
         this.healthTimer = setInterval(async () => {
@@ -1538,6 +1637,17 @@ export class BrowserTab {
                     }
                 } else {
                     this.healthFailCount = 0;
+                    // 视口校验：guest 视口停在旧尺寸时抖动重排（容器缩放/zoom 变化后
+                    // Electron webview 不主动同步，页面按小视口排版露白）
+                    const t = this.lastViewport;
+                    if (
+                        t.w > 0 &&
+                        typeof healthy.w === "number" &&
+                        typeof healthy.h === "number" &&
+                        (Math.abs(healthy.w - t.w) > 4 || Math.abs(healthy.h - t.h) > 4)
+                    ) {
+                        this.nudgeViewport();
+                    }
                 }
             } catch {}
         }, 2000);
@@ -1569,6 +1679,9 @@ export class BrowserTab {
             }
             this.webview.replaceWith(newWebview);
             this.webview = newWebview;
+            // 新 webview 需重新钉视口尺寸（lastViewport 复位后 syncViewport 才会写入）
+            this.lastViewport = { w: 0, h: 0, z: 1 };
+            this.syncViewport(true);
             this.controller.reattach(newWebview);
             // 重建后的 webview 恢复 UA（商店页需重新伪装 Edge）
             // appliedUserAgent 也要清：新 webview 是新 webContents，旧的已应用值不再适用
@@ -1609,6 +1722,9 @@ export class BrowserTab {
                 break;
             case "toggleBookmark":
                 await this.toggleBookmark();
+                break;
+            case "annotate":
+                await this.showAnnotationMenu(payload?.x, payload?.y);
                 break;
             case "menu":
                 this.showMenu(payload?.x, payload?.y);
@@ -1660,6 +1776,64 @@ export class BrowserTab {
     private updateBookmarkButton(url: string): void {
         const bookmarked = !!this.deps.bookmarks.find(url);
         this.toolbar.setBookmarked(bookmarked);
+    }
+
+    /**
+     * 标注菜单（地址栏右侧 ✎ 按钮）：
+     * - 有选区 → 直接标注选中文字（与页内选区气泡同链路）
+     * - 标注此页：无选区的页面级标注
+     * - 打开标注文档：跳转到当前页对应的思源标注文档
+     */
+    private async showAnnotationMenu(x?: number, y?: number): Promise<void> {
+        if (!this.annotation) return;
+        const url = this.controller.getCurrentUrl();
+        if (!url || !/^https?:\/\//i.test(url)) return;
+        // 读页内选区（宿主无法直接感知 guest 选区）
+        let selText = "";
+        try {
+            selText = String(await this.webview.executeJavaScript(
+                "(function(){var s=window.getSelection();return s&&!s.isCollapsed?s.toString().replace(/\\s+/g,' ').trim():'';})()"
+            ) || "");
+        } catch {}
+        const menu = new Menu("sy-browser-ann-menu");
+        if (!menu) return;
+        if (selText) {
+            menu.addItem({
+                id: "annotateSelection",
+                iconHTML: "",
+                label: this.deps.i18n.annotateSelection || "标注选中文字",
+                click: () => {
+                    this.annotation!.create(this.webview, url, this.controller.getCurrentTitle(), { quote: selText });
+                },
+            });
+        }
+        menu.addItem({
+            id: "annotatePage",
+            iconHTML: "",
+            label: this.deps.i18n.annotatePage || "标注此页（无选区）",
+            click: () => {
+                this.annotation!.create(this.webview, url, this.controller.getCurrentTitle(), {});
+            },
+        });
+        menu.addItem({
+            id: "openAnnotationDoc",
+            iconHTML: "",
+            label: this.deps.i18n.openAnnotationDoc || "打开标注文档",
+            click: () => {
+                void this.annotation!.openDoc(url);
+            },
+        });
+        let px = x;
+        let py = y;
+        if (px == null || py == null) {
+            const btn = this.toolbar.element.querySelector('[data-act="annotate"]') as HTMLElement | null;
+            if (btn) {
+                const rect = btn.getBoundingClientRect();
+                px = rect.right;
+                py = rect.bottom;
+            }
+        }
+        menu.open({ x: px ?? window.innerWidth - 300, y: py ?? 40 });
     }
 
     private showMenu(x?: number, y?: number): void {
@@ -1768,6 +1942,18 @@ export class BrowserTab {
         if (this.onExtHostLoaded) {
             window.removeEventListener("sy-browser-ext-host-loaded", this.onExtHostLoaded);
             this.onExtHostLoaded = null;
+        }
+        if (this.viewportRO) {
+            try { this.viewportRO.disconnect(); } catch {}
+            this.viewportRO = null;
+        }
+        if (this.zoomMO) {
+            try { this.zoomMO.disconnect(); } catch {}
+            this.zoomMO = null;
+        }
+        if (this.onWinResize) {
+            window.removeEventListener("resize", this.onWinResize);
+            this.onWinResize = null;
         }
         try {
             (window as any).browserPlugin?.extensionHost?.disposeCsRuntime?.(this.webview);

@@ -79,6 +79,13 @@ export class SettingsDialog {
         const staleOption = s.excerptNotebook && !notebooks.some((n) => n.id === s.excerptNotebook)
             ? `<option value="${escapeAttr(s.excerptNotebook)}" selected>(${escapeAttr(this.i18n.excerptNotebookStale || "已失效，请重新选择")})</option>`
             : "";
+        // 标注笔记本下拉
+        const annNbOptions = notebooks
+            .map((n) => `<option value="${n.id}" ${n.id === s.annotationNotebook ? "selected" : ""}>${escapeAttr(n.name)}</option>`)
+            .join("");
+        const annStaleOption = s.annotationNotebook && !notebooks.some((n) => n.id === s.annotationNotebook)
+            ? `<option value="${escapeAttr(s.annotationNotebook)}" selected>(${escapeAttr(this.i18n.excerptNotebookStale || "已失效，请重新选择")})</option>`
+            : "";
         return `
         <div class="b3-form sb-settings">
             <div class="b3-form__row">
@@ -164,6 +171,21 @@ export class SettingsDialog {
                 <input id="sb-excerpt-assets" type="checkbox" ${s.excerptAssets !== false ? "checked" : ""} />
             </div>
             <div class="b3-form__row">
+                <label>${this.i18n.annotationNotebook || "标注保存笔记本"}</label>
+                <select id="sb-ann-nb">
+                    <option value="">(${this.i18n.annotationNotebook || "标注保存笔记本"})</option>
+                    ${annNbOptions}
+                    ${annStaleOption}
+                </select>
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.annotationParentPath || "标注存放路径"}</label>
+                <input id="sb-ann-path" type="text" value="${escapeAttr(s.annotationParentPath || "/网页标注")}" placeholder="/网页标注"/>
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.annotationParentPathDesc || "标注文档保存在该路径下，结构为：存放路径 → 网站域名 → 网页标注文档。选中网页文字点「标注」即写入对应文档；重新打开网页会自动恢复高亮位置。"}
+            </div>
+            <div class="b3-form__row">
                 <label>${this.i18n.extManager || "Chrome 扩展"}</label>
                 <button class="b3-button" id="sb-ext-manager">${this.i18n.extManageOpen || "管理扩展..."}</button>
             </div>
@@ -234,6 +256,8 @@ export class SettingsDialog {
                 excerptParentPath: (root.querySelector("#sb-excerpt-path") as HTMLInputElement).value.trim() || "/",
                 excerptTags: (root.querySelector("#sb-excerpt-tags") as HTMLInputElement).value.trim(),
                 excerptAssets: (root.querySelector("#sb-excerpt-assets") as HTMLInputElement).checked,
+                annotationNotebook: (root.querySelector("#sb-ann-nb") as HTMLSelectElement)?.value || "",
+                annotationParentPath: (root.querySelector("#sb-ann-path") as HTMLInputElement)?.value.trim() || "/网页标注",
                 interceptAllLinks: (root.querySelector("#sb-intercept-all") as HTMLInputElement).checked,
                 excludedSites: (root.querySelector("#sb-excluded-sites") as HTMLTextAreaElement).value,
                 adBlockEnabled: (root.querySelector("#sb-adblock") as HTMLInputElement).checked,

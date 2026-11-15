@@ -79,7 +79,7 @@ module.exports = (env, argv) => {
                 {
                     // 摘录用的注入脚本（Readability / 剪藏脚本）以原始字符串内嵌，
                     // 在 webview 页面上下文中通过 executeJavaScript 执行
-                    test: /Readability\.js$|clipScript\.js$/,
+                    test: /Readability\.js$|clipScript\.js$|annotationScript\.js$/,
                     type: "asset/source",
                 },
                 {
@@ -96,10 +96,15 @@ module.exports = (env, argv) => {
         plugins: [
             // raw + entryOnly：banner 必须是可执行代码（不是注释），且只能出现在
             // 入口 chunk —— kernel.js 由另一份配置独立编译，不受影响。
+            // test: /\.js$/ 必须：BannerPlugin 会把 banner 同时打进入口 chunk 抽出的
+            // index.css（MiniCssExtract 产物），JS 混进 CSS 后内核把它作为插件样式
+            // 注入 <style>，浏览器整段丢弃 —— 所有 .sy-browser-* 样式失效，
+            // 页签塌缩成内容高度（"视口被缩小"的真凶）。限定 .js 后 CSS 恢复干净。
             new webpack.BannerPlugin({
                 banner: RELOAD_BANNER,
                 raw: true,
                 entryOnly: true,
+                test: /\.js$/,
             }),
             new webpack.DefinePlugin({
                 "process.env.NODE_ENV": JSON.stringify(argv.mode),

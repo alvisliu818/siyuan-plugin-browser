@@ -151,5 +151,16 @@
   "excerptNotebookInvalid": "摘录保存笔记本不存在或已关闭，请到插件设置中重新选择",
   "excerptNotebookStale": "已失效，请重新选择",
   "vmAutoConfirm": "暴力猴安装自动确认",
-  "vmAutoConfirmDesc": "点击脚本站的「安装」后自动在暴力猴确认页点「安装」，无需再手动确认；关闭后保持暴力猴原生手动确认流程"
+  "vmAutoConfirmDesc": "点击脚本站的「安装」后自动在暴力猴确认页点「安装」，无需再手动确认；关闭后保持暴力猴原生手动确认流程",
+  "annotate": "标注",
+  "annotateSelection": "标注选中文字",
+  "annotatePage": "标注此页（无选区）",
+  "openAnnotationDoc": "打开标注文档",
+  "annotationCreated": "已标注",
+  "annotationFailed": "标注失败",
+  "annotationNotebook": "标注保存笔记本",
+  "annotationNotebookRequired": "请先在插件设置中选择标注保存笔记本",
+  "annotationParentPath": "标注存放路径",
+  "annotationParentPathDesc": "标注文档保存在该路径下，结构为：存放路径 → 网站域名 → 网页标注文档。选中网页文字点「标注」即写入对应文档；重新打开网页会自动恢复高亮位置，悬浮高亮可查看绑定的思源块内容。",
+  "annotationNoDoc": "当前页面还没有标注文档"
 }
