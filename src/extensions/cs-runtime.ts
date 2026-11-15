@@ -1283,14 +1283,17 @@ class CsPageSession {
                 ).catch(() => null);
             }
             // userScripts.execute 出箱（垫片 v23）：VM content-realm 脚本代码
-            // 在此取走并执行。fire-and-forget，不阻塞泵。
+            // 在此取走并执行。必须按出箱顺序串行 await：VM 先下发 GM 引导包
+            // （数百 KB、分块多轮求值）再下发脚本包装函数，并发 fire-and-forget
+            // 会让小体积脚本包装抢在引导包就绪前定义，VM 的调用握手错过 →
+            // 包装函数只定义不调用，脚本静默不执行。
             try {
                 const dr2 = await evalInSwFlatCached(sender, electronId, SW_US_EXEC_DRAIN_EXPR);
                 if (!dr2.err && dr2.value) {
                     const execs = JSON.parse(String(dr2.value)) || [];
                     for (const ex of (Array.isArray(execs) ? execs : [])) {
                         const code = String((ex && ex.code) || "");
-                        if (code) void this.evalUsExecInWorld(electronId, code);
+                        if (code) await this.evalUsExecInWorld(electronId, code);
                     }
                 }
             } catch {}

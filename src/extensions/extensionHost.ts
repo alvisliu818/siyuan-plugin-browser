@@ -48,6 +48,8 @@ export interface IInstalledExtension {
     electronId?: string;
     /** 原生加载失败原因（为空且 native=false 时表示垫片模式正常） */
     nativeError?: string;
+    /** Edge 加载项商店扩展 id（跨源去重：同一扩展从不同路径安装时识别为同一） */
+    edgeId?: string;
     /** manifest.action.default_popup 的相对路径（工具栏图标点击后展示的面板） */
     popupPath?: string;
     /** manifest.action.default_title（图标悬停提示，缺省回退 name） */
@@ -1817,7 +1819,21 @@ export class ExtensionHost {
             fs.mkdirSync(downloadDir, { recursive: true });
             const crxFile = path.join(downloadDir, `edge-${id}.crx`);
             fs.writeFileSync(crxFile, buf);
-            return await this.installFromPackage(crxFile);
+            const r = await this.installFromPackage(crxFile);
+            if (r.ok && r.ext) {
+                r.ext.edgeId = id;
+                // 跨源去重：同一 Edge 扩展早期可能从别的路径装过（手动 CRX / 旧版
+                // 路径方案），路径哈希不同会被当成新扩展 → 重复加载两个 SW 冲突。
+                // 按 edgeId（或目录名内嵌的 edge-<id>-）识别旧条目并卸载。
+                const dups = this.extensions.filter(
+                    (e) => e.id !== r.ext!.id && (e.edgeId === id || (e.path || "").includes("edge-" + id + "-"))
+                );
+                for (const d of dups) {
+                    await this.uninstall(d.id);
+                }
+                await this.persist();
+            }
+            return r;
         } catch (e: any) {
             const name = meta?.name ? ` (${meta.name})` : "";
             return { ok: false, error: `Edge Add-ons${name}: ${String(e?.message || e)}` };

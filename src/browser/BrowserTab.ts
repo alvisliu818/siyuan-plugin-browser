@@ -729,6 +729,28 @@ export class BrowserTab {
                         ]);
                         const parsed = JSON.parse(String(ir?.value || "{}"));
                         if (parsed.ok) {
+                            // VM 的 SW→页面「调用脚本包装函数」握手在本环境不触发
+                            // （execute 下发的包装只定义不调用，脚本静默不跑）。另把
+                            // 脚本以直注副本注册进 userScripts 注册表，由宿主注入器带
+                            // GM 垫片直接在页面执行（与 TM 直装同路径），保证真正运行;
+                            // VM 侧仍保留自己的 scr:/code: 记录供面板管理。
+                            try {
+                                const matches: string[] = [];
+                                const mre = new RegExp("//\\s*@(match|include)\\s+([^\\r\\n]+)", "gi");
+                                let mm: RegExpExecArray | null;
+                                while ((mm = mre.exec(code))) {
+                                    const p = mm[2].trim();
+                                    if (p && !matches.includes(p)) matches.push(p);
+                                }
+                                if (!matches.length) matches.push("*://*/*");
+                                const normMatches = matches.map((p) => /:\/\/\*\*(?:[/?#]|$)/.test(p) ? p.replace("://**/", "://*/").replace("://**", "://*") : p);
+                                const sid = "sy-install-" + Date.now().toString(36);
+                                const script = { id: sid, matches: normMatches, js: [{ code }], world: "USER_SCRIPT", runAt: "document_idle" };
+                                const regExpr = "(function (sj) { try { var s = JSON.parse(sj); chrome.userScripts.register(s, function () {}); return 'ok'; } catch (e) { return 'throw:' + e.message; } })(" + JSON.stringify(JSON.stringify(script)) + ")";
+                                await evalInSwByElectronId(vm.electronId, regExpr);
+                            } catch (eReg) {
+                                console.warn("[browser-plugin] .user.js VM 直注副本注册失败:", String((eReg as Error)?.message || eReg).slice(0, 80));
+                            }
                             showMessage("已通过 Violentmonkey 安装: " + name, 3500, "info");
                             console.info("[browser-plugin] .user.js VM 直装完成:", JSON.stringify(parsed));
                             return;
