@@ -32,7 +32,7 @@
 import type { IWebviewTag } from "../types";
 import { fetchSyncPost } from "siyuan";
 import { CLIP_DEFAULT_TEMPLATE, renderClipTemplate, getDefaultClipMarkdown, formatClipExcerpt } from "../browser/excerpt";
-import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSwFlatCached, findSwFlatSession, findSwTarget, FlatCommandSender, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
+import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSwFlatCached, findSwFlatSession, findSwTarget, invalidateSwTargetCache, FlatCommandSender, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
 import { remoteSession } from "../utils/electron";
 import { BROWSER_PARTITION } from "../constants";
 
@@ -755,8 +755,24 @@ class CsPageSession {
     }
 
     private send(method: string, params: any = {}, timeoutMs = 15000, sessionId?: string): Promise<any> {
+        // 前置销毁检查：webview 被移除/页签关闭的竞态下，远程代理会抛
+        // "Object has been destroyed" —— 归类为会话死亡（安静失败），
+        // 不让它以原始异常向上冒泡（实测启动恢复期刷三条 warn）
+        if (this.wc.isDestroyed?.()) {
+            this.attached = false;
+            try { this.onDead(); } catch {}
+            return Promise.reject(new Error("webContents 已销毁"));
+        }
         return Promise.race([
-            this.wc.debugger.sendCommand(method, params, sessionId),
+            this.wc.debugger.sendCommand(method, params, sessionId).catch((e: any) => {
+                const msg = String(e?.message || e);
+                if (msg.includes("Object has been destroyed") || msg.includes("webContents 已销毁")) {
+                    this.attached = false;
+                    try { this.onDead(); } catch {}
+                    throw new Error("webContents 已销毁");
+                }
+                throw e;
+            }),
             new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), timeoutMs)),
         ]);
     }
@@ -944,7 +960,13 @@ class CsPageSession {
         for (const ext of exts) {
             try {
                 await this.installExt(ext);
-            } catch (e) {
+            } catch (e: any) {
+                const msg = String(e?.message || e);
+                // 页面销毁竞态（页签关闭/重建中）：静默降级，下一个 dom-ready 会重建
+                if (msg.includes("已销毁")) {
+                    console.debug(`[browser-plugin] cs-runtime: "${ext.name}" 页面已销毁，跳过本轮安装`);
+                    return;
+                }
                 console.warn(`[browser-plugin] cs-runtime: "${ext.name}" 世界安装失败:`, e);
             }
         }
@@ -1038,6 +1060,7 @@ class CsPageSession {
         const errors: string[] = [];
         for (const cs of groups) {
             for (const f of cs.js || []) {
+                if (!this.alive) return; // 页面已销毁（竞态）：安静止步，下一个 dom-ready 会重建
                 try {
                     const src = this.host.readFile(ext.path, f);
                     const r: any = await this.send("Runtime.evaluate", {
@@ -1054,7 +1077,9 @@ class CsPageSession {
                         );
                     }
                 } catch (e: any) {
-                    errors.push(`${f}: ${String(e?.message || e).slice(0, 160)}`);
+                    const msg = String(e?.message || e);
+                    if (msg.includes("已销毁")) return; // 页面没了：静默结束（不进 errors 刷屏）
+                    errors.push(`${f}: ${msg.slice(0, 160)}`);
                 }
             }
         }
@@ -1780,6 +1805,14 @@ class CsPageSession {
                 // 每轮重试降为 debug：SW 冷启动期（background 执行中）的正常窗口，
                 // 信息级会刷屏；耗尽仍空才是故障（下方 warn）
                 console.debug("[browser-plugin] SW handlers 未就绪，重试", tries + "/8");
+                // ★ 第 3/6 轮仍空：不是冷启动慢，大概率是路由进了孤儿 worker
+                // （脚本缓存旧 worker 与磁盘新脚本活跃 worker 并存，前者无垫片无
+                // handler）。失效目标缓存让 evalInSw 重新打分选活跃者，并唤醒 SW
+                // （startWorkerForScope 无副作用）—— 否则 8 轮重试全部扔在同一个孤儿上。
+                if (tries === 3 || tries === 6) {
+                    try { invalidateSwTargetCache(ext.electronId); } catch {}
+                    try { await this.host.wakeSw?.(ext.electronId); } catch {}
+                }
                 await new Promise((res) => setTimeout(res, 2000));
                 const r2 = await this.evalInSw(ext, expr);
                 if (r2.err) return { err: r2.err };
@@ -1894,6 +1927,11 @@ class CsPageSession {
             let tries = 0;
             while (parsed && (parsed.__noConnectHandlers || parsed.__noPortListeners) && tries < 4) {
                 tries++;
+                // 同 routeSendMessage：第 2 轮仍空则失效目标缓存（孤儿 worker 嫌疑）并唤醒
+                if (tries === 2) {
+                    try { invalidateSwTargetCache(ext.electronId); } catch {}
+                    try { await this.host.wakeSw?.(ext.electronId); } catch {}
+                }
                 await new Promise((res) => setTimeout(res, 1500));
                 const r2 = await this.evalInSw(ext, expr);
                 if (r2.err) return { err: r2.err };

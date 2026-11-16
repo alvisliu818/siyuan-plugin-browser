@@ -281,6 +281,24 @@ export function cdpHttpLikelyDead(): boolean {
  *  URL 快速匹配失败时逐个 SW evaluate chrome.runtime.id 确认，结果按 targetId 缓存 */
 const swRuntimeIdCache = new Map<string, string>(); // targetId → runtimeId
 
+/** ★ 多 worker 判别探针（2026-11-16 实证）：同一扩展可能同时存在两个 SW worker ——
+ *  脚本缓存命中的旧 worker（无垫片、无 handler）与磁盘新脚本的活跃 worker。
+ *  旧 worker 的 registration.active 为 null（注册已被替换/清除）→ 孤儿；
+ *  活跃 worker 的 registration.active.state === "activated" 且 scriptURL 指向自身。
+ *  打分：活跃 +2、垫片已运行（__syOnMessageHandlers 存在）+1、非本扩展 -1。
+ *  宿主路由进孤儿 = "SW handlers 重试耗尽仍为空" 的直接根因（AdGuard 实测）。
+ *  返回 -2 表示探针执行失败（调用方按无法判别处理）。 */
+const SW_SCORE_PROBE = `(function(){try{var rid=chrome.runtime&&chrome.runtime.id;if(!rid)return -1;var r=self.registration;var a=r&&r.active;var act=!!(a&&a.state==="activated"&&a.scriptURL&&self.location.href&&a.scriptURL===self.location.href);var sh=typeof self.__syOnMessageHandlers!=="undefined";return (act?2:0)+(sh?1:0);}catch(e){return -2;}})()`;
+
+/** 失效某扩展的 SW target 缓存（HTTP 路径）。routeSendMessage 的 __noHandlers
+ *  重试中调用：孤儿 worker 会被缓存反复命中，清掉后 findSwTarget 重新打分选活跃者。 */
+export function invalidateSwTargetCache(electronId: string): void {
+    for (const [tid, rid] of swRuntimeIdCache) {
+        if (rid === electronId) swRuntimeIdCache.delete(tid);
+    }
+    swFlatSessionCache.delete(electronId);
+}
+
 // ===== 进程内 SW 直驱（webContents.debugger + Target 域，正常启动无需 --remote-debugging-port） =====
 //
 // 2026-10 实测（Electron 44 / Chromium 152）：页面级 debugger 会话发 Target.getTargets
@@ -313,9 +331,42 @@ export async function findSwFlatSession(
             const r = await sendCommand("Target.getTargets");
             const infos: any[] = (r && r.targetInfos) || [];
             const sws = infos.filter((t) => t.type === "service_worker" || t.type === "background_page");
-            // 1) URL 快速匹配
-            let picked = sws.find((t) => String(t.url).includes(electronId));
-            // 2) 逐个 attach 探测 chrome.runtime.id（顺带缓存其它扩展的会话）
+            // 1) URL 匹配候选：单候选直接用；多候选（同扩展孤儿+活跃 worker 并存）
+            //    逐个 attach 打分：活跃（registration.active 指向自身）+2、垫片已运行 +1。
+            //    孤儿 worker（脚本缓存命中的旧脚本，无垫片无 handler）恒 0 分被淘汰。
+            const urlMatches = sws.filter((t) => String(t.url).includes(electronId));
+            let picked: any = null;
+            if (urlMatches.length === 1) {
+                picked = urlMatches[0];
+            } else if (urlMatches.length > 1) {
+                // 两遍式：先全部打分，再统一选优/关孤儿（单遍式会因候选顺序漏关先到的孤儿）
+                const scored: Array<{ t: any; score: number }> = [];
+                for (const t of urlMatches) {
+                    try {
+                        const a = await sendCommand("Target.attachToTarget", { targetId: t.targetId, flatten: true });
+                        const sid = a && a.sessionId;
+                        if (!sid) continue;
+                        const er = await sendCommand("Runtime.evaluate", { expression: SW_SCORE_PROBE, returnByValue: true }, sid);
+                        const score = er && er.result && typeof er.result.value === "number" ? er.result.value : -2;
+                        scored.push({ t, score });
+                    } catch {}
+                }
+                if (scored.length) {
+                    scored.sort((x, y) => y.score - x.score);
+                    if (scored[0].score >= 0) picked = scored[0].t;
+                    // 孤儿关闭：胜出者确为活跃（≥2 分）时，把 0 分孤儿 worker 关掉。
+                    // 它的注册已被替换（registration.active=null），留着只会被后续查找反复命中；
+                    // 关闭是可恢复的释放（SW 按需重启），仅在判别置信度高时执行。
+                    if (picked && scored[0].score >= 2) {
+                        for (const s of scored) {
+                            if (s.score <= 0 && s.t !== picked) {
+                                try { await sendCommand("Target.closeTarget", { targetId: s.t.targetId }); } catch {}
+                            }
+                        }
+                    }
+                }
+            }
+            // 2) 无 URL 命中：逐个 attach 探测 chrome.runtime.id（顺带缓存其它扩展的会话）
             for (const t of sws) {
                 if (picked) break;
                 try {
@@ -416,17 +467,36 @@ export async function findSwTarget(electronId: string): Promise<ISwTarget | null
         const targets = await fetchTargets();
         const sws = targets.filter((t) => t.type === "service_worker" || t.type === "background_page");
         const asTarget = (t: any): ISwTarget => ({ id: t.id, url: String(t.url), webSocketDebuggerUrl: t.webSocketDebuggerUrl });
-        // 1. 缓存命中（target 仍在列表）
-        for (const t of sws) {
-            if (swRuntimeIdCache.get(t.id) === electronId) return asTarget(t);
+        // 1. 候选收集：URL 匹配 + 缓存命中。同一扩展可能多 worker 并存
+        //    （孤儿 + 活跃，URL 相同）—— 单候选走快速路径，多候选必须打分。
+        const candidates = sws.filter((t) => String(t.url).includes(electronId) || swRuntimeIdCache.get(t.id) === electronId);
+        if (candidates.length === 1) {
+            swRuntimeIdCache.set(candidates[0].id, electronId);
+            return asTarget(candidates[0]);
         }
-        // 2. URL 快速匹配
-        const byUrl = sws.find((t) => String(t.url).includes(electronId));
-        if (byUrl) {
-            swRuntimeIdCache.set(byUrl.id, electronId);
-            return asTarget(byUrl);
+        if (candidates.length > 1) {
+            // 2. 多候选：逐个打分取最优（活跃 worker 优先，垫片标记次之）。
+            //    探针含 chrome.runtime.id 校验，非本扩展的候选得 -1 被淘汰。
+            let best: any = null;
+            let bestScore = -1;
+            for (const t of candidates) {
+                try {
+                    const s = await cdpEvalOnce(t.webSocketDebuggerUrl, SW_SCORE_PROBE, 4000);
+                    const score = typeof s === "number" ? s : -2;
+                    if (score > bestScore) { bestScore = score; best = t; }
+                } catch {}
+            }
+            if (best && bestScore >= 0) {
+                // 清掉同扩展落选候选的缓存（孤儿 targetId 不再命中）
+                for (const t of candidates) {
+                    if (t !== best) swRuntimeIdCache.delete(t.id);
+                }
+                swRuntimeIdCache.set(best.id, electronId);
+                return asTarget(best);
+            }
+            return null;
         }
-        // 3. 逐个探测 chrome.runtime.id（SW origin id 可能与扩展 id 不是同一套）
+        // 3. 无 URL 命中：逐个探测 chrome.runtime.id（SW origin id 可能与扩展 id 不是同一套）
         for (const t of sws) {
             try {
                 const r = await cdpEvalOnce(t.webSocketDebuggerUrl, "chrome.runtime.id", 4000);

@@ -142,13 +142,20 @@ export class UserscriptInjector {
                     await ensureExtensionWorld(webview, ext as any);
                     ensured = true;
                     break;
-                } catch (e) {
+                } catch (e: any) {
                     lastErr = e;
+                    // webContents 已销毁（页签关闭/重建竞态）：页面没了，
+                    // 重试没意义（实测启动期 6 轮×400ms 全部扔在死页上）—— 立即放弃
+                    const msg = String(e?.message || e);
+                    if (msg.includes("webContents 不可用") || msg.includes("已销毁")) break;
                     await new Promise((r) => setTimeout(r, 400));
                 }
             }
             if (!ensured) {
-                console.warn(`[browser-plugin] userScript world ensure failed (${ext.name}) 重试后仍失败:`, String(lastErr?.message || lastErr).slice(0, 120));
+                const msg = String(lastErr?.message || lastErr);
+                if (!(msg.includes("webContents 不可用") || msg.includes("已销毁"))) {
+                    console.warn(`[browser-plugin] userScript world ensure failed (${ext.name}) 重试后仍失败:`, msg.slice(0, 120));
+                }
                 continue;
             }
             for (const entry of (scripts.values() as IterableIterator<IUserScriptEntry>)) {
