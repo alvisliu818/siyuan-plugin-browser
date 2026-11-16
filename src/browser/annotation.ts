@@ -100,8 +100,8 @@ const ANN_CSS = `
 .sy-ann-pop-bar button:hover{background:#eee;}
 .sy-ann-pop-bar button.on{color:#1a73e8;background:#dbeafe;}
 .sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}
-@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}
-.sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}
+@keyframes syAnnFlash{0%{box-shadow:0 0 0 0 rgba(255,140,0,.85);}70%{box-shadow:0 0 0 12px rgba(255,140,0,0);}100%{box-shadow:0 0 0 0 rgba(255,140,0,0);}}
+.sy-ann-flash{animation:syAnnFlash 0.9s ease-out 2;}
 `;
 
 export class AnnotationController {
@@ -263,13 +263,17 @@ export class AnnotationController {
             const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
             const win = new remote.BrowserWindow({
                 width: 380, height: 340, x: sx, y: sy,
-                frame: true, titleBarStyle: "hidden", resizable: true,
+                frame: true, titleBarStyle: "hidden", resizable: false,
                 alwaysOnTop: false, skipTaskbar: true,
                 webPreferences: { nodeIntegration: true, contextIsolation: false },
             });
             win.__syAutoHide = !!payload?.hover;
             this.floatWins.set(item.id, win);
             win.on("closed", () => this.floatWins.delete(item.id));
+            win.on("move", () => {
+                clearTimeout(win.__syMoveT);
+                win.__syMoveT = setTimeout(() => this.floatChannel?.postMessage({ type: "dragend", id: item.id }), 400);
+            });
             win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
         } catch (e) {
             console.warn("[browser-plugin] annotation openFloat failed:", e);
@@ -305,11 +309,15 @@ export class AnnotationController {
             }
             const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
             const win = new remote.BrowserWindow({
-                width: 400, height: 440, frame: true, titleBarStyle: "hidden", resizable: true, skipTaskbar: true,
+                width: 400, height: 440, frame: true, titleBarStyle: "hidden", resizable: false, skipTaskbar: true,
                 webPreferences: { nodeIntegration: true, contextIsolation: false },
             });
             this.floatWins.set(listKey, win);
             win.on("closed", () => this.floatWins.delete(listKey));
+            win.on("move", () => {
+                clearTimeout(win.__syMoveT);
+                win.__syMoveT = setTimeout(() => this.floatChannel?.postMessage({ type: "dragend", id: listKey }), 400);
+            });
             win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
         } catch (e) {
             console.warn("[browser-plugin] annotation openListFloat failed:", e);

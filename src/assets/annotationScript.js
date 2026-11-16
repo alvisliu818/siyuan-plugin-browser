@@ -50,8 +50,8 @@
         ".sy-ann-pop-bar button:hover{background:#eee;}",
         ".sy-ann-pop-bar button.on{color:#1a73e8;background:#dbeafe;}",
         ".sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}",
-        "@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}",
-        ".sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}"
+        "@keyframes syAnnFlash{0%{box-shadow:0 0 0 0 rgba(255,140,0,.85);}70%{box-shadow:0 0 0 12px rgba(255,140,0,0);}100%{box-shadow:0 0 0 0 rgba(255,140,0,0);}}",
+        ".sy-ann-flash{animation:syAnnFlash 0.9s ease-out 2;}"
     ].join("");
 
     function ensureStyle() {
@@ -579,8 +579,11 @@
         // 瞬时滚动（不用 smooth）：smooth 依赖 rAF，页签在后台（浮动窗在前台）时
         // rAF 被节流导致平滑滚动不生效;瞬时滚动后台也能跳到位
         try { m.scrollIntoView({ block: "center" }); } catch (e) { m.scrollIntoView(); }
+        // 重复跳转也能重新闪：先移除类+强制 reflow 再添加，重启动画
+        m.classList.remove("sy-ann-flash");
+        void m.offsetWidth;
         m.classList.add("sy-ann-flash");
-        setTimeout(function () { m.classList.remove("sy-ann-flash"); }, 1800);
+        setTimeout(function () { m.classList.remove("sy-ann-flash"); }, 1900);
         return true;
     };
 })();
