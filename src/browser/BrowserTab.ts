@@ -219,8 +219,8 @@ export class BrowserTab {
                     this.annotation?.create(this.webview, this.controller.getCurrentUrl(), this.controller.getCurrentTitle(), payload);
                 },
                 onAnnOpen: (payload: { id?: string; x?: number; y?: number; edit?: boolean }) => {
-                    if (payload?.edit) this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
-                    else this.annotation?.openFloat(this.webview, this.controller.getCurrentUrl(), payload);
+                    if (payload?.edit) void this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
+                    else void this.annotation?.openFloat(this.webview, this.controller.getCurrentUrl(), payload);
                 },
                 onAnnMeta: (payload: { id?: string; color?: string; tags?: string[] }) => {
                     void this.annotation?.applyMeta(payload);
