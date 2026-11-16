@@ -40,6 +40,7 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     excerptNotebook: "",
     annotationNotebook: "",
     annotationParentPath: "/网页标注",
+    showAnnInline: true,
     excerptParentPath: "/",
     excerptTags: "",
     excerptAssets: true,

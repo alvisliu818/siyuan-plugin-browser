@@ -95,6 +95,8 @@ export interface BrowserSettings {
     annotationNotebook: string;
     /** 标注存放路径（人类可读路径，默认 "/网页标注"）；结构：路径 → 网站域名 → 网页标注文档 */
     annotationParentPath: string;
+    /** 是否在页内高亮下显示批注小字（绝对定位不占文档流） */
+    showAnnInline: boolean;
     /** 摘录保存路径（人类可读路径，默认根 "/"/，支持 {{...}} sprig 模板） */
     excerptParentPath: string;
     /** 摘录文档标签（逗号分隔） */

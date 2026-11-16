@@ -64,7 +64,7 @@ function pad2(n: number): string {
  * 失效——表现为弹框变成普通 div 追加到页面底部（页面流布局）。
  */
 const ANN_CSS = `
-.sy-ann-hl{background:rgba(255,213,0,.4)!important;border-radius:2px;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone;}
+.sy-ann-hl{position:relative;background:rgba(255,213,0,.4)!important;border-radius:2px;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone;}
 .sy-ann-hl:hover{background:rgba(255,170,0,.6)!important;}
 .sy-ann-bubble{position:fixed!important;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;}
 .sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}
@@ -74,7 +74,8 @@ const ANN_CSS = `
 .sy-ann-pop-note{white-space:pre-wrap;}
 .sy-ann-pop-empty{color:#999;font-style:italic;}
 .sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}
-.sy-ann-inline{display:block;font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.12);border-radius:3px;padding:0 3px;margin:2px 0 0;cursor:pointer;line-height:1.4;}
+.sy-ann-inline{position:absolute;left:0;top:100%;display:block;font-size:11px;color:#8a6d1a;background:none;border-radius:0;padding:0;margin:1px 0 0;cursor:pointer;line-height:1.2;white-space:nowrap;z-index:5;}
+.sy-ann-inline:hover{opacity:.15;}
 .sy-ann-c-yellow{background:rgba(255,213,0,.4)!important;}
 .sy-ann-c-green{background:rgba(120,220,120,.45)!important;}
 .sy-ann-c-blue{background:rgba(120,180,255,.45)!important;}
@@ -222,6 +223,14 @@ export class AnnotationController {
         }
     }
 
+    /** 设置开关变更后回刷各页内小字显隐（show 显式传新鲜值，避免缓存 settings 滞后） */
+    applyInlineVisibility(show?: boolean): void {
+        const v = show === undefined ? !!this.getSettings().showAnnInline : !!show;
+        for (const wv of this.webviews.values()) {
+            wv.executeJavaScript("window.__syAnnSetInlineVisible && window.__syAnnSetInlineVisible(" + JSON.stringify(v) + ");").catch(() => {});
+        }
+    }
+
     /** 列表浮动窗点条目 → 页内滚动到对应高亮并闪烁 */
     private gotoAnnotation(id: string, url: string): void {
         const wv = this.webviews.get(AnnotationStore.normalizeKey(url));
@@ -249,7 +258,7 @@ export class AnnotationController {
             }
             this.pageCache.set(urlKey, items);
             this.webviews.set(urlKey, webview);
-            const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + ");";
+            const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + "," + JSON.stringify(!!this.getSettings().showAnnInline) + ");";
             // 样式必须先于脚本经 insertCSS 注入（不受页面 meta CSP 限制）；
             // 页内 ensureStyle 只作兜底
             try {

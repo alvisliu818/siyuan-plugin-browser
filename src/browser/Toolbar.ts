@@ -2,6 +2,15 @@ import type { BrowserSettings, IWebviewTag } from "../types";
 import { normalizeUrl } from "../utils/url";
 import { el } from "../utils/dom";
 
+/** 地址栏展示用解码（百分号转义还原为原文，支持中文）;解码失败回退原串 */
+function decodeUrlForDisplay(url: string): string {
+    try {
+        return decodeURIComponent(url);
+    } catch {
+        return url;
+    }
+}
+
 /** 工具栏按钮动作 */
 export type ToolbarAction =
     | "back"
@@ -41,6 +50,8 @@ export interface IToolbarExtIcon {
 export class Toolbar {
     readonly element: HTMLElement;
     private urlbar: HTMLInputElement;
+    /** 地址栏真实 URL（显示为解码原文，提交未编辑时用真实值导航） */
+    private realUrl = "";
     private backBtn: HTMLButtonElement;
     private forwardBtn: HTMLButtonElement;
     private reloadBtn: HTMLButtonElement;
@@ -154,7 +165,9 @@ export class Toolbar {
             if (e.key === "Enter") {
                 e.preventDefault();
                 const raw = this.urlbar.value;
-                const url = normalizeUrl(raw, this.settings);
+                const url = this.realUrl && raw === decodeUrlForDisplay(this.realUrl)
+                    ? this.realUrl
+                    : normalizeUrl(raw, this.settings);
                 this.cb.onUrlSubmit(url);
             } else if (e.key === "Escape") {
                 this.urlbar.blur();
@@ -199,10 +212,11 @@ export class Toolbar {
         }
     }
 
-    /** 设置地址栏内容（不触发回调） */
+    /** 设置地址栏内容（不触发回调）。显示解码原文（支持中文），不展示百分号转义 */
     setUrl(url: string): void {
         if (document.activeElement === this.urlbar) return;
-        this.urlbar.value = url;
+        this.realUrl = url;
+        this.urlbar.value = decodeUrlForDisplay(url);
     }
 
     /** 更新前进/后退按钮可用状态 */

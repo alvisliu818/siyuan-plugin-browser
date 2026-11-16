@@ -14,7 +14,7 @@
     window.__syAnnInjected = true;
 
     var CSS = [
-        ".sy-ann-hl{background:rgba(255,213,0,.4);border-radius:2px;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone;}",
+        ".sy-ann-hl{position:relative;background:rgba(255,213,0,.4);border-radius:2px;cursor:pointer;box-decoration-break:clone;-webkit-box-decoration-break:clone;}",
         ".sy-ann-hl:hover{background:rgba(255,170,0,.6);}",
         ".sy-ann-bubble{position:fixed;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;}",
         ".sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}",
@@ -24,7 +24,8 @@
         ".sy-ann-pop-note{white-space:pre-wrap;}",
         ".sy-ann-pop-empty{color:#999;font-style:italic;}",
         ".sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}",
-        ".sy-ann-inline{display:block;font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.12);border-radius:3px;padding:0 3px;margin:2px 0 0;cursor:pointer;line-height:1.4;}",
+        ".sy-ann-inline{position:absolute;left:0;top:100%;display:block;font-size:11px;color:#8a6d1a;background:none;border-radius:0;padding:0;margin:1px 0 0;cursor:pointer;line-height:1.2;white-space:nowrap;z-index:5;}",
+        ".sy-ann-inline:hover{opacity:.15;}",
         ".sy-ann-c-yellow{background:rgba(255,213,0,.4)!important;}",
         ".sy-ann-c-green{background:rgba(120,220,120,.45)!important;}",
         ".sy-ann-c-blue{background:rgba(120,180,255,.45)!important;}",
@@ -150,19 +151,18 @@
             } catch (e) { /* 节点已失效等情况忽略 */ }
         }
         // 内联小字：高亮后附截断的批注摘要，页面内不点开即可快速浏览
-        if (wrapped && ann.note && String(ann.note).trim()) {
+        if (wrapped && inlineVisible && ann.note && String(ann.note).trim()) {
             try {
                 var marks = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + renderedId + '"]');
                 var lastMark = marks[marks.length - 1];
-                var nx = lastMark && lastMark.nextSibling;
-                if (lastMark && lastMark.parentNode && !(nx && nx.nodeType === 1 && nx.classList.contains("sy-ann-inline"))) {
+                if (lastMark && !lastMark.querySelector(".sy-ann-inline")) {
                     var inline = document.createElement("span");
                     inline.className = "sy-ann-inline";
                     inline.setAttribute("data-ann-id", String(ann.id || ""));
                     var nt = String(ann.note).replace(/\s+/g, " ").trim();
                     inline.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
                     inline.title = nt;
-                    lastMark.parentNode.insertBefore(inline, lastMark.nextSibling);
+                    lastMark.appendChild(inline);
                 }
             } catch (e) { /* 忽略 */ }
         }
@@ -241,6 +241,7 @@
 
     var COLORS = ["yellow", "green", "blue", "pink", "purple"];
     var bubbleColor = "yellow";
+    var inlineVisible = true;
     var popHideTimer = null;
     function cancelPopHide() { if (popHideTimer) { clearTimeout(popHideTimer); popHideTimer = null; } }
     // 移开宽限：鼠标离开高亮后延迟收起，留出移入小窗点按钮的时间
@@ -460,11 +461,19 @@
 
     // ===== 宿主入口 =====
 
-    window.__syAnnInit = function (items) {
+    window.__syAnnInit = function (items, showInline) {
         ensureStyle();
+        if (showInline !== undefined) inlineVisible = !!showInline;
         list.length = 0;
         for (var i = 0; i < (items || []).length; i++) list.push(items[i]);
         window.__syAnnRender();
+    };
+
+    // 设置开关：显示/隐藏页内批注小字
+    window.__syAnnSetInlineVisible = function (v) {
+        inlineVisible = !!v;
+        var inls = document.querySelectorAll(".sy-ann-inline");
+        for (var i = 0; i < inls.length; i++) inls[i].style.display = inlineVisible ? "" : "none";
     };
 
     window.__syAnnRender = function () {

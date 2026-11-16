@@ -1822,6 +1822,11 @@ export class BrowserTab {
      * - 标注此页：无选区的页面级标注
      * - 打开标注文档：跳转到当前页对应的思源标注文档
      */
+    /** 设置变更（标注小字开关等）回刷页内标注 UI */
+    applyAnnSettings(show?: boolean): void {
+        this.annotation?.applyInlineVisibility(show);
+    }
+
     private async showAnnotationMenu(x?: number, y?: number): Promise<void> {
         if (!this.annotation) return;
         const url = this.controller.getCurrentUrl();
@@ -1867,6 +1872,16 @@ export class BrowserTab {
             label: this.deps.i18n.annListFloat || "本页标注列表（浮动窗）",
             click: () => {
                 this.annotation!.openListFloat(this.webview, url);
+            },
+        });
+        const showInline = !!this.settings.showAnnInline;
+        menu.addItem({
+            id: "toggleAnnInline",
+            iconHTML: "",
+            label: showInline ? (this.deps.i18n.hideAnnInline || "隐藏标注小字") : (this.deps.i18n.showAnnInline || "显示标注小字"),
+            click: () => {
+                void this.deps.settings.save({ showAnnInline: !showInline });
+                this.annotation?.applyInlineVisibility(!showInline);
             },
         });
         let px = x;

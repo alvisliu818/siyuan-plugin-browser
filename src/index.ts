@@ -386,9 +386,11 @@ export default class BrowserPlugin extends Plugin {
         // 按设置显隐图标（body class + CSS，详见 applyIconVisibility 注释）
         this.applyIconVisibility();
 
-        // 设置变化时同步图标显隐
+        // 设置变化时同步图标显隐 + 各页签标注小字开关（传新鲜值防缓存滞后）
         this.settingsStore.onChange(() => {
             this.applyIconVisibility();
+            const v = this.settingsStore.get().showAnnInline;
+            for (const t of this.tabInstances.values()) t.applyAnnSettings(v);
         });
     }
 
