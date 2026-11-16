@@ -1861,6 +1861,14 @@ export class BrowserTab {
                 void this.annotation!.openDoc(url);
             },
         });
+        menu.addItem({
+            id: "annListFloat",
+            iconHTML: "",
+            label: this.deps.i18n.annListFloat || "本页标注列表（浮动窗）",
+            click: () => {
+                this.annotation!.openListFloat(this.webview, url);
+            },
+        });
         let px = x;
         let py = y;
         if (px == null || py == null) {

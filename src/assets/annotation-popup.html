@@ -26,6 +26,19 @@
   .acts{display:flex;gap:6px;justify-content:flex-end;margin-top:10px;}
   .acts button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:3px 10px;cursor:pointer;}
   .acts .pri{background:#1a73e8;color:#fff;border:none;}
+  .lhead{display:flex;gap:6px;margin-bottom:8px;}
+  .lhead button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:3px 8px;cursor:pointer;}
+  .li{display:flex;gap:6px;align-items:flex-start;padding:6px 6px;border-radius:6px;cursor:pointer;border-bottom:1px solid #f0f0f0;}
+  .li:hover{background:#f5f8ff;}
+  .li .dot{flex:0 0 10px;width:10px;height:10px;border-radius:50%;margin-top:4px;}
+  .li .tx{flex:1;min-width:0;}
+  .li .q{font-size:12px;color:#333;margin:0;border:none;padding:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .li .n{font-size:11px;color:#888;margin:2px 0 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .li .tg{font-size:10px;color:#335;background:#eef;border-radius:3px;padding:0 4px;margin-left:4px;}
+  .dot-yellow{background:rgba(255,213,0,.9);} .dot-green{background:rgba(120,220,120,.9);}
+  .dot-blue{background:rgba(120,180,255,.9);} .dot-pink{background:rgba(255,150,200,.9);}
+  .dot-purple{background:rgba(190,140,255,.9);}
+  .lempty{color:#999;font-style:italic;padding:12px 0;}
 </style>
 </head>
 <body>
@@ -47,7 +60,28 @@
   try { chan = new BroadcastChannel("sy-ann-float"); } catch (e) {}
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function send() { if (chan) chan.postMessage({ type: "meta", id: data.id, color: color, tags: tags }); }
+  function renderList() {
+    var items = data.items || [];
+    document.querySelector("#bar .t").textContent = "本页标注 (" + items.length + ")";
+    var h = '<div class="lhead"><button id="cp">标注此页</button><button id="od">打开标注文档</button></div>';
+    if (!items.length) h += '<div class="lempty">本页暂无标注</div>';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var nt = String(it.note || "").replace(/\s+/g, " ").trim();
+      h += '<div class="li" data-id="' + esc(it.id) + '"><span class="dot dot-' + esc(it.color || "yellow") + '"></span><span class="tx">' +
+        '<div class="q">' + esc(it.quote || "(页面级)") + "</div>" +
+        (nt ? '<div class="n">' + esc(nt) + "</div>" : "") +
+        ((it.tags || []).length ? '<div>' + it.tags.map(function (t) { return '<span class="tg">' + esc(t) + "</span>"; }).join("") + "</div>" : "") +
+        "</span></div>";
+    }
+    document.getElementById("body").innerHTML = h;
+    var lis = document.querySelectorAll(".li");
+    for (var j = 0; j < lis.length; j++) lis[j].onclick = function () { if (chan) chan.postMessage({ type: "goto", id: this.getAttribute("data-id"), url: data.url }); };
+    document.getElementById("cp").onclick = function () { if (chan) chan.postMessage({ type: "createPage", url: data.url }); };
+    document.getElementById("od").onclick = function () { if (chan) chan.postMessage({ type: "openDoc", url: data.url }); };
+  }
   function render() {
+    if (data.mode === "list") { renderList(); return; }
     var h = "";
     if (data.quote) h += '<div class="q">' + esc(data.quote) + "</div>";
     h += data.note ? '<div class="n">' + esc(data.note) + "</div>" : '<div class="empty">（无批注）</div>';

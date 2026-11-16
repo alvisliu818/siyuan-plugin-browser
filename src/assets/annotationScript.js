@@ -511,7 +511,9 @@
         var m = document.querySelector('mark.sy-ann-hl[data-ann-id="' + safeId + '"]');
         if (!m) return false;
         window.__syAnnFocused = id;
-        try { m.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) { m.scrollIntoView(); }
+        // 瞬时滚动（不用 smooth）：smooth 依赖 rAF，页签在后台（浮动窗在前台）时
+        // rAF 被节流导致平滑滚动不生效;瞬时滚动后台也能跳到位
+        try { m.scrollIntoView({ block: "center" }); } catch (e) { m.scrollIntoView(); }
         m.classList.add("sy-ann-flash");
         setTimeout(function () { m.classList.remove("sy-ann-flash"); }, 1800);
         return true;

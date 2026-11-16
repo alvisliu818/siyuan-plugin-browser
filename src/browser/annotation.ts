@@ -115,9 +115,12 @@ export class AnnotationController {
             this.floatChannel = new BroadcastChannel("sy-ann-float");
             this.floatChannel.onmessage = (ev: MessageEvent) => {
                 const m: any = ev.data;
-                if (!m || !m.id) return;
-                if (m.type === "meta") void this.applyMeta({ id: m.id, color: m.color, tags: m.tags });
-                else if (m.type === "edit") void this.openEditById(String(m.id));
+                if (!m) return;
+                if (m.type === "meta" && m.id) void this.applyMeta({ id: m.id, color: m.color, tags: m.tags });
+                else if (m.type === "edit" && m.id) void this.openEditById(String(m.id));
+                else if (m.type === "goto" && m.id) this.gotoAnnotation(String(m.id), String(m.url || ""));
+                else if (m.type === "createPage") this.createPageFromFloat(String(m.url || ""));
+                else if (m.type === "openDoc") void this.openDoc(String(m.url || ""));
             };
         } catch {}
     }
@@ -191,6 +194,47 @@ export class AnnotationController {
         } catch (e) {
             console.warn("[browser-plugin] annotation openFloat failed:", e);
         }
+    }
+
+    /** 地址栏 ✎ 菜单「本页标注列表」→ 轻量浮动窗列出本页全部标注（可固定、点条目跳转） */
+    async openListFloat(webview: IWebviewTag, url: string): Promise<void> {
+        try {
+            if (!/^https?:\/\//i.test(url)) return;
+            const urlKey = AnnotationStore.normalizeKey(url);
+            this.webviews.set(urlKey, webview);
+            let items = this.pageCache.get(urlKey);
+            const page = this.store.find(urlKey);
+            if (!items && page?.docId) items = await this.fetchAnnotations(page.docId);
+            const data = {
+                mode: "list", url,
+                items: (items || []).map((i) => ({ id: i.id, quote: i.quote, note: i.note, color: i.color || "yellow", tags: i.tags || [] })),
+            };
+            const remote = (window as any).require?.("@electron/remote");
+            if (!remote?.BrowserWindow) return;
+            const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
+            const win = new remote.BrowserWindow({
+                width: 400, height: 440, frame: false, skipTaskbar: true,
+                webPreferences: { nodeIntegration: true, contextIsolation: false },
+            });
+            win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
+        } catch (e) {
+            console.warn("[browser-plugin] annotation openListFloat failed:", e);
+        }
+    }
+
+    /** 列表浮动窗点条目 → 页内滚动到对应高亮并闪烁 */
+    private gotoAnnotation(id: string, url: string): void {
+        const wv = this.webviews.get(AnnotationStore.normalizeKey(url));
+        if (!wv) return;
+        wv.executeJavaScript("window.__syAnnFocused=null; window.__syAnnFocus && window.__syAnnFocus(" + JSON.stringify(id) + ");").catch(() => {});
+    }
+
+    /** 列表浮动窗「标注此页」→ 页面级标注 */
+    private createPageFromFloat(url: string): void {
+        const wv = this.webviews.get(AnnotationStore.normalizeKey(url));
+        if (!wv) return;
+        const title = String((wv as any).getTitle?.() || "");
+        void this.create(wv, url, title, {});
     }
 
     /** dom-ready 注入页内脚本并恢复本页标注高亮 */
