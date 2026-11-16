@@ -155,8 +155,13 @@ export class BrowserTab {
                     if (url && url.includes("script_installation.php") && this.pendingUserJs) {
                         this.pendingUserJs.askOpened = true;
                     }
-                    // webNavigation.onCommitted 合成派发（TM 安装检测等导航观察；
-                    // chrome-extension/data 页不派发）
+                },
+                onNavCommit: (url) => {
+                    // webNavigation.onCommitted 合成派发（TM .user.js 安装检测等导航观察；
+                    // chrome-extension/data 页不派发）。必须挂导航开始（did-start-navigation）：
+                    // VM/TM 的 onTabUpdated 在 onCommitted 分支会删 badges 等待重注入，
+                    // 挂 did-navigate/onUrlChange 会晚于 InjectionFeedback，刚写入的 inject
+                    // 状态被删 → 弹窗 "Violentmonkey was restarted" 横幅 + 脚本红线，刷新重复同时序。
                     if (url && /^https?:\/\//i.test(url)) void this.emitWebNavCommitted(url);
                 },
                 onTitleChange: (title) => {

@@ -19,6 +19,7 @@ export class WebviewController {
     private i18n: Record<string, string>;
     private callbacks: {
         onUrlChange: (url: string) => void;
+        onNavCommit: (url: string) => void;
         onTitleChange: (title: string) => void;
         onLoadingChange: (loading: boolean) => void;
         onFaviconChange: (favicon: string) => void;
@@ -220,6 +221,16 @@ export class WebviewController {
             this.loadingSince = 0;
             this.callbacks.onLoadingChange(false);
             this.callbacks.onProcessGone?.(reason);
+        });
+        // webNavigation.onCommitted 语义 = 导航提交（早于 dom-ready 的内容脚本注入）。
+        // 不能挂 did-navigate/onUrlChange：那晚于 InjectionFeedback，VM/TM 的
+        // onTabUpdated 在 onCommitted 分支会删掉刚写入的页签注入状态 → 弹窗
+        // "Violentmonkey was restarted" 横幅 + 脚本红线，刷新重复同时序。仅主框架 http(s) 派发。
+        this.on("did-start-navigation", (e: any) => {
+            const url = e?.url;
+            if (url && /^https?:\/\//i.test(url) && e.isMainFrame !== false) {
+                this.callbacks.onNavCommit?.(url);
+            }
         });
         this.on("did-navigate", (e) => {
             this.programmaticNav = false;

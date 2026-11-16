@@ -765,7 +765,14 @@ export class ExtensionHost {
                         var seenTabs = {};
                         list = list.filter(function (t) { var k = String(t.id) + "|" + (t.url || ""); if (seenTabs[k]) return false; seenTabs[k] = 1; return true; });
                         var fed = self.__syLastFedTab;
-                        if (fed && !list.some(function (t) { return String(t.id) === String(fed.id); })) list = list.concat([fed]);
+                        if (fed) {
+                            // 同一 webview 在原生事件里可能带真实 tabId（tabs.onUpdated/webNavigation），
+                            // 与垫片固定 id=1 并存 → VM 状态分裂（弹窗读到无 inject 的那份，
+                            // "was restarted" 横幅+脚本红线）。同 URL 的原生条目丢弃，收敛到 id=1；
+                            // 喂入的页签放最前（getActiveTab 取 [0]）。
+                            list = list.filter(function (t) { return String(t.url || "") !== String(fed.url || ""); });
+                            if (!list.some(function (t) { return String(t.id) === String(fed.id); })) list.unshift(fed);
+                        }
                         var p = props || {};
                         if (p.active || p.highlighted) list = list.filter(function (t) { return t.active; });
                         if (p.windowId !== undefined && p.windowId !== -1 && p.windowId !== 1) list = list.filter(function (t) { return t.windowId === p.windowId; });
