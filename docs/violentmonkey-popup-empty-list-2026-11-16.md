@@ -90,20 +90,64 @@ if (reset && (cachedSetPopup ? !cachedSetPopup[0] : cachedSetPopup = {})) {
   已将测试库启用目录 `12k10go` 与副本 `19f6031` 的垫片同步，三处 MD5 现均为 `54395ce6112feca1154e8e0b8bf22710`。
 - 测试库窗口未启动，**未做 e2e 实机点验**；插件产物与垫片文件已就位，启动后即生效。
 
-## 5. 已知副作用（未消除）
+## 5. 已知副作用 —— 已消除（v26 + v27，2026-11-16 下午/晚间）
 
-弹窗会多出一行 `Violentmonkey was restarted. Please reload the tab to run userscripts.` 与
-`Reload tab`，顶部总开关显示关闭态。原因：`popup-tracker.js` 在
-`reset && 补算出的 scripts 非空` 时判定为"SW 重启后内容脚本仍连着"，置
-`failure = [failureReasonRestarted, IS_APPLIED]` 并把 `injectInto = 'off'`。
-**脚本列表不受影响**，但状态展示有误导。
+### 5.1 横幅与红色删除线（v26 根除）
 
-彻底消除需要换成「保留 `badge.inject` 为真 + 由宿主在 popup 打开前模拟一条 `SetPopup`
-填 VM 内存 cache」的方案（`reset=false` 即不触发该分支）。该方案需拦截 SW 的
-`self.onmessage` 或 `webRequest.onBeforeRequest`，并处理 `augmentSetPopup` 的异步竞态，
-复杂度明显高于本次收益，故留作下一步。
+弹窗多出的 `Violentmonkey was restarted...` 横幅 + 脚本名红色删除线，根因是 v25 垫片把
+`badge.inject` 恒读 undefined → `initPopup()` 的 `reset=true` 恒成立 → `augmentSetPopup`
+补算路径把 `isInjectable()`（垫片恒成功）误判为「SW 重启」→ `failure=[failureReasonRestarted,
+IS_APPLIED]`（横幅）+ `state=more`（删除线）。
 
-## 6. 复盘 / 方法论
+v26（extensionHost 0d2 节 + cs-runtime 配套）：
+- `badge.inject` **条件放行**：仅当 SW 全局 `__sySetPopupSeenAt[1]` 新鲜（5min TTL =
+  SetPopup 缓存生命周期）时读真值（reset=false → 无横幅、缓存命中路径）；否则回落 v25 保底。
+  真值经 WeakMap 保存 + `__syBadgesInject` 持久化镜像（accessor 不可枚举、clone 丢键，
+  SW 重启后回种）。
+- 端口 `onDisconnect` 真实现 + 端口出生/复用打点（`__syPortPollAt`）：popup 世界死后
+  VM 的 `popupTabs` 残留会吞掉 SetPopup（"popupTabs[tabId] → return"），3s 无打点判死
+  断开触发 VM 清理；出生打点防误杀「刚创建、泵首拍未到」的活端口。
+- precache 投递链四步：断陈旧端口 → 喂 `__syLastFedTab`（冷 SW 内存态丢失）→
+  GetMoreIds 现算 + 态修正 more→content（宿主隔离世界 = VM 语义 content 态 →
+  runs=true 无删除线）→ SetPopup + CacheLoad 验证 + 投递标记。
+
+### 5.2 弹窗空列表（v27 根治 —— ERR_ABORTED 双拉吃掉 pop-on-read 缓存）
+
+v26 部署后横幅消除，但活体验证发现**弹窗列表变空**：popup 文档 ERR_ABORTED 重载使
+get-data.js 被 fetch 两次（实测间隔 217ms），`initPopup` 的 `cache.pop('SetPopup1')`
+是 pop-on-read —— 首拉吃掉预填条目后，二拉 pop 到空缓存 → `BGDATA.popup[0]=null` → 空列表。
+且宿主未实现 VM 的 SW→扩展页广播（BroadcastChannel('bus')），popup 无二次初始化路径。
+
+v27 修复（cs-runtime + ext-popup，**确定性方案，不赌补打时序**）：
+- `refillSetPopupCache`（新导出）：重放世界 fetch get-data.js **之前**补齐并确认缓存
+  （CacheLoad 验证）—— 重放 fetch 是 BGDATA 的最终消费点（主世界已钝化，原生加载吃掉
+  预填条目无害），fetch 前补齐 = 本次 pop 必命中。ext-popup.ts 的 remoteSrcs 循环里
+  对 `get-data.js` rel 调用，PopupOverlay 传 `anchorTab.url` 作 pageUrl。
+- **Run 补报**（refill 表达式内）：宿主隔离世界实际运行这些脚本，但内容脚本的 Run 上报
+  （cmd-run.js）未路由到 SW → VM 的 `badges[tabId].inject` 恒 undefined → 横幅复发
+  （扩展 reload 清 storage.session 丢镜像后暴露）。以扩展页身份直发 Run（own 命令门禁：
+  sender.url 以扩展根开头；msg.top=1 → setBadge 的 isTop），setBadge 同步写内存真值
+  （0d2 setter → syRealInject），initPopup 读 inject=true → reset=false → 无横幅；
+  VM 的 flushSession 落 `__syBadgesInject` 镜像 {1:true}，跨 SW 重启回种。
+- 原计划的 60ms 密集补填（tick 循环）**弃用** —— 改为上述 fetch 前确定性补齐；
+  稀疏维持（1200ms × 10）保留作端口清理与缓存保鲜。
+
+### 5.3 验证数据（2026-11-16 晚，主库活体）
+
+判定标准：`Matched scripts` + `searchEngineJump` 出现；扩展世界（`__syCsPop` ctx）
+`.script.failed`=0、`.script.runs`>=1、无 `was restarted` 横幅。
+
+| 场景 | total | failed | runs | banner | 备注 |
+|---|---|---|---|---|---|
+| 主窗 reload 后新开 | 1 | 0 | 1 | false | SW 状态：injectRead=true、mirror={1:true} |
+| 开→关→再开（toggle） | 1 | 0 | 1 | false | |
+| 冷 SW（CDP 杀 SW 再开） | 1 | 0 | 1 | false | 镜像回种验证通过 |
+| 连续快速开关（6×700ms） | 1 | 0 | 1 | false | |
+
+>5min 标记过期场景由机制覆盖（每次打开都重打 seenAt + Run 重报 + 镜像回种），未实跑等待。
+测试库（siyuan-test-ws）已同步部署 index.js，未做运行时点验（上午报告第 4 节遗留项仍开放）。
+
+## 6. 复盘 / 方法论## 6. 复盘 / 方法论
 
 - **协议要对**：VM MV3 的命令是 `{cmd, data}`（`chrome.runtime.onMessage`）或
   `postMessage({id, msg:{cmd,data}})`（`sendCmdToSW`）。上一轮探针用 `{method: ...}` 全程没打中
