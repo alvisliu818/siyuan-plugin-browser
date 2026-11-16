@@ -222,7 +222,7 @@ export class ExtensionHost {
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v23";
+        const SHIM_VER = "v24";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -237,6 +237,19 @@ export class ExtensionHost {
         //    （此前数组在 onMessage 包装内创建，若包装条件不满足则数组缺失，
         //    宿主会误报 "垫片未运行" 且无重试依据。）
         self.__syOnMessageHandlers = self.__syOnMessageHandlers || [];
+        // 0a) MV3 keepalive：chrome.alarms 周期唤醒重置 idle 计时，防 SW 闲置回收。
+        //     SW 回收会换 boot id → VM 判页签注入过期 → 弹「restarted / Reload tab」
+        //     横幅且列表脚本划红线（即使脚本实际在跑）。alarm 持久化、跨 SW 重启自
+        //     维持;onAlarm 空监听 + getPlatformInfo 产生事件重置 idle。
+        try {
+            if (chrome.alarms && !self.__syKeepAliveAlarm) {
+                self.__syKeepAliveAlarm = 1;
+                chrome.alarms.create("syKeepAlive", { periodInMinutes: 0.4 });
+                chrome.alarms.onAlarm.addListener(function () {
+                    try { chrome.runtime.getPlatformInfo(function () {}); } catch (e) {}
+                });
+            }
+        } catch (e) {}
         // 0b) 消息归一（垫片统一兼容点）：SW 侧部分扩展 handler 对可选字段无
         //     保护（实测 TM loadTree：referrer 缺失 → pd.level(undefined) 抛
         //     "Cannot read properties of undefined (reading 'replace')" →
