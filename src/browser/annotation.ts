@@ -119,7 +119,7 @@ export class AnnotationController {
         private i18n: Record<string, string>,
         private getSettings: () => BrowserSettings,
     ) {
-        // 轻量浮动窗（独立 OS 窗）经 BroadcastChannel 回传颜色/标签/编辑请求
+        // 轻量浮动窗（独立 OS 窗）经 BroadcastChannel 回传颜色/标签/编辑/保存批注/移动请求
         try {
             this.floatChannel = new BroadcastChannel("sy-ann-float");
             this.floatChannel.onmessage = (ev: MessageEvent) => {
@@ -130,12 +130,18 @@ export class AnnotationController {
                 else if (m.type === "goto" && m.id) this.gotoAnnotation(String(m.id), String(m.url || ""));
                 else if (m.type === "createPage") this.createPageFromFloat(String(m.url || ""));
                 else if (m.type === "openDoc") void this.openDoc(String(m.url || ""));
-                else if (m.id && (m.type === "pin" || m.type === "hide" || m.type === "resize" || m.type === "close")) {
+                else if (m.type === "saveNote" && m.id) void this.saveNoteFromFloat(String(m.id), String(m.note ?? ""));
+                else if (m.id && (m.type === "pin" || m.type === "hide" || m.type === "resize" || m.type === "move" || m.type === "close")) {
                     const w = this.floatWins.get(String(m.id));
                     if (!w || w.isDestroyed()) return;
                     if (m.type === "pin") w.setAlwaysOnTop(!!m.value);
                     else if (m.type === "hide") w.hide();
                     else if (m.type === "resize") w.setSize(Number(m.w) || 380, Number(m.h) || 340);
+                    else if (m.type === "move") {
+                        // 标题栏手动拖动（弹窗页 pointer capture + rAF 节流）
+                        const nx = Number(m.x), ny = Number(m.y);
+                        if (Number.isFinite(nx) && Number.isFinite(ny)) w.setPosition(nx, ny);
+                    }
                     else if (m.type === "close") w.close();
                 }
             };
@@ -184,6 +190,45 @@ export class AnnotationController {
             openWindow({ doc: { id: found.item.noteId }, width: 560, height: 480, alwaysOnTop: true });
         } catch (e) {
             console.warn("[browser-plugin] annotation openEdit failed:", e);
+        }
+    }
+
+    /**
+     * 悬浮弹窗「简单编辑」：批注文本就地编辑，写回思源批注块并同步页内小字。
+     * 新结构批注块是嵌套列表项（必须用列表语法更新）；旧结构页面级锚点=段落本身；
+     * 清空批注 = 恢复创建时的占位空块。
+     */
+    private async saveNoteFromFloat(id: string, note: string): Promise<void> {
+        const ack = (ok: boolean, text?: string) => this.floatChannel?.postMessage({ type: "noteSaved", id, ok, note: text });
+        try {
+            const found = this.findItem(id);
+            if (!found) { ack(false); return; }
+            const { urlKey, item } = found;
+            const text = String(note || "").replace(/\r/g, "").trim();
+            const target = item.noteId || (!item.quote ? item.anchorBlockId || "" : "");
+            if (!target) {
+                showMessage(this.i18n.annotationNoDoc || "该标注缺少批注块，请在思源中编辑", 3000, "error");
+                ack(false);
+                return;
+            }
+            const q: any = await fetchSyncPost("/api/query/sql", { stmt: "SELECT type FROM blocks WHERE id='" + target.replace(/'/g, "''") + "'" });
+            const btype = String(q?.data?.[0]?.type || "");
+            // 段内换行 → kramdown 硬换行（保持单块）；空批注恢复占位空块
+            const md = text.replace(/\n/g, "  \n");
+            let data = text ? md : " ";
+            if (btype === "i") data = text ? "- " + md : "- ";
+            const r: any = await fetchSyncPost("/api/block/updateBlock", { id: target, dataType: "markdown", data });
+            if (r?.code !== 0) throw new Error(r?.msg || "updateBlock failed");
+            item.note = text;
+            ack(true, text);
+            const wv = this.webviews.get(urlKey);
+            if (wv) {
+                wv.executeJavaScript("window.__syAnnSetNotes && window.__syAnnSetNotes(" + JSON.stringify([item]) + ");").catch(() => {});
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] annotation saveNote failed:", e);
+            showMessage((this.i18n.annotationFailed || "保存批注失败") + ": " + (e as any)?.message, 3000, "error");
+            ack(false);
         }
     }
 
@@ -631,8 +676,9 @@ export class AnnotationController {
                         if (!noteId) noteId = String(nxt.id || "");
                     }
                 } else if (row.type === "p") {
-                    // 旧结构页面级：锚点段落自身即批注
+                    // 旧结构页面级：锚点段落自身即批注（noteId 指向该段，供就地编辑/在思源编辑）
                     note = String(row.content || "");
+                    if (!noteId) noteId = String(row.id || "");
                 }
                 items.push({
                     id: String(anchor.id || row.id),
