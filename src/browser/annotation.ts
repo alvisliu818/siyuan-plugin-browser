@@ -69,7 +69,7 @@ const ANN_CSS = `
 .sy-ann-bubble{position:fixed!important;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;}
 .sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}
 .sy-ann-bubble .sy-ann-create{background:#1a73e8;color:#fff;font-weight:600;}
-.sy-ann-pop{position:fixed!important;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.25);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;}
+.sy-ann-pop{position:fixed!important;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border:none!important;outline:none;border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.18);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;}
 .sy-ann-pop-quote{font-size:12px;color:#666;border-left:3px solid #f5c542;padding-left:8px;margin-bottom:6px;white-space:pre-wrap;}
 .sy-ann-pop-note{white-space:pre-wrap;}
 .sy-ann-pop-empty{color:#999;font-style:italic;}
@@ -94,6 +94,12 @@ const ANN_CSS = `
 .sy-ann-taginput{font-size:12px;border:1px solid #ddd;border-radius:4px;padding:2px 6px;width:110px;}
 .sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}
 .sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}
+.sy-ann-pop-bar{display:flex;align-items:center;gap:4px;margin:-4px -4px 6px;padding:2px 4px;cursor:move;user-select:none;}
+.sy-ann-pop-bar .t{flex:1;font-size:11px;color:#999;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+.sy-ann-pop-bar button{border:none;background:transparent;cursor:pointer;font-size:13px;padding:1px 5px;border-radius:4px;color:#666;}
+.sy-ann-pop-bar button:hover{background:#eee;}
+.sy-ann-pop-bar button.on{color:#1a73e8;background:#dbeafe;}
+.sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}
 @keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}
 .sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}
 `;
@@ -104,6 +110,8 @@ export class AnnotationController {
     private popupUrl: string | null = null;
     /** urlKey → webview，供元数据变更后回刷页内高亮/小字 */
     private webviews = new Map<string, IWebviewTag>();
+    /** 标注 id → 浮动窗（复用，避免悬浮/点击重复弹窗） */
+    private floatWins = new Map<string, any>();
     private floatChannel: BroadcastChannel | null = null;
 
     constructor(
@@ -122,6 +130,14 @@ export class AnnotationController {
                 else if (m.type === "goto" && m.id) this.gotoAnnotation(String(m.id), String(m.url || ""));
                 else if (m.type === "createPage") this.createPageFromFloat(String(m.url || ""));
                 else if (m.type === "openDoc") void this.openDoc(String(m.url || ""));
+                else if (m.id && (m.type === "pin" || m.type === "hide" || m.type === "resize" || m.type === "close")) {
+                    const w = this.floatWins.get(String(m.id));
+                    if (!w || w.isDestroyed()) return;
+                    if (m.type === "pin") w.setAlwaysOnTop(!!m.value);
+                    else if (m.type === "hide") w.hide();
+                    else if (m.type === "resize") w.setSize(Number(m.w) || 380, Number(m.h) || 340);
+                    else if (m.type === "close") w.close();
+                }
             };
         } catch {}
     }
@@ -172,7 +188,7 @@ export class AnnotationController {
     }
 
     /** 点击高亮 → 轻量浮动窗（独立 OS 窗：快、可多开、可拖出思源边界、可固定） */
-    openFloat(webview: IWebviewTag, url: string, payload: { id?: string; x?: number; y?: number }): void {
+    openFloat(webview: IWebviewTag, url: string, payload: { id?: string; x?: number; y?: number; hover?: boolean }): void {
         try {
             const urlKey = AnnotationStore.normalizeKey(url);
             this.webviews.set(urlKey, webview);
@@ -182,19 +198,42 @@ export class AnnotationController {
             const data = {
                 id: item.id, quote: item.quote, note: item.note,
                 color: item.color || "yellow", tags: item.tags || [], url,
+                hover: !!payload?.hover,
             };
             const remote = (window as any).require?.("@electron/remote");
             if (!remote?.BrowserWindow) return;
+            // 光标处屏幕坐标（guest 视口坐标 + webview 偏移 + 宿主窗口屏幕位置）
+            const wr = webview.getBoundingClientRect();
+            const sx = Math.max(0, Math.min(Math.round(window.screenX + wr.left + (payload?.x || 0) + 12), (window.screen.availWidth || 1920) - 390));
+            const sy = Math.max(0, Math.min(Math.round(window.screenY + wr.top + (payload?.y || 0) + 12), (window.screen.availHeight || 1080) - 350));
+            const exist = this.floatWins.get(item.id);
+            if (exist && !exist.isDestroyed()) {
+                exist.__syAutoHide = !!payload?.hover;
+                this.floatChannel?.postMessage({ type: "autohide", id: item.id, value: !!payload?.hover });
+                exist.setPosition(sx, sy);
+                exist.show();
+                exist.focus();
+                return;
+            }
             const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
             const win = new remote.BrowserWindow({
-                width: 380, height: 340, frame: false, transparent: false,
+                width: 380, height: 340, x: sx, y: sy,
+                frame: true, titleBarStyle: "hidden", resizable: true,
                 alwaysOnTop: false, skipTaskbar: true,
                 webPreferences: { nodeIntegration: true, contextIsolation: false },
             });
+            win.__syAutoHide = !!payload?.hover;
+            this.floatWins.set(item.id, win);
+            win.on("closed", () => this.floatWins.delete(item.id));
             win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
         } catch (e) {
             console.warn("[browser-plugin] annotation openFloat failed:", e);
         }
+    }
+
+    /** 鼠标离开高亮 → 通知悬浮浮动窗（未固定且鼠标不在窗内时自动收起） */
+    notifyMarkLeave(id: string): void {
+        this.floatChannel?.postMessage({ type: "markleave", id });
     }
 
     /** 地址栏 ✎ 菜单「本页标注列表」→ 轻量浮动窗列出本页全部标注（可固定、点条目跳转） */
@@ -206,17 +245,26 @@ export class AnnotationController {
             let items = this.pageCache.get(urlKey);
             const page = this.store.find(urlKey);
             if (!items && page?.docId) items = await this.fetchAnnotations(page.docId);
+            const listKey = "list:" + urlKey;
             const data = {
-                mode: "list", url,
+                mode: "list", url, listKey,
                 items: (items || []).map((i) => ({ id: i.id, quote: i.quote, note: i.note, color: i.color || "yellow", tags: i.tags || [] })),
             };
             const remote = (window as any).require?.("@electron/remote");
             if (!remote?.BrowserWindow) return;
+            const exist = this.floatWins.get(listKey);
+            if (exist && !exist.isDestroyed()) {
+                exist.show();
+                exist.focus();
+                return;
+            }
             const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
             const win = new remote.BrowserWindow({
-                width: 400, height: 440, frame: false, skipTaskbar: true,
+                width: 400, height: 440, frame: true, titleBarStyle: "hidden", resizable: true, skipTaskbar: true,
                 webPreferences: { nodeIntegration: true, contextIsolation: false },
             });
+            this.floatWins.set(listKey, win);
+            win.on("closed", () => this.floatWins.delete(listKey));
             win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
         } catch (e) {
             console.warn("[browser-plugin] annotation openListFloat failed:", e);

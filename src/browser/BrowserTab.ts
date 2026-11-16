@@ -215,6 +215,9 @@ export class BrowserTab {
                 onAnnMeta: (payload: { id?: string; color?: string; tags?: string[] }) => {
                     void this.annotation?.applyMeta(payload);
                 },
+                onAnnHoverEnd: (payload: { id?: string }) => {
+                    this.annotation?.notifyMarkLeave(String(payload?.id || ""));
+                },
                 onEdgeInstall: (id: string, source: string) =>
                     this.deps.installEdgeExtension?.(id, source) ?? Promise.resolve(),
                 onProcessGone: (reason: string) => {

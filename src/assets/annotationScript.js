@@ -19,7 +19,7 @@
         ".sy-ann-bubble{position:fixed;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;}",
         ".sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}",
         ".sy-ann-bubble .sy-ann-create{background:#1a73e8;color:#fff;font-weight:600;}",
-        ".sy-ann-pop{position:fixed;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,.25);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;}",
+        ".sy-ann-pop{position:fixed;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border:none;outline:none;border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.18);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;}",
         ".sy-ann-pop-quote{font-size:12px;color:#666;border-left:3px solid #f5c542;padding-left:8px;margin-bottom:6px;white-space:pre-wrap;}",
         ".sy-ann-pop-note{white-space:pre-wrap;}",
         ".sy-ann-pop-empty{color:#999;font-style:italic;}",
@@ -44,6 +44,12 @@
         ".sy-ann-taginput{font-size:12px;border:1px solid #ddd;border-radius:4px;padding:2px 6px;width:110px;}",
         ".sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}",
         ".sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}",
+        ".sy-ann-pop-bar{display:flex;align-items:center;gap:4px;margin:-4px -4px 6px;padding:2px 4px;cursor:move;user-select:none;}",
+        ".sy-ann-pop-bar .t{flex:1;font-size:11px;color:#999;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}",
+        ".sy-ann-pop-bar button{border:none;background:transparent;cursor:pointer;font-size:13px;padding:1px 5px;border-radius:4px;color:#666;}",
+        ".sy-ann-pop-bar button:hover{background:#eee;}",
+        ".sy-ann-pop-bar button.on{color:#1a73e8;background:#dbeafe;}",
+        ".sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}",
         "@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}",
         ".sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}"
     ].join("");
@@ -242,6 +248,8 @@
     var COLORS = ["yellow", "green", "blue", "pink", "purple"];
     var bubbleColor = "yellow";
     var inlineVisible = true;
+    var popDrag = false;      // 拖拽/缩放进行中：不收起小窗
+    var suppressClick = false; // 拖拽结束的 click 不当作「点别处」
     var popHideTimer = null;
     function cancelPopHide() { if (popHideTimer) { clearTimeout(popHideTimer); popHideTimer = null; } }
     // 移开宽限：鼠标离开高亮后延迟收起，留出移入小窗点按钮的时间
@@ -271,8 +279,45 @@
             if (!b) return;
             e.stopPropagation();
             var act = b.getAttribute("data-ann-act");
+            if (act === "pin") { popPinned = !popPinned; b.classList.toggle("on", popPinned); return; }
             if (act === "edit") { hidePop(true); window.__syAnnOpen = { id: id, x: 0, y: 0, edit: true }; }
             else if (act === "close") { hidePop(true); }
+        });
+        // 拖拽移动（标题栏，transform 合成层免每帧布局）+ 右下角缩放
+        p.addEventListener("mousedown", function (e) {
+            var onBtn = e.target.closest ? e.target.closest("button") : null;
+            var bar = e.target.closest ? e.target.closest(".sy-ann-pop-bar") : null;
+            var rz = e.target.closest ? e.target.closest(".sy-ann-pop-resize") : null;
+            if (bar && !onBtn) {
+                e.preventDefault();
+                popDrag = true; suppressClick = true; cancelPopHide();
+                var sx = e.clientX, sy = e.clientY;
+                var mv = function (ev) { p.style.transform = "translate(" + (ev.clientX - sx) + "px," + (ev.clientY - sy) + "px)"; };
+                var up = function (ev) {
+                    document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+                    var r0 = p.getBoundingClientRect();
+                    p.style.transform = "";
+                    var nx = Math.round(r0.left), ny = Math.round(r0.top);
+                    p.style.left = nx + "px"; p.style.top = ny + "px";
+                    setPos("sy-ann-pop", nx, ny);
+                    popDrag = false;
+                };
+                document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+            } else if (rz) {
+                e.preventDefault(); e.stopPropagation();
+                popDrag = true; suppressClick = true; cancelPopHide();
+                var sx2 = e.clientX, sy2 = e.clientY;
+                var r1 = p.getBoundingClientRect();
+                var w0 = r1.width, h0 = r1.height;
+                var mv2 = function (ev) {
+                    var w = Math.max(220, Math.min(window.innerWidth - 20, w0 + ev.clientX - sx2));
+                    var h = Math.max(120, Math.min(window.innerHeight - 20, h0 + ev.clientY - sy2));
+                    p.style.maxWidth = "none"; p.style.maxHeight = "none";
+                    p.style.width = w + "px"; p.style.height = h + "px";
+                };
+                var up2 = function () { document.removeEventListener("mousemove", mv2); document.removeEventListener("mouseup", up2); popDrag = false; };
+                document.addEventListener("mousemove", mv2); document.addEventListener("mouseup", up2);
+            }
         });
         p.addEventListener("keydown", function (e) {
             if (e.key === "Enter" && e.target.classList && e.target.classList.contains("sy-ann-taginput")) {
@@ -307,7 +352,9 @@
 
     function renderPopBody(p, ann) {
         var note = String(ann.note || "").trim();
-        var html = "";
+        var html = '<div class="sy-ann-pop-bar"><span class="t">标注</span>' +
+            '<button data-ann-act="pin" class="' + (popPinned ? "on" : "") + '" title="固定（点别处不消失）">📌</button>' +
+            '<button data-ann-act="close" title="关闭">×</button></div>';
         if (ann.quote) html += '<div class="sy-ann-pop-quote">' + esc(ann.quote) + "</div>";
         html += note ? '<div class="sy-ann-pop-note">' + esc(note) + "</div>" : '<div class="sy-ann-pop-empty">（无批注）</div>';
         html += '<div class="sy-ann-swatches">';
@@ -322,6 +369,7 @@
         html += '<input class="sy-ann-taginput" placeholder="+标签(回车)" />';
         html += "</div>";
         html += '<div class="sy-ann-pop-actions"><button data-ann-act="edit">在思源编辑</button><button data-ann-act="close">关闭</button></div>';
+        html += '<div class="sy-ann-pop-resize" title="拖动缩放"></div>';
         p.innerHTML = html;
     }
 
@@ -346,34 +394,42 @@
         if (p) layerHide(p);
     }
 
-    // 悬浮高亮/内联小字 → 轻量小窗
+    // 悬浮停留 300ms → 开/复用 OS 浮动窗（可移出页面/思源边界）;移开取消停留计时
+    var hoverT = null;
     document.addEventListener("mouseover", function (e) {
         var m = e.target.closest ? e.target.closest(".sy-ann-hl,.sy-ann-inline") : null;
-        if (!m || popPinned) return;
+        if (!m) return;
         var id = m.getAttribute("data-ann-id");
-        var cur = document.getElementById("sy-ann-pop");
-        if (cur && cur.style.display !== "none" && cur.getAttribute("data-ann-id") === String(id)) { cancelPopHide(); return; }
-        var ann = findAnn(id);
-        if (ann) showPop(ann, e.clientX, e.clientY, false);
+        var x = e.clientX, y = e.clientY;
+        if (hoverT) clearTimeout(hoverT);
+        hoverT = setTimeout(function () {
+            hoverT = null;
+            window.__syAnnOpen = { id: id, x: Math.round(x), y: Math.round(y), hover: true };
+        }, 300);
     }, true);
     document.addEventListener("mouseout", function (e) {
         var m = e.target.closest ? e.target.closest(".sy-ann-hl,.sy-ann-inline") : null;
-        if (!m || popPinned || popHover) return;
-        var to = e.relatedTarget;
-        if (to && to.closest && to.closest("#sy-ann-pop")) return;
-        schedulePopHide();
+        if (!m) return;
+        if (hoverT) { clearTimeout(hoverT); hoverT = null; }
+        window.__syAnnHoverEnd = { id: m.getAttribute("data-ann-id") };
     }, true);
 
     // 点击高亮/内联小字 → 固定快速小窗（不开思源窗口）;「在思源编辑」按钮才开。点别处收起
     document.addEventListener("click", function (e) {
+        if (suppressClick) { suppressClick = false; return; }
         var inPop = e.target.closest ? e.target.closest("#sy-ann-pop") : null;
         if (inPop) return;
         var m = markAtPoint(e.clientX, e.clientY);
-        if (!m) { hidePop(true); return; }
+        if (!m) { hidePop(); return; }
         e.preventDefault();
         e.stopImmediatePropagation();
-        var ann = findAnn(m.getAttribute("data-ann-id"));
-        if (ann) showPop(ann, e.clientX, e.clientY, true);
+        hidePop(true);
+        // 点击开 OS 浮动窗（可拖出页面/思源边界、缩放、固定）;悬浮才是页内预览
+        window.__syAnnOpen = {
+            id: m.getAttribute("data-ann-id"),
+            x: Math.round(e.clientX),
+            y: Math.round(e.clientY),
+        };
     }, true);
 
     // ===== 选区悬浮小气泡 =====

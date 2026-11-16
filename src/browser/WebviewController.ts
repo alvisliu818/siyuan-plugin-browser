@@ -34,6 +34,8 @@ export class WebviewController {
         onAnnOpen?: (payload: { id?: string; x?: number; y?: number }) => void;
         /** 页内小窗改颜色/标签 → 宿主持久化（guest 轮询通道） */
         onAnnMeta?: (payload: { id?: string; color?: string; tags?: string[] }) => void;
+        /** 鼠标离开高亮 → 通知悬浮浮动窗自动收起（未固定时） */
+        onAnnHoverEnd?: (payload: { id?: string }) => void;
         /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
         /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
@@ -789,7 +791,7 @@ export class WebviewController {
             } catch { return; }
             try {
                 this.webview
-                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null})")
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null, h: window.__syAnnHoverEnd || null})")
                     .then((r: any) => {
                         if (r && r.t) {
                             this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
@@ -806,6 +808,9 @@ export class WebviewController {
                         } else if (r && r.m) {
                             this.webview.executeJavaScript("window.__syAnnMeta = null").catch(() => {});
                             this.callbacks.onAnnMeta?.(r.m);
+                        } else if (r && r.h) {
+                            this.webview.executeJavaScript("window.__syAnnHoverEnd = null").catch(() => {});
+                            this.callbacks.onAnnHoverEnd?.(r.h);
                         }
                     })
                     .catch(() => {});

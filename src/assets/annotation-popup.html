@@ -4,8 +4,9 @@
 <meta charset="utf-8">
 <title>标注</title>
 <style>
-  html,body{margin:0;height:100%;font-family:sans-serif;font-size:13px;color:#222;background:#fff;}
-  #bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#f5f5f5;border-bottom:1px solid #e0e0e0;-webkit-app-region:drag;user-select:none;}
+  html{margin:0;height:100%;background:transparent;}
+  body{margin:0;height:100%;font-family:sans-serif;font-size:13px;color:#222;background:#fff;border-radius:10px;overflow:hidden;box-sizing:border-box;}
+  #bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#f5f5f5;border-bottom:1px solid #e0e0e0;-webkit-app-region:drag;user-select:none;border-radius:10px 10px 0 0;}
   #bar .t{flex:1;font-weight:600;font-size:12px;color:#555;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
   #bar button{-webkit-app-region:no-drag;border:none;background:transparent;cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px;color:#555;}
   #bar button:hover{background:#e0e0e0;}
@@ -39,6 +40,7 @@
   .dot-blue{background:rgba(120,180,255,.9);} .dot-pink{background:rgba(255,150,200,.9);}
   .dot-purple{background:rgba(190,140,255,.9);}
   .lempty{color:#999;font-style:italic;padding:12px 0;}
+  #resize{position:fixed;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;-webkit-app-region:no-drag;z-index:9;}
 </style>
 </head>
 <body>
@@ -48,16 +50,38 @@
   <button id="close" title="关闭">×</button>
 </div>
 <div id="body"></div>
+<div id="resize" title="拖动缩放"></div>
 <script>
 (function () {
   var data = {};
   try { data = JSON.parse(decodeURIComponent(location.hash.slice(1) || "{}")); } catch (e) {}
+  if (!data.id && data.listKey) data.id = data.listKey;
   var COLORS = ["yellow", "green", "blue", "pink", "purple"];
   var color = data.color || "yellow";
   var tags = (data.tags || []).slice();
   var pinned = false;
   var chan = null;
   try { chan = new BroadcastChannel("sy-ann-float"); } catch (e) {}
+  // 悬浮 opened（hover）未固定时：鼠标离开高亮+窗体 → 自动收起;点击 opened 常驻
+  var autoHide = !!data.hover;
+  var hovered = false;
+  var hideT = null;
+  function cancelHide() { if (hideT) { clearTimeout(hideT); hideT = null; } }
+  function scheduleHide() {
+    cancelHide();
+    hideT = setTimeout(function () {
+      hideT = null;
+      if (autoHide && !pinned && !hovered) { if (chan) chan.postMessage({ type: "hide", id: data.id }); }
+    }, 800);
+  }
+  if (chan) chan.onmessage = function (ev) {
+    var m = ev.data || {};
+    if (m.id !== data.id) return;
+    if (m.type === "autohide") { autoHide = !!m.value; if (!autoHide) cancelHide(); }
+    else if (m.type === "markleave") { if (autoHide && !pinned && !hovered) scheduleHide(); }
+  };
+  document.body.addEventListener("mouseenter", function () { hovered = true; cancelHide(); });
+  document.body.addEventListener("mouseleave", function () { hovered = false; if (autoHide && !pinned) scheduleHide(); });
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function send() { if (chan) chan.postMessage({ type: "meta", id: data.id, color: color, tags: tags }); }
   function renderList() {
@@ -103,14 +127,27 @@
     document.getElementById("edit").onclick = function () { if (chan) chan.postMessage({ type: "edit", id: data.id }); };
   }
   render();
-  var remote = null;
-  try { remote = require("@electron/remote"); } catch (e) {}
+  // 窗口操作（固定/关闭/缩放）经 BroadcastChannel 请求宿主执行（浮动窗 webContents
+  // 未启用 @electron/remote，不能直接调 remote）
   document.getElementById("pin").onclick = function () {
     pinned = !pinned;
     this.classList.toggle("on", pinned);
-    try { remote.getCurrentWindow().setAlwaysOnTop(pinned); } catch (e) {}
+    if (pinned) cancelHide();
+    if (chan) chan.postMessage({ type: "pin", id: data.id, value: pinned });
   };
-  document.getElementById("close").onclick = function () { try { remote.getCurrentWindow().close(); } catch (e) { window.close(); } };
+  document.getElementById("close").onclick = function () { if (chan) chan.postMessage({ type: "close", id: data.id }); };
+  // 右下角拖拽缩放（frameless 无原生边框，自定义手柄）
+  document.getElementById("resize").addEventListener("mousedown", function (e) {
+    e.preventDefault();
+    var w0 = window.outerWidth, h0 = window.outerHeight, sx = e.screenX, sy = e.screenY;
+    var pend = null, raf = 0;
+    function mv(ev) {
+      pend = [Math.max(260, w0 + ev.screenX - sx), Math.max(160, h0 + ev.screenY - sy)];
+      if (!raf) raf = requestAnimationFrame(function () { raf = 0; if (pend && chan) chan.postMessage({ type: "resize", id: data.id, w: pend[0], h: pend[1] }); });
+    }
+    function up() { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); }
+    document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+  });
 })();
 </script>
 </body>
