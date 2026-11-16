@@ -577,6 +577,7 @@ class CsPageSession {
     private frameId: string | null = null;
     /** electronId → content 世界 contextId（跑内容脚本） */
     private contentWorlds = new Map<string, number>();
+    private kaTimer: ReturnType<typeof setInterval> | null = null;
     /** electronId → 当前 popup 世界 contextId（每次打开面板新建） */
     private popupWorldByExt = new Map<string, number>();
     /** popup 世界 contextId → electronId（桥调用反查） */
@@ -602,6 +603,10 @@ class CsPageSession {
     }
 
     close(): void {
+        if (this.kaTimer) {
+            clearInterval(this.kaTimer);
+            this.kaTimer = null;
+        }
         for (const [eid, w] of this.swReplyPumps) {
             clearInterval(w.timer);
         }
@@ -708,6 +713,19 @@ class CsPageSession {
         const tree: any = await this.send("Page.getFrameTree");
         // 注意返回结构是 {frameTree: {frame}}，不是 {frame}（取错层级 → frameId 恒 null → sync 静默跳过）
         this.frameId = tree?.frameTree?.frame?.id || tree?.frame?.id || null;
+        this.startKeepAlive();
+    }
+
+    /** MV3 SW keepalive：Electron 未实现 chrome.alarms，改用 CS 世界周期 storage ping。
+     *  storage.onChanged 属 SW 扩展事件，会重置 idle 计时 → SW 不闲置回收 → boot id
+     *  稳定 → VM 不弹「restarted / Reload tab」、列表脚本不划红线。 */
+    private startKeepAlive(): void {
+        if (this.kaTimer) return;
+        this.kaTimer = setInterval(() => {
+            for (const [, ctxId] of this.contentWorlds) {
+                this.evaluateInWorld(ctxId, "try{chrome.storage.local.set({__syKA:Date.now()})}catch(e){}", 5000).catch(() => {});
+            }
+        }, 20000);
     }
 
     private onCdpEvent(method: string, params: any): void {
