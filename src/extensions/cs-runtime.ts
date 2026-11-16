@@ -140,14 +140,14 @@ export async function evalInSwByElectronId(electronId: string, expr: string): Pr
  *  - msg.top=1 → src.top（kTop，主框架；跳过 handleCommandMessage 的 src.tab=false 分支）
  *  - src.tab={id:1,url}（SetPopup 取 tabId 建缓存键 SetPopup1，与垫片 tabs.query 固定 id 对齐）
  *  - src.frameId=0（augmentSetPopup 以 src[kFrameId] 为缓存子键，popup 读 [0]） */
-/** 返回首发（feed tab + GetMoreIds + SetPopup 填缓存）完成的 promise：
- *  调用方（openExtensionPopup）必须等它落地再开面板 —— 冷 SW 上 SW 唤醒+VM
- *  init 可达数秒，popup 页 get-data.js 的 BGDATA fetch 会抢先，__syLastFedTab
- *  和 SetPopup 缓存都没就位 → "cannot run" + 空列表（首启实测复现）。
- *  后续补打（ERR_ABORTED 重载覆盖）不包含在内，仍 fire-and-forget。 */
-export function precacheSetPopupForPopup(electronId: string, pageUrl: string): Promise<void> {
+/** 返回「是否真拿到匹配脚本（ids>0）」的 promise：调用方（openExtensionPopup）
+ *  等它落地再开面板，面板首拉即命中 SetPopup 缓存（VM 缓存 pop-on-read，先开面板
+ *  再重载补拉会与缓存填充竞态）。冷 SW 上 VM 脚本库（内存 $r）异步加载，首发可能
+ *  ids=0（库未就位），内部重试到 ids>0 或 10s 限时;false（确无匹配或 SW 挂死）时
+ *  调用方限时兜底先开面板、落地后再补拉。后续补打（ERR_ABORTED 重载覆盖）fire-and-forget。 */
+export function precacheSetPopupForPopup(electronId: string, pageUrl: string): Promise<boolean> {
     try {
-        if (!manager || !electronId || !pageUrl || !/^https?:/i.test(pageUrl)) return Promise.resolve();
+        if (!manager || !electronId || !pageUrl || !/^https?:/i.test(pageUrl)) return Promise.resolve(false);
         const fire = async (first: boolean): Promise<string> => {
             try {
                 // 三步链（对齐真 Chrome 冷启动时序：prefetchSetPopup → 页面 SetPopup）：
@@ -211,10 +211,11 @@ export function precacheSetPopupForPopup(electronId: string, pageUrl: string): P
                 return "err:" + String(e?.message || e);
             }
         };
-        // 首发重试循环：冷 SW 上 VM init 未完成时 handlers 还没注册（首发拿
-        // "nohandlers" 立即返回）→ 调用方放行面板 → popup 页 BGDATA fetch 抢跑
-        // → "cannot run" + 空列表（完整重启首点实测竞态）。必须重试到数据真正
-        // 就位（"ok ids="）再 resolve，面板打开时序以本 promise 为准。
+        // 数据就位判定：只有真拿到匹配脚本（ids>0）才算就位。ids=0 不能当就位——
+        // 冷 SW 上 VM handlers 已注册但脚本库（内存 $r）尚未从 storage 加载完时
+        // GetMoreIds 现算返回空，若此时 resolve，调用方会带空缓存开面板 → 间歇空
+        // 列表（原 bug）。ids=0 持续重试给 VM 加载窗口;调用方等本 promise 落地再开
+        // 面板，首拉即命中缓存，避免先开后补拉与 pop-on-read 缓存竞态。
         const firstP = (async () => {
             const deadline = Date.now() + 10_000;
             let first = true;
@@ -222,10 +223,10 @@ export function precacheSetPopupForPopup(electronId: string, pageUrl: string): P
             while (Date.now() < deadline) {
                 res = await fire(first);
                 first = false;
-                if (/^ok ids=/.test(res)) break;
+                if (/^ok ids=[1-9]/.test(res)) return true;
                 await new Promise((r) => setTimeout(r, 600));
             }
-            return res;
+            return false;
         })();
         // 数据就位后的补打：popup webview ERR_ABORTED 重载后 get-data.js 会重新
         // fetch（cache.pop 又空了），补打保证任一次文档加载都拿得到缓存
@@ -233,9 +234,9 @@ export function precacheSetPopupForPopup(electronId: string, pageUrl: string): P
             let n = 0;
             const t = setInterval(() => { void fire(false); if (++n >= 5) clearInterval(t); }, 600);
         });
-        return firstP.then(() => {});
+        return firstP;
     } catch {}
-    return Promise.resolve();
+    return Promise.resolve(false);
 }
 
 export function ensureCsRuntime(webview: IWebviewTag): void {

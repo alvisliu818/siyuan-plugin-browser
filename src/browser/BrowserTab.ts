@@ -1306,15 +1306,17 @@ export class BrowserTab {
             });
             this.extPopup.installGlobalListeners();
         }
-        // popup 打开前置：先填 VM 的 SetPopup 缓存（真 Chrome 由 webRequest
-        // prefetch 触发，垫片无此事件 → popup 脚本列表恒空），必须在 popup 页
-        // get-data.js 请求前完成。precache 内部会重试到数据真正就位（冷 SW +
-        // VM init 可达数秒），这里放宽限时只为 SW 彻底挂死时面板仍能打开。
-        // 数据若迟到（8s 限时超时）：落地时重载面板文档重拉数据 —— 列表
-        // 无条件最终一致显示，不依赖任何时序运气。
+        // popup 数据前置：填 VM 的 SetPopup 缓存（真 Chrome 由 webRequest prefetch
+        // 触发，垫片无此事件 → 不填则 popup 脚本列表恒空）。precache 异步重试到真
+        // 拿到匹配脚本（ids>0），面板不等它先行打开，数据就位后一次性补拉重载 ——
+        // 列表最终一致显示，不依赖时序运气，也不让冷 SW 把面板卡在打开前。
         if (ext.electronId) {
             const pp = precacheSetPopupForPopup(ext.electronId, String(this.webview.getURL?.() || ""));
-            const ready = await Promise.race([pp.then(() => true), new Promise((r2) => setTimeout(() => r2(false), 8000))]);
+            // 等真拿到匹配脚本（ids>0）再开面板：VM 的 SetPopup 缓存 pop-on-read，
+            // 先开面板再重载补拉会与缓存填充竞态（面板振荡/间歇空列表）。数据就位后
+            // 再开，面板首拉即命中缓存，稳定无闪烁；冷 SW 限时 8s 兜底（SW 挂死仍能开，
+            // 落地后再补拉）。ids=0 不算就位（冷 SW 脚本库未加载完），precache 内部重试。
+            const ready = await Promise.race([pp, new Promise((r2) => setTimeout(() => r2(false), 8000))]);
             this.extPopup.open({
                 extId,
                 anchorRect: { right: r.right, bottom: r.bottom },
@@ -1335,8 +1337,8 @@ export class BrowserTab {
                 },
             });
             if (!ready) {
-                void pp.then(() => {
-                    if (this.extPopup?.isOpenFor(extId)) this.extPopup.refreshForData();
+                void pp.then((gotData) => {
+                    if (gotData && this.extPopup?.isOpenFor(extId)) this.extPopup.refreshForData();
                 });
             }
             return;

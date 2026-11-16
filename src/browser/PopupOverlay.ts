@@ -50,6 +50,7 @@ export class ExtensionPopupOverlay {
     private userAgent: string | undefined;
     private openExtId: string | null = null;   // 当前打开的扩展（null = 无 popup 显示）
     private openRequested = false;             // 已请求注入（等 dom-ready）
+    private injectRetries = 0;                 // 导航竞态注入重试计数（open 时重置）
     private docReady = false;                  // guest 文档就绪（about:blank 加载完成）
     private activeOpts: PopupOpenOptions | null = null;
     private navRetries = 0;                    // 原生源导航重试计数（>8 = 放弃走兜底）
@@ -267,6 +268,7 @@ export class ExtensionPopupOverlay {
         // 假象，真实路径是 pages/popup.html）。原生失败时由 injectNow 按 URL
         // 降级到 about:blank 重建路径。
         this.openRequested = true;
+        this.injectRetries = 0;
         this.docReady = false;
         const extUrl = "chrome-extension://" + opts.electronId + "/" + String(opts.popupPath).replace(/^\.\//, "");
         const curUrl = (() => { try { return this.vw!.getURL?.() || ""; } catch { return ""; } })();
@@ -372,9 +374,14 @@ export class ExtensionPopupOverlay {
                 },
             });
             if (!out.ok) {
+                // 导航竞态：dom-ready 触发注入时文档仍在导航（reload/重开），CDP
+                // 会话报 "Inspected target navigated or closed" → 注入失败 → 面板
+                // 无消息桥 → 脚本列表空。不直接关面板，等文档稳定后重试注入。
+                if (this.scheduleInjectRetry(opts.extId)) return;
                 this.onErrorCb(`打开「${opts.name}」面板失败: ${out.error}`);
                 this.close();
             } else {
+                this.injectRetries = 0;
                 // popup 页原生扩展 API 补丁（主世界，扩展文档就位后）：
                 // 1) 消费 lastError —— VM 面板经原生 chrome.tabs.sendMessage 通知页签，
                 //    页签接收端在自建世界（原生 content script 已清空）→ 原生恒置
@@ -404,9 +411,26 @@ export class ExtensionPopupOverlay {
                 }, 400);
             }
         } catch (e) {
+            if (this.scheduleInjectRetry(opts.extId)) return;
             this.onErrorCb(`打开「${opts.name}」面板失败: ${e instanceof Error ? e.message : e}`);
             this.close();
         }
+    }
+
+    /** 注入因导航竞态失败时的重试调度：面板仍开着且未超重试上限 → 延迟一拍
+     *  （等导航稳定）重新置 openRequested 走 injectNow;否则返回 false 由调用方
+     *  报错关面板。重开/reload 的 dom-ready 可能早于文档真正稳定，首注入撞
+     *  "Inspected target navigated or closed"，重试一次即落在稳定文档上。 */
+    private scheduleInjectRetry(extId: string): boolean {
+        if (!this.isOpenFor(extId) || this.injectRetries >= 5) return false;
+        this.injectRetries++;
+        const delay = 400 * this.injectRetries;
+        setTimeout(() => {
+            if (!this.isOpenFor(extId)) return;
+            this.openRequested = true;
+            void this.injectNow();
+        }, delay);
+        return true;
     }
 
     /** 数据迟到补拉：面板已打开但数据未就位（precache 落地晚于 open）时

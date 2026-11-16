@@ -617,15 +617,26 @@ export class ExtensionHost {
         try {
             if (chrome.runtime && chrome.runtime.onMessage && !chrome.runtime.onMessage.__syWrapped) {
                 var omFns = [];
-                var omWrapped = {
-                    addListener: function (fn) { if (typeof fn === "function") omFns.push(fn); },
-                    removeListener: function (fn) { var i = omFns.indexOf(fn); if (i >= 0) omFns.splice(i, 1); },
-                };
-                Object.defineProperty(chrome.runtime, "onMessage", {
-                    configurable: true,
-                    get: function () { return omWrapped; },
-                });
-                omWrapped.__syWrapped = true;
+                // 保留原生 onMessage 事件对象与派发：扩展页（popup）主世界走原生
+                // runtime.sendMessage 直达 SW，若把事件整个替换成只收集不派发的
+                // 对象，原生消息无人接 → 面板重开空列表。这里只包装 addListener/
+                // removeListener 顺带收集 handler（供 storage 路由/宿主直调复用），
+                // 原生 addListener 仍注册到真实事件，native 派发不丢。
+                var realOM = chrome.runtime.onMessage;
+                var origAdd = typeof realOM.addListener === "function" ? realOM.addListener.bind(realOM) : null;
+                var origRem = typeof realOM.removeListener === "function" ? realOM.removeListener.bind(realOM) : null;
+                if (origAdd) {
+                    realOM.addListener = function (fn) {
+                        if (typeof fn === "function" && omFns.indexOf(fn) < 0) omFns.push(fn);
+                        return origAdd(fn);
+                    };
+                    realOM.removeListener = function (fn) {
+                        var i = omFns.indexOf(fn);
+                        if (i >= 0) omFns.splice(i, 1);
+                        return origRem ? origRem(fn) : undefined;
+                    };
+                }
+                realOM.__syWrapped = true;
                 self.__syOnMessageHandlers = omFns;
                 if (chrome.storage && chrome.storage.onChanged) {
                     chrome.storage.onChanged.addListener(function (changes, area) {
