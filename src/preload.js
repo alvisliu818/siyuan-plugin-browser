@@ -106,6 +106,19 @@
                     }
                 },
             );
+            // 扩展弹窗关闭桥：弹窗 overlay 的外部点击监听在宿主文档上，
+            // 而 webview 内的鼠标事件不会冒泡到宿主 DOM —— 点页面内容
+            // （弹窗外的页面区域）时宿主无感知，弹窗永远关不掉。
+            // 这里把 mousedown 通知宿主（弹窗 overlay 自己的 webview 不走
+            // WebviewController 的 ipc-message 监听，点弹窗内部不会误关）。
+            // 注意必须限 http/https 页：扩展页面和弹窗自身不发。
+            try {
+                if (/^https?:\/\//i.test(location.href)) {
+                    document.addEventListener("mousedown", function () {
+                        try { ipcRenderer.sendToHost("sy-guest-mousedown"); } catch (e) {}
+                    }, true);
+                }
+            } catch (e) {}
             // 扩展页 localStorage 回灌通道：overlay 的模拟扩展文档跑在 about:blank
             // （不透明源）上，localStorage 被原生拒绝，guest 里的垫片（POPUP_JS_PRELUDE）
             // 写入后经此把快照回灌宿主页持久化。仅 about:blank 主帧暴露 —— 真实站点

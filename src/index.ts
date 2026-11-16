@@ -97,6 +97,16 @@ export default class BrowserPlugin extends Plugin {
         // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
         (window as any).browserPlugin = this;
 
+        // ★ preload 路径必须同步可得：Electron webview 的 preload 属性只在
+        // guest 进程创建（webview 插入 DOM / 首次导航）前生效，attach 后再
+        // setAttribute 会被静默忽略（实测 Electron 44 / Chromium 152：导致
+        // __browserPluginPreloadInjected 恒为 undefined，sendToHost 桥（缩放、
+        // F12、sy-guest-mousedown 等）全部失效，只剩 executeJavaScript 兜底）。
+        // detectPreloadPath 走多次 fetch 异步验证，晚于页签恢复的 webview 创建，
+        // 所以这里先乐观预填（本插件正式安装布局固定为 data/plugins/<name>/preload.js），
+        // 异步探测完成后再校正（dev/storage/petal 场景）。
+        this.preloadFileUrl = this.computePreloadFallbackSync();
+
         // 诊断口：在指定扩展的 SW 上下文里求值表达式（控制台/探针排障用，
         // 例：dump 暴力猴存储 chrome.storage.local.get(null)）。仅主窗口可用。
         (window as any).browserPlugin.diagEvalInSw = async (electronId: string, expr: string) => {
@@ -1451,6 +1461,20 @@ export default class BrowserPlugin extends Plugin {
     /** 同步获取已缓存的 preload 路径（未探测完成时返回空串） */
     getPreloadPathSync(): string {
         return this.preloadFileUrl;
+    }
+
+    /** 同步乐观预填 preload 路径（不校验文件存在，供 webview 创建前使用）。
+     *  正式安装布局为 data/plugins/<name>/preload.js；dev（storage/petal）由
+     *  detectPreloadPath 异步校正。 */
+    private computePreloadFallbackSync(): string {
+        try {
+            const workspaceDir = (window as any).siyuan?.config?.system?.workspaceDir;
+            if (!workspaceDir) return "";
+            const norm = (p: string) => p.replace(/\\/g, "/").replace(/\/+/g, "/");
+            return "file:///" + norm(workspaceDir).replace(/^\//, "") + "/data/plugins/" + this.name + "/preload.js";
+        } catch {
+            return "";
+        }
     }
 
     private async detectPreloadPath(): Promise<string> {

@@ -41,6 +41,10 @@ export class WebviewController {
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
         /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
         onProcessGone?: (reason: string) => void;
+        /** 页面内（guest）mousedown 通知：扩展弹窗 overlay 的关闭触发器之一。
+         *  webview 内的鼠标事件不冒泡到宿主 DOM，点页面内容关弹窗必须经
+         *  preload 的 sy-guest-mousedown 通知才能到达宿主（详见 preload.js 注释） */
+        onGuestMouseDown?: () => void;
     };
     private disposed = false;
     private listeners: Array<{ type: string; fn: (e: any) => void }> = [];
@@ -330,6 +334,11 @@ export class WebviewController {
                     const p = e.args?.[0];
                     if (p && p.extId) persistExtLs(String(p.extId), p.data);
                 } catch {}
+            } else if (e.channel === "sy-guest-mousedown") {
+                // 页面内点击（preload 桥）：通知宿主关闭扩展弹窗（Chrome 弹窗语义）。
+                // preload 未加载时此通道不存在，兜底走 injectLinkInterceptor 的
+                // __syGuestMousedownSeq 轮询（两条通道幂等，都触发也只关一次）
+                try { this.callbacks.onGuestMouseDown?.(); } catch {}
             }
         });
         this.on("will-navigate", (e) => {
@@ -709,6 +718,8 @@ export class WebviewController {
      * 主进程通过轮询读取该变量并打开新页签。
      */
     private pendingNewTabCheckTimer: any = null;
+    /** guest mousedown 计数器上次值（弹窗外点关闭兜底通道；0=未注入页面） */
+    private lastGuestMousedownSeq = 0;
     private injectLinkInterceptor(): void {
         if (this.disposed) return;
         // guest 失效（重建竞态）时跳过本轮：旧句柄的 invoke 会报
@@ -724,6 +735,14 @@ export class WebviewController {
                 if (window.__browserInterceptorInjected) return;
                 window.__browserInterceptorInjected = true;
                 window.__pendingNewTab = null;
+                // guest 点击通知（扩展弹窗外点关闭的兜底通道）：preload 的
+                // sy-guest-mousedown ipc 通道在 preload 未加载时不存在（Electron 44
+                // 实测 webview preload 属性不生效），这里用计数器 + 宿主轮询兜底。
+                // 初值取时间戳避免页面重载后与宿主上次值碰撞（重载后从新基数起计）。
+                window.__syGuestMousedownSeq = Date.now() % 1000000000;
+                document.addEventListener('mousedown', function(){
+                    try { window.__syGuestMousedownSeq++; } catch(e) {}
+                }, true);
                 var isHttp = function(u){
                     try { return /^https?:\\/\\//i.test(new URL(u, location.href).href); } catch(e) { return false; }
                 };
@@ -802,8 +821,14 @@ export class WebviewController {
             } catch { return; }
             try {
                 this.webview
-                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null, h: window.__syAnnHoverEnd || null})")
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null, h: window.__syAnnHoverEnd || null, g: window.__syGuestMousedownSeq || 0})")
                     .then((r: any) => {
+                        // guest 点击计数独立处理：mousedown 先于 click，可能与其他
+                        // 信号同时出现，不能进 else 链
+                        if (r && typeof r.g === "number" && r.g !== this.lastGuestMousedownSeq) {
+                            this.lastGuestMousedownSeq = r.g;
+                            try { this.callbacks.onGuestMouseDown?.(); } catch {}
+                        }
                         if (r && r.t) {
                             this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
                             this.openNewTabDedup(r.t, "inject-poll");

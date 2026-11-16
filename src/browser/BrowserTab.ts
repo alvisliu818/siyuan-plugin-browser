@@ -144,6 +144,11 @@ export class BrowserTab {
             bookmarks: deps.bookmarks,
             i18n: deps.i18n,
             callbacks: {
+                // 页面内点击（preload 桥）→ 关闭扩展弹窗（Chrome 弹窗语义：
+                // overlay 的外部点击监听在宿主文档，看不到 webview 内的点击
+                onGuestMouseDown: () => {
+                    if (this.extPopup?.isOpen()) this.extPopup.close();
+                },
                 onUrlChange: (url) => {
                     this.toolbar.setUrl(url);
                     this.updateBookmarkButton(url);
