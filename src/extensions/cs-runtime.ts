@@ -127,6 +127,157 @@ export async function evalInSwByElectronId(electronId: string, expr: string): Pr
     return await manager.evalInSwAny(electronId, expr);
 }
 
+/** SW 侧 SetPopup 补填表达式（precacheSetPopupForPopup 与重放前补齐
+ *  refillSetPopupCache 共用同一四步链，对齐真 Chrome 冷启动时序：
+ *  prefetchSetPopup → 页面 SetPopup）：
+ *  0) 断开陈旧 Popup 端口 —— 世界侧泵（600ms 打点）超 3s 未更新 = 端口所属
+ *     popup 世界已死（面板关闭/重载），disconnect 触发 VM 的 onDisconnect →
+ *     清 popupTabs，否则 SetPopup 被 "popupTabs[tabId] → return" 提前吞掉；
+ *  1) 喂 __syLastFedTab —— SW 闲置被 Chromium 回收后内存态全丢，冷 SW 里
+ *     initPopup 的 getActiveTab 拿空 url → getFailureReason 判 noninjectable
+ *     → 面板 "cannot run userscripts"；
+ *  2) GetMoreIds —— 真列表数据按 url 现算（own 命令要求 sender.url 以扩展根
+ *     开头，故以 popup 页身份发包；SetPopup 再切回页面身份按 src.url 匹配）
+ *     + 态修正 more → content（宿主里脚本运行于隔离世界 = VM 语义 content 态
+ *     → runs=true、failed=false，不再红色删除线）；
+ *  2.5) Run 补报 —— 宿主世界未路由内容脚本的 Run 上报，替发之使 VM 的
+ *     badges[tabId].inject 落真值（0d2 setter），initPopup 读 inject=true →
+ *     reset=false → augment 的 "was restarted" 横幅根除（跨 SW 重启经镜像回种）；
+ *  3) SetPopup + CacheLoad 验证 + __sySetPopupSeenAt 投递标记 —— 只有缓存里
+ *     真有条目才返回 ok 并打标记；0d2 垫片（v26+）据此放行 badge.inject 真值，
+ *     initPopup 的 reset=false → 不触发 "was restarted" 误判。
+ *  回包协议（diaglog 实锤）：VM 打包 SW handler 同步返回恒 true，真实结果经
+ *  第 3 参 sendResponse 以 [result, error] 对送达 —— call 轮询捕获，不能直接
+ *  await fn(...)。 */
+function buildSetPopupRefillExpr(electronId: string, pageUrl: string): string {
+    const extUrl = "chrome-extension://" + electronId + "/popup/index.html";
+    const pageSender = JSON.stringify({ id: electronId, url: pageUrl, tab: { id: 1, url: pageUrl }, frameId: 0 });
+    return `(async () => {
+                    const fns = self.__syOnMessageHandlers || [];
+                    if (!fns.length) return JSON.stringify({ r: "nohandlers" });
+                    try {
+                        const now = Date.now();
+                        const pollAt = self.__syPortPollAt || {};
+                        for (const pid in self.__syPorts) {
+                            const p = self.__syPorts[pid];
+                            if (!p || typeof p.name !== "string" || p.name.indexOf("Popup") !== 0) continue;
+                            const last = pollAt[pid];
+                            if (!last || now - last > 3000) { try { p.disconnect && p.disconnect(); } catch (e) {} }
+                        }
+                    } catch (e) {}
+                    // VM 打包 SW handler 的回包协议（diaglog 实锤）：同步返回恒为 true
+                    // （Chrome onMessage 异步回包语义），真实结果经第 3 参 sendResponse
+                    // 以 [result, error] 对送达，且在内部 promise settle 后才回调 ——
+                    // await fn(...) 只拿到 true，必须捕获回调并轮询等它落地。
+                    const call = (fn, msg, sender) => new Promise(resolve => {
+                        let settled = false;
+                        const finish = value => {
+                            if (settled) return;
+                            settled = true;
+                            clearTimeout(timer);
+                            resolve(value);
+                        };
+                        const timer = setTimeout(() => finish([null, "response timeout"]), 3000);
+                        try {
+                            const result = fn(msg, sender, finish);
+                            if (result && typeof result.then === "function") {
+                                result.then(finish, error => finish([null, String(error)]));
+                            } else if (result !== true && result !== undefined && result !== false) {
+                                finish(result);
+                            }
+                        } catch (error) { finish([null, String(error)]); }
+                    });
+                    self.__syLastFedTab = ${JSON.stringify({ id: 1, active: true, windowId: 1, url: pageUrl, title: "" })};
+                    let ids = null;
+                    for (const fn of fns) {
+                        try {
+                            const [val, error] = await call(fn, { cmd: "GetMoreIds", data: { url: ${JSON.stringify(pageUrl)}, top: 1, ids: {} }, url: ${JSON.stringify(extUrl)}, top: 1 }, ${pageSender});
+                            if (!error && val && typeof val === "object") { ids = val; break; }
+                        } catch (e) {}
+                    }
+                    if (!ids) return JSON.stringify({ r: "unavailable" });
+                    if (ids) {
+                        // 态修正：GetMoreIds 现算只有 more/0；宿主里脚本运行于隔离世界
+                        // （VM 语义 content 态）→ runs=true、failed=false（不再红色删除线）
+                        const fixed = {};
+                        for (const k of Object.keys(ids)) fixed[k] = ids[k] ? "content" : ids[k];
+                        ids = fixed;
+                    }
+                    // Run 补报（v27）：宿主隔离世界实际运行这些脚本 —— 真 Chrome 里
+                    // 内容脚本会发 Run（cmd-run.js report），宿主世界未路由该消息 → VM 的
+                    // badges[tabId].inject 恒 undefined → initPopup 的 reset=true → augment
+                    // 误判 "was restarted" 横幅。以扩展页身份直发 Run（own 命令门禁：
+                    // sender.url 以扩展根开头；msg.top=1 → setBadge 的 isTop），setBadge
+                    // 同步写内存真值（0d2 setter → syRealInject），紧随的 initPopup 读
+                    // badge.inject=true → reset=false → 无横幅；后续 flush 落
+                    // __syBadgesInject 镜像，跨 SW 重启回种。ids 空数组时 injectable=false
+                    //（与真 Chrome 无脚本页一致，同样抑制横幅）。
+                    const runMsg = { cmd: "Run", data: { ids: Object.keys(ids), reset: false }, top: 1 };
+                    const runSender = { id: ${JSON.stringify(electronId)}, url: ${JSON.stringify(extUrl)}, tab: { id: 1, url: ${JSON.stringify(pageUrl)} }, frameId: 0 };
+                    for (const fn of fns) {
+                        try { await call(fn, runMsg, runSender); } catch (eR) {}
+                    }
+                    const msg = { cmd: "SetPopup", data: { ids: ids || {}, injectInto: "auto", menus: {} }, url: ${JSON.stringify(pageUrl)}, top: 1 };
+                    let err = "";
+                    for (const fn of fns) {
+                        try {
+                            const [, cbErr] = await call(fn, msg, ${pageSender});
+                            if (cbErr) err = String((cbErr && cbErr.message) || cbErr);
+                        } catch (e) { err = String((e && e.message) || e); }
+                    }
+                    if (err) return JSON.stringify({ r: "err:" + err });
+                    if (!ids || !Object.keys(ids).length) return JSON.stringify({ r: "ok ids=0" });
+                    // 验证：SetPopup 的 augmentSetPopup 是 fire-and-forget 异步，轮询确认
+                    // cache["SetPopup1"] 真有条目（popupTabs 残留/存储读失败会静默吞掉）
+                    for (let t = 0; t < 12; t++) {
+                        await new Promise(r => setTimeout(r, 80));
+                        for (const fn of fns) {
+                            try {
+                                const [entry] = await call(fn, { cmd: "CacheLoad", data: "SetPopup1", url: ${JSON.stringify(extUrl)}, top: 1 }, ${pageSender});
+                                if (entry && typeof entry === "object" && entry[0]) {
+                                    // 投递标记：0d2 垫片（v26）在标记新鲜期（SetPopup 缓存
+                                    // 生命周期内）放行 badge.inject 真值 → initPopup 的
+                                    // reset=false → 不触发 "was restarted" 误判
+                                    self.__sySetPopupSeenAt = self.__sySetPopupSeenAt || {};
+                                    self.__sySetPopupSeenAt["1"] = Date.now();
+                                    return JSON.stringify({ r: "ok ids=" + Object.keys(ids).length, ids: ids });
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                    return JSON.stringify({ r: "unverified ids=" + Object.keys(ids).length });
+                })()`;
+}
+
+/** 重放前确定性补齐（ext-popup.ts 在 fetch get-data.js 前调用）：
+ *  popup 文档原生加载的 <script src> 已吃掉预填缓存条目（initPopup 的
+ *  cache.pop-on-read），重放世界的 fetch 是 BGDATA 的最终消费点 —— fetch 前
+ *  补齐并确认缓存真有条目（CacheLoad 验证），本次 pop 必命中，不依赖补打
+ *  时序去碰双拉间隔。非 VM / 非 http(s) 页面无事可做，返回 true（调用方
+ *  无需告警）；补齐失败返回 false（调用方照常 fetch，尽力而为）。 */
+export async function refillSetPopupCache(electronId: string, pageUrl: string): Promise<boolean> {
+    try {
+        if (!manager || !electronId || !pageUrl) return true;
+        const extInfo = manager.findExt(electronId);
+        if (!extInfo || !/violentmonkey|暴力猴/i.test(String(extInfo.name || ""))) return true;
+        if (!/^https?:/i.test(pageUrl)) return true;
+        for (let round = 0; round < 2; round++) {
+            const r = await evalInSwByElectronId(electronId, buildSetPopupRefillExpr(electronId, pageUrl));
+            let res = r.err ? "err:" + r.err : String(r.value ?? "");
+            try {
+                const parsed = JSON.parse(res);
+                if (parsed && typeof parsed.r === "string") res = parsed.r;
+            } catch {}
+            if (/^ok ids=/.test(res)) return true;
+            if (round === 0) await new Promise((r2) => setTimeout(r2, 250));
+        }
+        console.warn("[browser-plugin] get-data refill unverified, ext:", electronId);
+        return false;
+    } catch {
+        return false;
+    }
+}
+
 /** popup 打开前置：伪装 content 桥身份直发一条 SetPopup 命令，填 VM 的
  *  cache['SetPopup'+tabId]。VM popup 的脚本列表来自 initPopup 的
  *  cache.pop('SetPopup'+tabId)，而 content 侧只在 isPopupShown=true 时才发
@@ -139,8 +290,24 @@ export async function evalInSwByElectronId(electronId: string, expr: string): Pr
  *  - msg.url → src.url（getScriptsByURL 按 src.url 匹配脚本）
  *  - msg.top=1 → src.top（kTop，主框架；跳过 handleCommandMessage 的 src.tab=false 分支）
  *  - src.tab={id:1,url}（SetPopup 取 tabId 建缓存键 SetPopup1，与垫片 tabs.query 固定 id 对齐）
- *  - src.frameId=0（augmentSetPopup 以 src[kFrameId] 为缓存子键，popup 读 [0]） */
-/** 返回「是否真拿到匹配脚本（ids>0）」的 promise：调用方（openExtensionPopup）
+ *  - src.frameId=0（augmentSetPopup 以 src[kFrameId] 为缓存子键，popup 读 [0]）
+ *
+ *  v26 增强（「Violentmonkey was restarted」横幅 + 脚本红色删除线根除）：
+ *  a) 投递前断开陈旧 Popup 端口 —— 端口 onDisconnect 曾是空壳，popup 关闭后
+ *     VM 的 popupTabs 残留，SetPopup 被 "popupTabs[tabId] → return" 提前吞掉，
+ *     缓存永远填不上（横幅间歇复发的根因）；
+ *  b) ids 态修正 more → content —— GetMoreIds 现算只给 more 态，popup 把
+ *     failed=more 的脚本渲染成红色删除线；宿主里脚本实际运行于隔离世界
+ *     （= VM 语义的 content 态），上报 content 使 runs=true；
+ *  c) CacheLoad 验证 + __sySetPopupSeenAt 投递标记 —— 只有缓存里真有条目才
+ *     返回 ok 并打标记；0d2 垫片（v26）据此放行 badge.inject 真值，initPopup
+ *     的 reset=false → 不再走 isInjectable 误判分支（横幅来源）；
+ *  d) 重放前确定性补齐（refillSetPopupCache，ext-popup.ts 在 fetch get-data.js
+ *     前调用）—— 原生文档加载吃掉预填条目后，重放世界的 fetch（BGDATA 最终
+ *     消费点）前补齐并确认缓存，必命中 → 空列表根治，不赌补打时序。
+ *  非 Violentmonkey 扩展直接跳过（GetMoreIds/SetPopup 是 VM 专有命令，对其它
+ *  扩展只会白等重试拖慢面板打开）。 */
+/** 返回「是否真拿到匹配脚本且缓存已验证（ids>0）」的 promise：调用方（openExtensionPopup）
  *  等它落地再开面板，面板首拉即命中 SetPopup 缓存（VM 缓存 pop-on-read，先开面板
  *  再重载补拉会与缓存填充竞态）。冷 SW 上 VM 脚本库（内存 $r）异步加载，首发可能
  *  ids=0（库未就位），内部重试到 ids>0 或 10s 限时;false（确无匹配或 SW 挂死）时
@@ -148,60 +315,17 @@ export async function evalInSwByElectronId(electronId: string, expr: string): Pr
 export function precacheSetPopupForPopup(electronId: string, pageUrl: string): Promise<boolean> {
     try {
         if (!manager || !electronId || !pageUrl || !/^https?:/i.test(pageUrl)) return Promise.resolve(false);
+        // 仅 VM 需要（VM 专有命令）；其它扩展直接放行，避免无谓重试拖慢面板打开
+        const extInfo = manager.findExt(electronId);
+        if (!extInfo || !/violentmonkey|暴力猴/i.test(String(extInfo.name || ""))) return Promise.resolve(false);
         const fire = async (first: boolean): Promise<string> => {
             try {
-                // 三步链（对齐真 Chrome 冷启动时序：prefetchSetPopup → 页面 SetPopup）：
-                // 1) 喂 __syLastFedTab —— SW 闲置被 Chromium 回收后内存态全丢，冷 SW 里
-                //    initPopup 的 getActiveTab 拿空 url → getFailureReason 判 noninjectable
-                //    → 面板 "cannot run userscripts"（用户实测间歇复发的根因：热 SW 全绿、
-                //    冷 SW 必挂）。precache 是面板打开前宿主最后一次触碰 SW 的点，在此恢复。
-                // 2) GetMoreIds —— 真列表数据 = 页面桥的 bridge.ids（页面 SetPopup payload），
-                //    冷 SW 时页面侧已同步的 ids 同样丢失；GetMoreIds 按 url 现算。
-                //    own 命令要求 sender.url 以扩展根开头（background/index.js:44-46），
-                //    故此调用以 popup 页身份发包；SetPopup 再切回页面身份（augmentSetPopup
-                //    按 src.url 匹配脚本）。
-                // 3) SetPopup —— 用真实 ids 填 VM 的 SetPopup1 缓存（popup 页 BGDATA 读）。
-                const extUrl = "chrome-extension://" + electronId + "/popup/index.html";
-                const pageSender = JSON.stringify({ id: electronId, url: pageUrl, tab: { id: 1, url: pageUrl }, frameId: 0 });
-                const expr = `(async () => {
-                    const fns = self.__syOnMessageHandlers || [];
-                    if (!fns.length) return "nohandlers";
-                    // VM 打包 SW handler 的回包协议（diaglog 实锤）：同步返回恒为 true
-                    // （Chrome onMessage 异步回包语义），真实结果经第 3 参 sendResponse
-                    // 以 [result, error] 对送达，且在内部 promise settle 后才回调 ——
-                    // await fn(...) 只拿到 true，必须捕获回调并轮询等它落地。
-                    let resp = null;
-                    let got = false;
-                    const sr = function (v) { got = true; resp = v; };
-                    const call = async (fn, msg, sender) => {
-                        resp = null; got = false;
-                        let sync = null;
-                        try { sync = fn(msg, sender, sr); } catch (e) { return [null, e]; }
-                        try { if (sync && typeof sync.then === "function") sync = await sync; } catch (e) { return [null, e]; }
-                        for (let i = 0; i < 150 && !got; i++) await new Promise(r => setTimeout(r, 20));
-                        if (got) return resp;
-                        return [sync !== true ? sync : null, null];
-                    };
-                    self.__syLastFedTab = ${JSON.stringify({ id: 1, active: true, windowId: 1, url: pageUrl, title: "" })};
-                    let ids = null;
-                    for (const fn of fns) {
-                        try {
-                            const [val] = await call(fn, { cmd: "GetMoreIds", data: { url: ${JSON.stringify(pageUrl)}, top: 1, ids: {} }, url: ${JSON.stringify(extUrl)}, top: 1 }, ${pageSender});
-                            if (val && typeof val === "object" && Object.keys(val).length) { ids = val; break; }
-                        } catch (e) {}
-                    }
-                    const msg = { cmd: "SetPopup", data: { ids: ids || {}, injectInto: "auto", menus: {} }, url: ${JSON.stringify(pageUrl)}, top: 1 };
-                    let err = "";
-                    for (const fn of fns) {
-                        try {
-                            const [, cbErr] = await call(fn, msg, ${pageSender});
-                            if (cbErr) err = String((cbErr && cbErr.message) || cbErr);
-                        } catch (e) { err = String((e && e.message) || e); }
-                    }
-                    return err ? "err:" + err : "ok ids=" + (ids ? Object.keys(ids).length : 0);
-                })()`;
-                const r = await evalInSwByElectronId(electronId, expr);
-                const res = r.err ? "err:" + r.err : String(r.value ?? "");
+                const r = await evalInSwByElectronId(electronId, buildSetPopupRefillExpr(electronId, pageUrl));
+                let res = r.err ? "err:" + r.err : String(r.value ?? "");
+                try {
+                    const parsed = JSON.parse(res);
+                    if (parsed && typeof parsed.r === "string") res = parsed.r;
+                } catch {}
                 if (first || res && !/^ok ids=/.test(res)) {
                     console.log("[browser-plugin] precache SetPopup:", res, "url:", String(pageUrl).slice(0, 80));
                 }
@@ -211,11 +335,11 @@ export function precacheSetPopupForPopup(electronId: string, pageUrl: string): P
                 return "err:" + String(e?.message || e);
             }
         };
-        // 数据就位判定：只有真拿到匹配脚本（ids>0）才算就位。ids=0 不能当就位——
-        // 冷 SW 上 VM handlers 已注册但脚本库（内存 $r）尚未从 storage 加载完时
-        // GetMoreIds 现算返回空，若此时 resolve，调用方会带空缓存开面板 → 间歇空
-        // 列表（原 bug）。ids=0 持续重试给 VM 加载窗口;调用方等本 promise 落地再开
-        // 面板，首拉即命中缓存，避免先开后补拉与 pop-on-read 缓存竞态。
+        // 数据就位判定：真拿到匹配脚本（ids>0）且缓存验证通过（返回 ok）才算就位。
+        // ids=0 / unverified 不能当就位——冷 SW 上 VM handlers 已注册但脚本库（内存
+        // $r）尚未从 storage 加载完时 GetMoreIds 现算返回空，若此时 resolve，调用方
+        // 会带空缓存开面板 → 间歇空列表（原 bug）。内部重试给 VM 加载窗口;调用方等
+        // 本 promise 落地再开面板，首拉即命中缓存，避免先开后补拉与 pop-on-read 缓存竞态。
         const firstP = (async () => {
             const deadline = Date.now() + 10_000;
             let first = true;
@@ -228,11 +352,13 @@ export function precacheSetPopupForPopup(electronId: string, pageUrl: string): P
             }
             return false;
         })();
-        // 数据就位后的补打：popup webview ERR_ABORTED 重载后 get-data.js 会重新
-        // fetch（cache.pop 又空了），补打保证任一次文档加载都拿得到缓存
-        void firstP.then(() => {
+        // 就位后的稀疏维持：fire 顺带清理死掉的 Popup 端口（重载场景的世界残留）
+        // 并保持缓存新鲜；重放 fetch 前的确定性补齐见 refillSetPopupCache
+        //（根治 pop-on-read 双拉空窗，不依赖此处时序）。
+        void firstP.then((ok) => {
+            if (!ok) return;
             let n = 0;
-            const t = setInterval(() => { void fire(false); if (++n >= 5) clearInterval(t); }, 600);
+            const t = setInterval(() => { void fire(false); if (++n >= 10) clearInterval(t); }, 1200);
         });
         return firstP;
     } catch {}
@@ -482,6 +608,15 @@ class CsRuntimeManager {
             const err = String(e?.message || e);
             dbg({ ok: false, error: err });
             return { ok: false, error: err };
+        }
+    }
+
+    /** 按 electronId 查扩展信息（模块级函数无 host 引用时用） */
+    findExt(electronId: string): ICsExtInfo | undefined {
+        try {
+            return this.host.listNativeExts().find((e) => e.electronId === electronId);
+        } catch {
+            return undefined;
         }
     }
 
@@ -1709,17 +1844,37 @@ class CsPageSession {
                             removeListener: function (fn) { var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
                             hasListener: function (fn) { return listeners.indexOf(fn) >= 0; },
                         },
-                        onDisconnect: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                        // ★ onDisconnect 真实现（v26）：此前是空壳 —— popup 世界死亡
+                        //   （面板关闭/ERR_ABORTED 重载）后 VM 的 popupTabs 永不清理，
+                        //   后续 precache 的 SetPopup 全被 "popupTabs[tabId] → return"
+                        //   提前吞掉，缓存永远填不上（弹窗横幅+红线的根因之一）。
+                        //   收集监听器；宿主侧判定端口陈旧时调 disconnect() 触发回派。
+                        onDisconnect: {
+                            addListener: function (fn) { if (typeof fn === "function") (port.__syDiscFns = port.__syDiscFns || []).push(fn); },
+                            removeListener: function (fn) { var i = port.__syDiscFns ? port.__syDiscFns.indexOf(fn) : -1; if (i >= 0) port.__syDiscFns.splice(i, 1); },
+                            hasListener: function (fn) { return !!port.__syDiscFns && port.__syDiscFns.indexOf(fn) >= 0; },
+                        },
                         postMessage: function (msg) { outbox.push(msg === undefined ? null : msg); },
-                        disconnect: function () { delete self.__syPorts[${pidJson}]; },
+                        disconnect: function () {
+                            delete self.__syPorts[${pidJson}];
+                            try { delete self.__syPortOutbox[${pidJson}]; } catch (eO) {}
+                            try { delete self.__syPortPollAt[${pidJson}]; } catch (eP) {}
+                            var dfs = port.__syDiscFns || [];
+                            for (var iD = 0; iD < dfs.length; iD++) { try { dfs[iD](port); } catch (eD) {} }
+                        },
                     };
                     self.__syPorts[${pidJson}] = port;
+                    // 出生打点：世界侧泵 600ms 后接管；precache 的 3s 无打点判死会误杀
+                    // "刚创建、泵首拍未到"的活端口
+                    try { self.__syPortPollAt = self.__syPortPollAt || {}; self.__syPortPollAt[${pidJson}] = Date.now(); } catch (eTS) {}
                     for (var i = 0; i < fns.length; i++) { try { fns[i](port); } catch (e) {} }
                     created = true;
                     if (!listeners.length) return JSON.stringify({ __noPortListeners: true });
                 } else {
                     // 复用端口：从 port 对象恢复 listeners（垫片闭包不可达，存 port 上）
                     listeners = port.__syListeners || [];
+                    // 复用 = 世界侧活着在发消息：刷新活跃戳（防泵停但消息仍流的会话被误判陈旧）
+                    try { (self.__syPortPollAt || (self.__syPortPollAt = {}))[${pidJson}] = Date.now(); } catch (eTR) {}
                 }
                 if (!port.__syListeners) port.__syListeners = listeners;
                 // __syNormalizeMsg：垫片统一消息归一（见 extensionHost 垫片 0b 节）
@@ -1794,7 +1949,12 @@ class CsPageSession {
             var out = [];
             try {
                 var box = self.__syPortOutbox || {};
+                // ★ 端口活跃时间戳（v26）：世界侧泵每 600ms 打一次 —— 端口所属世界
+                //   死亡（面板关闭/页面导航/ERR_ABORTED）后不再更新。宿主据此判定
+                //   陈旧端口并 disconnect()（见 precache 的清理逻辑）。
+                self.__syPortPollAt = self.__syPortPollAt || {};
                 for (var i = 0; i < ids.length; i++) {
+                    self.__syPortPollAt[ids[i]] = Date.now();
                     var arr = box[ids[i]];
                     if (arr && arr.length) out.push({ portId: ids[i], msgs: arr.splice(0, arr.length) });
                 }

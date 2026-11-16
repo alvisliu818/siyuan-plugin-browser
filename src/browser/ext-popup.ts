@@ -13,6 +13,7 @@
  * （本插件的 webview 正是如此），页面世界里才有 chrome 对象可用。
  */
 import type { IWebviewTag } from "../types";
+import { refillSetPopupCache } from "../extensions/cs-runtime";
 
 interface INodeMods {
     fs: typeof import("fs");
@@ -834,6 +835,11 @@ export async function injectExtensionPageRuntime(opts: {
      * 种子、写入防抖回灌宿主（见 POPUP_JS_PRELUDE）。真实源文档不装垫片，
      * 传了也无副作用。 */
     lsSeed?: Record<string, string> | null;
+    /** 锚定内容页 URL（http/https）—— VM 的 get-data.js 由 SW 动态伺服且其
+     *  initPopup 走 cache.pop-on-read：原生文档加载已吃掉预填条目，重放 fetch
+     *  前据此补齐并确认 SetPopup 缓存（refillSetPopupCache）。非弹窗场景
+     *  （扩展页直开）不传，跳过补齐。 */
+    pageUrl?: string;
 }): Promise<{ ok: boolean; error?: string; scripts?: number }> {
     const { webview, extPath, electronId, pagePath } = opts;
     try {
@@ -982,6 +988,13 @@ export async function injectExtensionPageRuntime(opts: {
         // BGDATA）磁盘上不存在。
         for (const rel of remoteSrcs) {
             const url = "chrome-extension://" + electronId + "/" + String(rel).replace(/^\//, "");
+            // VM get-data.js（SW 动态伺服、播种 BGDATA）：其 initPopup 走
+            // cache.pop-on-read，原生文档加载的 <script src> 已吃掉预填条目 ——
+            // fetch 前补齐并确认缓存真有条目，本次 fetch 的 pop 必命中（重放
+            // 世界是 BGDATA 最终消费点，不赌补打时序碰双拉间隔窗口）。
+            if (opts.pageUrl && /get-data\.js(\?|$)/.test(String(rel))) {
+                try { await refillSetPopupCache(electronId, opts.pageUrl); } catch {}
+            }
             let code: string | null = null;
             try {
                 code = await webview.executeJavaScript(

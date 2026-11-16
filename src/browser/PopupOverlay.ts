@@ -363,6 +363,9 @@ export class ExtensionPopupOverlay {
                 // about:blank 兜底路径仍需 location 伪装（原生加载时 location 是真语义，无需）
                 spoofLocationUrl: nativeLoad ? undefined : "chrome-extension://" + opts.electronId + "/" + pagePath,
                 lsSeed: nativeLoad ? null : readExtLsSeed(opts.electronId),
+                // 锚定内容页 URL：VM get-data.js 重放 fetch 前补齐 SetPopup 缓存用
+                //（原生加载已吃掉预填条目，重放前确定性补齐，见 ext-popup/cs-runtime）
+                pageUrl: opts.anchorTab ? opts.anchorTab.url : undefined,
                 begin: () => beginPopupWorld(vw, extInfo),
                 evalJs: (src2, relPath) => {
                     const fakeUrl = "chrome-extension://" + opts.electronId + "/" + String(relPath).replace(/^\.\//, "");

@@ -208,6 +208,12 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
+        // v27：标记版（垫片字节不变）—— 配套 cs-runtime/ext-popup 的重放前确定性
+        //      补齐（refillSetPopupCache）：get-data.js 重放 fetch 前补齐并确认
+        //      SetPopup 缓存，根治 pop-on-read 双拉空窗导致的弹窗空列表。
+        // v26：badge.inject 条件放行 —— 根除 v25 引入的 "Violentmonkey was restarted"
+        //      横幅 + 脚本红色删除线（reset 补算被误判为 SW 重启、state=more 渲染成
+        //      failed；详见 0d2 节，配套 cs-runtime 的端口生命周期/投递标记修复）。
         // v25：VM 弹窗脚本列表空修复 —— 规范化 chrome.storage.session 里持久化的
         //      badge.inject 伪状态，让 initPopup() 的 reset 重新成立（详见 0d2 节）。
         // v23：userScripts.execute 补桩（SW→页面 下发用户脚本代码，出箱
@@ -224,7 +230,7 @@ export class ExtensionHost {
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v25";
+        const SHIM_VER = "v27";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -417,24 +423,23 @@ export class ExtensionHost {
                 } catch (eB) {}
             }
         } catch (e) {}
-        // 0d2) VM 弹窗脚本列表空修复（v25，只改宿主垫片，不动扩展源码）：
-        //      宿主用 loadExtension + userScripts 模拟注入，内容脚本不会向 SW
-        //      发 SetPopup，但 VM 的 setBadge()/resetBadgeData() 会把
-        //      badge.inject=true 写进内存并 flush 到 chrome.storage.session，
-        //      跨 SW 重启保留。initPopup() 的 reset 条件
-        //      badgeData[INJECT] === undefined 因此恒为 false，而 SetPopup 的
-        //      cache 是纯内存、SW 重启即空 —— 既不取缓存，也不走
-        //      augmentSetPopup 补算，cachedSetPopup 返回空；popup 的
-        //      setPopup() 永不执行，store.scripts 保持 [[],[]] → 列表空。
-        //      （头部与 "Find scripts for this site" 仍显示，因 GetTabDomain
-        //      正常，这正是该病因的特征。）
-        //      只抹启动快照不够：运行时 VM 还会写回内存。故把 badges 根对象
-        //      包成 Proxy，已有条目与新建条目都装上 inject 的 accessor
-        //      （读恒 undefined、写入吞掉），并在 session.set 二次兜底。
-        //      reset 重新成立后 VM 自行调 augmentSetPopup →
-        //      getScriptsByURL + getData 补算，列表恢复。
-        //      accessor 设为不可枚举，structured clone 时该键直接消失；
-        //      Proxy 与 accessor 均已实测可安全通过 storage.session 克隆。
+        // 0d2) VM 弹窗 badge.inject 条件放行（v26；v25 无条件抹杀的升级，不动 VM 源码）：
+        //      背景：宿主用 loadExtension + userScripts 模拟注入，内容脚本不会向 SW
+        //      发 SetPopup，但 VM 的 setBadge()/resetBadgeData() 会把 badge.inject=true
+        //      写进内存并 flush 到 chrome.storage.session，跨 SW 重启保留。
+        //      v25 的解法（inject 恒读 undefined）修好了"列表空"（reset=true →
+        //      augmentSetPopup 补算），但带来两个副作用：
+        //      a) initPopup() 恒走 reset 路径，isInjectable()（垫片 executeScript/
+        //         registerInjector 恒成功）+ 补算脚本非空 → VM 误判"SW 重启" →
+        //         "Violentmonkey was restarted" 横幅 + injectInto=off（总开关关闭态）；
+        //      b) 补算路径的脚本 state=more → popup 渲染 failed → 脚本名红色删除线。
+        //      v26 语义：inject **条件放行** —— 仅当宿主 precache 近期（SetPopup 缓存
+        //      生命周期 5min 内）成功投递并验证过 SetPopup（SW 全局 __sySetPopupSeenAt
+        //      有新鲜时间戳）时读真值（正常链：reset=false + cache.pop 命中 → 无横幅、
+        //      content 态无删除线）；否则读 undefined，回落 v25 的 reset 补算保底
+        //      （列表仍能显示，横幅作为降级态保留）。真值经 WeakMap 保存；持久化经
+        //      __syBadgesInject 镜像（accessor 不可枚举、structured clone 会丢键，
+        //      SW 重启后靠镜像回种，覆盖"页签加载于重启前、未刷新就开面板"场景）。
         //      只作用于 badges 键，其它扩展零影响。
         try {
             var sySess = chrome.storage && chrome.storage.session;
@@ -442,15 +447,30 @@ export class ExtensionHost {
                 sySess.__syBadgeGuard = 1;
                 var syOrigSessGet = sySess.get.bind(sySess);
                 var syOrigSessSet = sySess.set && sySess.set.bind(sySess);
-                var syNeutralizeOne = function (one) {
+                var SY_SP_TTL = 300000; // 与 VM cache 默认生命周期对齐（common/cache.js: 5min）
+                var syRealInject = new WeakMap(); // badge entry -> 真实 inject 值（不进 clone/持久化）
+                var syEntryTab = new WeakMap();   // badge entry -> 页签 id 字符串
+                var sySeenFresh = function (tid) {
+                    try {
+                        var seen = self.__sySetPopupSeenAt;
+                        return !!(tid !== undefined && seen && seen[tid] && Date.now() - seen[tid] < SY_SP_TTL);
+                    } catch (e) { return false; }
+                };
+                var syNeutralizeOne = function (one, tid) {
                     try {
                         if (!one || typeof one !== "object" || one.__syInjectNeutralized) return;
                         var d = Object.getOwnPropertyDescriptor(one, "inject");
                         if (d && !d.configurable) return;
+                        if (d && "value" in d) syRealInject.set(one, d.value); // 持久化残留的旧真值
+                        if (tid !== undefined) syEntryTab.set(one, String(tid));
                         Object.defineProperty(one, "inject", {
                             configurable: true, enumerable: false,
-                            get: function () { return undefined; },
-                            set: function () {}
+                            get: function () {
+                                // SetPopup 投递新鲜期内放行真值（reset=false → 无横幅），
+                                // 否则读 undefined（回落 reset 补算保底）
+                                return sySeenFresh(syEntryTab.get(one)) ? syRealInject.get(one) : undefined;
+                            },
+                            set: function (v) { try { syRealInject.set(one, v); } catch (eW) {} }
                         });
                         Object.defineProperty(one, "__syInjectNeutralized", {
                             value: true, enumerable: false, configurable: true
@@ -459,7 +479,7 @@ export class ExtensionHost {
                 };
                 var syNeutralizeAll = function (root) {
                     if (!root || typeof root !== "object") return;
-                    for (var tid in root) syNeutralizeOne(root[tid]);
+                    for (var tid in root) syNeutralizeOne(root[tid], tid);
                 };
                 var syFixBadges = function (res) {
                     try {
@@ -467,17 +487,28 @@ export class ExtensionHost {
                         if (bg && typeof bg === "object") {
                             var raw = bg.__syBadgeRaw || bg;
                             syNeutralizeAll(raw);
+                            // 持久化镜像回种：SW 重启后内存态全丢，__syBadgesInject
+                            // （set 时写入的快照）回种真实 inject 值
+                            var mir = res.__syBadgesInject;
+                            if (mir && typeof mir === "object") {
+                                for (var mTid in raw) {
+                                    var mOne = raw[mTid];
+                                    if (mOne && !syRealInject.has(mOne) && mir[mTid] !== undefined) {
+                                        syRealInject.set(mOne, mir[mTid]);
+                                    }
+                                }
+                            }
                             if (!bg.__syIsBadgeProxy) {
                                 res.badges = new Proxy(raw, {
                                     get: function (t, k) {
                                         if (k === "__syIsBadgeProxy") return true;
                                         if (k === "__syBadgeRaw") return t;
                                         var v = t[k];
-                                        if (v && typeof v === "object" && /^\d+$/.test(String(k))) syNeutralizeOne(v);
+                                        if (v && typeof v === "object" && /^\\d+$/.test(String(k))) syNeutralizeOne(v, k);
                                         return v;
                                     },
                                     set: function (t, k, v) {
-                                        if (v && typeof v === "object" && /^\d+$/.test(String(k))) syNeutralizeOne(v);
+                                        if (v && typeof v === "object" && /^\\d+$/.test(String(k))) syNeutralizeOne(v, k);
                                         t[k] = v;
                                         return true;
                                     },
@@ -502,7 +533,19 @@ export class ExtensionHost {
                     sySess.set = function (items, cb) {
                         try {
                             if (items && items.badges) {
-                                syNeutralizeAll(items.badges.__syBadgeRaw || items.badges);
+                                var sRaw = items.badges.__syBadgeRaw || items.badges;
+                                syNeutralizeAll(sRaw);
+                                // 持久化镜像：accessor 键 clone 会丢，真值单独存一份，
+                                // SW 重启后由 syFixBadges 回种
+                                var sMir = {};
+                                for (var sTid in sRaw) {
+                                    var sOne = sRaw[sTid];
+                                    var sVal;
+                                    if (sOne && sOne.__syInjectNeutralized && syRealInject.has(sOne)) sVal = syRealInject.get(sOne);
+                                    else if (sOne && !sOne.__syInjectNeutralized && sOne.inject !== undefined) sVal = sOne.inject;
+                                    if (sVal !== undefined) sMir[sTid] = sVal;
+                                }
+                                items.__syBadgesInject = sMir;
                             }
                         } catch (eSet) {}
                         return syOrigSessSet(items, cb);
