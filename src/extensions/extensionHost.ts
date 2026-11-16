@@ -208,6 +208,8 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
+        // v25：VM 弹窗脚本列表空修复 —— 规范化 chrome.storage.session 里持久化的
+        //      badge.inject 伪状态，让 initPopup() 的 reset 重新成立（详见 0d2 节）。
         // v23：userScripts.execute 补桩（SW→页面 下发用户脚本代码，出箱
         //       __syUsExecOutbox 由 cs-runtime 回包泵排空后在自建世界执行）——
         //       Violentmonkey MV3 注入链 forceContent 路径的关键通道。
@@ -222,7 +224,7 @@ export class ExtensionHost {
         // 走"守卫幂等堆叠"（各节都有 __sy* 守卫，双跑无害）。
         // 标记含内容哈希（见 shimBody 之后）：迭代垫片内容而版本号不变时也能
         // 触发重注入，杜绝"改了垫片但文件头标记没变被跳过"的坑。
-        const SHIM_VER = "v24";
+        const SHIM_VER = "v25";
         let changedShimCount = 0;
         // shimBody/SHIM_MARK 提到循环外：catch 重试块也要用（原来定义在 try 内，
         // 重试块 TS2304 + 运行时 ReferenceError——文件锁场景重试永远失败）。
@@ -415,6 +417,99 @@ export class ExtensionHost {
                 } catch (eB) {}
             }
         } catch (e) {}
+        // 0d2) VM 弹窗脚本列表空修复（v25，只改宿主垫片，不动扩展源码）：
+        //      宿主用 loadExtension + userScripts 模拟注入，内容脚本不会向 SW
+        //      发 SetPopup，但 VM 的 setBadge()/resetBadgeData() 会把
+        //      badge.inject=true 写进内存并 flush 到 chrome.storage.session，
+        //      跨 SW 重启保留。initPopup() 的 reset 条件
+        //      badgeData[INJECT] === undefined 因此恒为 false，而 SetPopup 的
+        //      cache 是纯内存、SW 重启即空 —— 既不取缓存，也不走
+        //      augmentSetPopup 补算，cachedSetPopup 返回空；popup 的
+        //      setPopup() 永不执行，store.scripts 保持 [[],[]] → 列表空。
+        //      （头部与 "Find scripts for this site" 仍显示，因 GetTabDomain
+        //      正常，这正是该病因的特征。）
+        //      只抹启动快照不够：运行时 VM 还会写回内存。故把 badges 根对象
+        //      包成 Proxy，已有条目与新建条目都装上 inject 的 accessor
+        //      （读恒 undefined、写入吞掉），并在 session.set 二次兜底。
+        //      reset 重新成立后 VM 自行调 augmentSetPopup →
+        //      getScriptsByURL + getData 补算，列表恢复。
+        //      accessor 设为不可枚举，structured clone 时该键直接消失；
+        //      Proxy 与 accessor 均已实测可安全通过 storage.session 克隆。
+        //      只作用于 badges 键，其它扩展零影响。
+        try {
+            var sySess = chrome.storage && chrome.storage.session;
+            if (sySess && typeof sySess.get === "function" && !sySess.__syBadgeGuard) {
+                sySess.__syBadgeGuard = 1;
+                var syOrigSessGet = sySess.get.bind(sySess);
+                var syOrigSessSet = sySess.set && sySess.set.bind(sySess);
+                var syNeutralizeOne = function (one) {
+                    try {
+                        if (!one || typeof one !== "object" || one.__syInjectNeutralized) return;
+                        var d = Object.getOwnPropertyDescriptor(one, "inject");
+                        if (d && !d.configurable) return;
+                        Object.defineProperty(one, "inject", {
+                            configurable: true, enumerable: false,
+                            get: function () { return undefined; },
+                            set: function () {}
+                        });
+                        Object.defineProperty(one, "__syInjectNeutralized", {
+                            value: true, enumerable: false, configurable: true
+                        });
+                    } catch (eOne) {}
+                };
+                var syNeutralizeAll = function (root) {
+                    if (!root || typeof root !== "object") return;
+                    for (var tid in root) syNeutralizeOne(root[tid]);
+                };
+                var syFixBadges = function (res) {
+                    try {
+                        var bg = res && res.badges;
+                        if (bg && typeof bg === "object") {
+                            var raw = bg.__syBadgeRaw || bg;
+                            syNeutralizeAll(raw);
+                            if (!bg.__syIsBadgeProxy) {
+                                res.badges = new Proxy(raw, {
+                                    get: function (t, k) {
+                                        if (k === "__syIsBadgeProxy") return true;
+                                        if (k === "__syBadgeRaw") return t;
+                                        var v = t[k];
+                                        if (v && typeof v === "object" && /^\d+$/.test(String(k))) syNeutralizeOne(v);
+                                        return v;
+                                    },
+                                    set: function (t, k, v) {
+                                        if (v && typeof v === "object" && /^\d+$/.test(String(k))) syNeutralizeOne(v);
+                                        t[k] = v;
+                                        return true;
+                                    },
+                                    deleteProperty: function (t, k) { delete t[k]; return true; }
+                                });
+                            }
+                        }
+                    } catch (eBadge) {}
+                    return res;
+                };
+                sySess.get = function (keys, cb) {
+                    if (typeof keys === "function") {
+                        var cb1 = keys; keys = null;
+                        return syOrigSessGet(null, function (v) { try { cb1(syFixBadges(v)); } catch (eB1) { cb1(v); } });
+                    }
+                    if (typeof cb === "function") return syOrigSessGet(keys, function (v) { try { cb(syFixBadges(v)); } catch (eB2) { cb(v); } });
+                    var p = syOrigSessGet(keys, null);
+                    try { if (p && typeof p.then === "function") p = p.then(syFixBadges); } catch (eB3) {}
+                    return p;
+                };
+                if (syOrigSessSet) {
+                    sySess.set = function (items, cb) {
+                        try {
+                            if (items && items.badges) {
+                                syNeutralizeAll(items.badges.__syBadgeRaw || items.badges);
+                            }
+                        } catch (eSet) {}
+                        return syOrigSessSet(items, cb);
+                    };
+                }
+            }
+        } catch (eSess) {}
         // 0e) chrome.extension 兼容（v20，Violentmonkey SW 启动即死修复）：VM 2.50
         //     的 sw.js 顶层 probe chrome.extension.isAllowedFileSchemeAccess /
         //     isAllowedIncognitoAccess（真实 SW 实证报
