@@ -24,6 +24,9 @@
         ".sy-ann-pop-note{white-space:pre-wrap;}",
         ".sy-ann-pop-empty{color:#999;font-style:italic;}",
         ".sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}",
+        ".sy-ann-inline{font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.18);border-radius:3px;padding:0 3px;margin-left:3px;cursor:pointer;vertical-align:super;line-height:1;white-space:nowrap;}",
+        ".sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}",
+        ".sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}",
         "@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}",
         ".sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}"
     ].join("");
@@ -59,7 +62,7 @@
                 var p = n.parentElement;
                 if (!p) return NodeFilter.FILTER_REJECT;
                 if (p.closest("script,style,noscript,textarea,xmp")) return NodeFilter.FILTER_REJECT;
-                if (p.closest(".sy-ann-hl,.sy-ann-bubble")) return NodeFilter.FILTER_REJECT;
+                if (p.closest(".sy-ann-hl,.sy-ann-bubble,.sy-ann-inline,.sy-ann-pop")) return NodeFilter.FILTER_REJECT;
                 if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
                 return NodeFilter.FILTER_ACCEPT;
             }
@@ -130,6 +133,23 @@
                 wrapped++;
             } catch (e) { /* 节点已失效等情况忽略 */ }
         }
+        // 内联小字：高亮后附截断的批注摘要，页面内不点开即可快速浏览
+        if (wrapped && ann.note && String(ann.note).trim()) {
+            try {
+                var marks = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + renderedId + '"]');
+                var lastMark = marks[marks.length - 1];
+                var nx = lastMark && lastMark.nextSibling;
+                if (lastMark && lastMark.parentNode && !(nx && nx.nodeType === 1 && nx.classList.contains("sy-ann-inline"))) {
+                    var inline = document.createElement("span");
+                    inline.className = "sy-ann-inline";
+                    inline.setAttribute("data-ann-id", String(ann.id || ""));
+                    var nt = String(ann.note).replace(/\s+/g, " ").trim();
+                    inline.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
+                    inline.title = nt;
+                    lastMark.parentNode.insertBefore(inline, lastMark.nextSibling);
+                }
+            } catch (e) { /* 忽略 */ }
+        }
         return wrapped;
     }
 
@@ -185,26 +205,103 @@
      */
     function markAtPoint(x, y) {
         var el = document.elementFromPoint(x, y);
-        var m = el && el.closest ? el.closest(".sy-ann-hl") : null;
+        var m = el && el.closest ? el.closest(".sy-ann-hl,.sy-ann-inline") : null;
         if (m) return m;
-        var marks = document.querySelectorAll("mark.sy-ann-hl");
+        var marks = document.querySelectorAll("mark.sy-ann-hl,.sy-ann-inline");
         for (var i = 0; i < marks.length; i++) {
             if (pointInRect(x, y, marks[i].getBoundingClientRect())) return marks[i];
         }
         return null;
     }
 
-    // 点击高亮 → 通知宿主打开思源弹框（内容与按钮由宿主渲染，避开页面 CSP）
+    // ===== 悬浮/点击轻量小窗（页内渲染、数据已在页内免内核往返，快速浏览）=====
+    var popPinned = false;
+    var popHover = false;
+
+    function findAnn(id) {
+        for (var i = 0; i < list.length; i++) if (String(list[i].id) === String(id)) return list[i];
+        return null;
+    }
+
+    function ensurePop() {
+        var p = document.getElementById("sy-ann-pop");
+        if (p) return p;
+        p = document.createElement("div");
+        p.id = "sy-ann-pop";
+        p.className = "sy-ann-pop";
+        p.style.display = "none";
+        try { p.setAttribute("popover", "manual"); } catch (e) {}
+        p.addEventListener("click", function (e) {
+            var b = e.target.closest ? e.target.closest("[data-ann-act]") : null;
+            if (!b) return;
+            e.stopPropagation();
+            var act = b.getAttribute("data-ann-act");
+            if (act === "edit") {
+                var id = p.getAttribute("data-ann-id");
+                hidePop(true);
+                window.__syAnnOpen = { id: id, x: 0, y: 0 };
+            } else if (act === "close") {
+                hidePop(true);
+            }
+        });
+        p.addEventListener("mouseenter", function () { popHover = true; });
+        p.addEventListener("mouseleave", function () { popHover = false; if (!popPinned) hidePop(); });
+        document.body.appendChild(p);
+        return p;
+    }
+
+    function showPop(ann, x, y, pinned) {
+        var p = ensurePop();
+        popPinned = !!pinned;
+        p.setAttribute("data-ann-id", String(ann.id || ""));
+        var note = String(ann.note || "").trim();
+        var html = "";
+        if (ann.quote) html += '<div class="sy-ann-pop-quote">' + esc(ann.quote) + "</div>";
+        html += note ? '<div class="sy-ann-pop-note">' + esc(note) + "</div>" : '<div class="sy-ann-pop-empty">（无批注）</div>';
+        html += '<div class="sy-ann-pop-actions"><button data-ann-act="edit">在思源编辑</button><button data-ann-act="close">关闭</button></div>';
+        p.innerHTML = html;
+        var px = Math.min(Math.max(x + 12, 8), Math.max(8, window.innerWidth - 350));
+        var py = Math.min(Math.max(y + 12, 8), Math.max(8, window.innerHeight - 200));
+        p.style.left = px + "px"; p.style.top = py + "px";
+        setPos("sy-ann-pop", Math.round(px), Math.round(py));
+        layerShow(p, "block");
+    }
+
+    function hidePop(force) {
+        if (popPinned && !force) return;
+        popPinned = false;
+        var p = document.getElementById("sy-ann-pop");
+        if (p) layerHide(p);
+    }
+
+    // 悬浮高亮/内联小字 → 轻量小窗
+    document.addEventListener("mouseover", function (e) {
+        var m = e.target.closest ? e.target.closest(".sy-ann-hl,.sy-ann-inline") : null;
+        if (!m || popPinned) return;
+        var id = m.getAttribute("data-ann-id");
+        var cur = document.getElementById("sy-ann-pop");
+        if (cur && cur.style.display !== "none" && cur.getAttribute("data-ann-id") === String(id)) return;
+        var ann = findAnn(id);
+        if (ann) showPop(ann, e.clientX, e.clientY, false);
+    }, true);
+    document.addEventListener("mouseout", function (e) {
+        var m = e.target.closest ? e.target.closest(".sy-ann-hl,.sy-ann-inline") : null;
+        if (!m || popPinned || popHover) return;
+        var to = e.relatedTarget;
+        if (to && to.closest && to.closest("#sy-ann-pop")) return;
+        hidePop();
+    }, true);
+
+    // 点击高亮/内联小字 → 固定快速小窗（不开思源窗口）;「在思源编辑」按钮才开。点别处收起
     document.addEventListener("click", function (e) {
+        var inPop = e.target.closest ? e.target.closest("#sy-ann-pop") : null;
+        if (inPop) return;
         var m = markAtPoint(e.clientX, e.clientY);
-        if (!m) return;
+        if (!m) { hidePop(true); return; }
         e.preventDefault();
         e.stopImmediatePropagation();
-        window.__syAnnOpen = {
-            id: m.getAttribute("data-ann-id"),
-            x: Math.round(e.clientX),
-            y: Math.round(e.clientY),
-        };
+        var ann = findAnn(m.getAttribute("data-ann-id"));
+        if (ann) showPop(ann, e.clientX, e.clientY, true);
     }, true);
 
     // ===== 选区悬浮小气泡 =====
@@ -298,6 +395,21 @@
         for (var i = 0; i < (items || []).length; i++) {
             list.push(items[i]);
             wrapOne(items[i]);
+        }
+    };
+
+    // 编辑后刷新批注文本（内联小字 + 缓存），不重新包裹高亮
+    window.__syAnnSetNotes = function (items) {
+        for (var i = 0; i < (items || []).length; i++) {
+            var it = items[i];
+            for (var j = 0; j < list.length; j++) if (String(list[j].id) === String(it.id)) list[j].note = it.note;
+            var safeId = String(it.id || "").replace(/[^A-Za-z0-9_-]/g, "");
+            var inl = document.querySelector('.sy-ann-inline[data-ann-id="' + safeId + '"]');
+            if (inl) {
+                var nt = String(it.note || "").replace(/\s+/g, " ").trim();
+                inl.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
+                inl.title = nt;
+            }
         }
     };
 

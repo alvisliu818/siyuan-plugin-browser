@@ -69,6 +69,9 @@ const ANN_CSS = `
 .sy-ann-pop-note{white-space:pre-wrap;}
 .sy-ann-pop-empty{color:#999;font-style:italic;}
 .sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}
+.sy-ann-inline{font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.18);border-radius:3px;padding:0 3px;margin-left:3px;cursor:pointer;vertical-align:super;line-height:1;white-space:nowrap;}
+.sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}
+.sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}
 @keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}
 .sy-ann-flash{animation:syAnnFlash 1.8s ease-out;}
 `;
@@ -104,6 +107,11 @@ export class AnnotationController {
                 console.warn("[browser-plugin] annotation insertCSS failed:", e);
             }
             await webview.executeJavaScript(script);
+            // 回到页签（如从思源编辑窗切回）时刷新批注文本，内联小字/小窗保持最新
+            if (!(webview as any).__syAnnNoteHook) {
+                (webview as any).__syAnnNoteHook = true;
+                webview.addEventListener("focus", () => void this.refreshNotes(webview));
+            }
             // SPA/懒加载正文晚于 dom-ready 渲染：补画两轮（已包裹的标注不会重复包裹）
             for (const delay of [2000, 5000]) {
                 setTimeout(() => {
@@ -123,6 +131,20 @@ export class AnnotationController {
         } catch (e) {
             console.warn("[browser-plugin] annotation inject failed:", e);
         }
+    }
+
+    /** 重拉本页批注并刷新页内内联小字/缓存（编辑后切回页签时调用） */
+    private async refreshNotes(webview: IWebviewTag): Promise<void> {
+        try {
+            const url = String((webview as any).getURL?.() || "");
+            if (!/^https?:\/\//i.test(url)) return;
+            const urlKey = AnnotationStore.normalizeKey(url);
+            const page = this.store.find(urlKey);
+            if (!page?.docId) return;
+            const items = await this.fetchAnnotations(page.docId);
+            this.pageCache.set(urlKey, items);
+            await webview.executeJavaScript("window.__syAnnSetNotes && window.__syAnnSetNotes(" + JSON.stringify(items) + ");");
+        } catch {}
     }
 
     /** 从 URL 提取标注定位片段（#syann=<标注id>） */

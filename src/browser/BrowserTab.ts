@@ -99,6 +99,10 @@ export class BrowserTab {
     private viewportRO: ResizeObserver | null = null;
     private zoomMO: MutationObserver | null = null;
     private onWinResize: (() => void) | null = null;
+    /** 视口同步自激抑制：syncViewport 写 webview 尺寸/zoom 会改变容器矩形进而再触发
+     *  ResizeObserver，形成「写→RO→写」反馈环（开新窗口时布局/zoom 刷新kick它→工具栏
+     *  抖动）。写入后短暂忽略非 force 回调，打断自激;真实外部 resize 稍后仍会同步。 */
+    private syncSuppressUntil = 0;
     private lastViewport = { w: 0, h: 0, z: 1 };
     private lastNudgeAt = 0;
 
@@ -1556,7 +1560,9 @@ export class BrowserTab {
         window.addEventListener("resize", this.onWinResize);
         // 思源界面缩放（documentElement style.zoom 内联修改）时重新同步
         try {
-            this.zoomMO = new MutationObserver(() => this.syncViewport(true));
+            // 非 force：仅当尺寸/zoom 真变（lastViewport 守卫检出）才写样式，避免开新窗
+            // 时无关的 documentElement class/style 变动强制写尺寸引发抖动
+            this.zoomMO = new MutationObserver(() => this.syncViewport());
             this.zoomMO.observe(document.documentElement, { attributes: true, attributeFilter: ["style", "class"] });
         } catch {}
         this.syncViewport(true);
@@ -1564,6 +1570,8 @@ export class BrowserTab {
 
     private syncViewport(force = false): void {
         if (this.disposed) return;
+        // 自激抑制窗口内的非 force 回调（自身写入引发的 RO）直接跳过，打断反馈环
+        if (!force && Date.now() < this.syncSuppressUntil) return;
         const container = this.element.querySelector(".sy-browser-content") as HTMLElement | null;
         const wv = this.webview as unknown as HTMLElement | null;
         if (!container || !wv) return;
@@ -1582,9 +1590,13 @@ export class BrowserTab {
         wv.style.zoom = z === 1 ? "" : String(1 / z);
         wv.style.width = w + "px";
         wv.style.height = h + "px";
+        // 本次写入会扰动容器矩形触发 RO;短暂抑制非 force 回调防自激抖动
+        this.syncSuppressUntil = Date.now() + 150;
     }
 
-    /** guest 视口与目标尺寸不一致时，抖动 1px 强制 guest 重排（10s 节流防循环） */
+    /** guest 视口与目标尺寸不一致时强制 guest 重排（10s 节流防循环）。
+     *  不再 ±1px 抖元素尺寸——那会造成可见的工具栏/页面周期抖动;尺寸保持目标值，
+     *  改在 guest 内派发 resize 事件让页面按当前视口重排，无可见抖动。 */
     private nudgeViewport(): void {
         const now = Date.now();
         if (now - this.lastNudgeAt < 10_000) return;
@@ -1592,17 +1604,14 @@ export class BrowserTab {
         const t = this.lastViewport;
         const wv = this.webview as unknown as HTMLElement | null;
         if (!t.w || !wv) return;
-        console.warn("[browser-plugin] guest viewport desynced, nudging:", JSON.stringify(t));
+        console.warn("[browser-plugin] guest viewport desynced, reflow:", JSON.stringify(t));
         try {
-            wv.style.width = t.w + 1 + "px";
-            wv.style.height = t.h + 1 + "px";
-            void wv.offsetHeight;
-            setTimeout(() => {
-                try {
-                    wv.style.width = t.w + "px";
-                    wv.style.height = t.h + "px";
-                } catch {}
-            }, 80);
+            wv.style.width = t.w + "px";
+            wv.style.height = t.h + "px";
+            this.syncSuppressUntil = Date.now() + 150;
+        } catch {}
+        try {
+            this.webview.executeJavaScript("window.dispatchEvent(new Event('resize'))").catch(() => {});
         } catch {}
     }
 
@@ -1664,13 +1673,14 @@ export class BrowserTab {
                     // 视口校验：guest 视口停在旧尺寸时抖动重排（容器缩放/zoom 变化后
                     // Electron webview 不主动同步，页面按小视口排版露白）
                     const t = this.lastViewport;
-                    if (
-                        t.w > 0 &&
-                        typeof healthy.w === "number" &&
-                        typeof healthy.h === "number" &&
-                        (Math.abs(healthy.w - t.w) > 4 || Math.abs(healthy.h - t.h) > 4)
-                    ) {
-                        this.nudgeViewport();
+                    // guest innerWidth/Height 受 webview zoom 补偿缩放（= 目标×z），
+                    // 与未缩放目标直接比会恒 desync → 反复 nudge 抖动。同时比对
+                    // 原始目标与 zoom 换算目标，两者都差才判真 desync。
+                    if (t.w > 0 && typeof healthy.w === "number" && typeof healthy.h === "number") {
+                        const z = t.z || 1;
+                        const desyncW = Math.abs(healthy.w - t.w) > 4 && Math.abs(healthy.w - t.w * z) > 4;
+                        const desyncH = Math.abs(healthy.h - t.h) > 4 && Math.abs(healthy.h - t.h * z) > 4;
+                        if (desyncW || desyncH) this.nudgeViewport();
                     }
                 }
             } catch {}

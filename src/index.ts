@@ -1289,6 +1289,19 @@ export default class BrowserPlugin extends Plugin {
         this.setting.open(this.name);
     }
 
+    /** 覆盖基类 onDataChanged（默认整体重载插件）。多窗口下任一实例 saveData 会
+     *  通知其它实例;若走默认重载，顶栏图标/dock 反复注销重注册，且重载再 saveData
+     *  形成跨窗口乒乓 → 顶栏+侧栏周期抖动。这里只重读存储刷新 UI，不重载插件。 */
+    async onDataChanged(): Promise<void> {
+        await Promise.all([
+            this.settingsStore.load(),
+            this.bookmarksStore.load(),
+            this.historyStore.load(),
+            this.downloadsStore.load(),
+            this.annotationStore.load(),
+        ]);
+    }
+
     async onLayoutReady(): Promise<void> {
         // 全局引用，便于页签/Dock 的 init 回调中访问插件实例
         (window as any).browserPlugin = this;
