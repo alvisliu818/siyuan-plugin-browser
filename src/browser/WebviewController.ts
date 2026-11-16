@@ -29,9 +29,11 @@ export class WebviewController {
         onFindResult?: (activeMatch: number, matches: number) => void;
         onExcerpt?: (mode: "article" | "part") => void;
         /** 页内标注创建事件（guest 脚本选区气泡触发，轮询通道） */
-        onAnnCreate?: (payload: { quote?: string; prefix?: string; suffix?: string }) => void;
-        /** 点击高亮 → 宿主打开思源弹框（guest 轮询通道） */
+        onAnnCreate?: (payload: { quote?: string; prefix?: string; suffix?: string; color?: string }) => void;
+        /** 点击高亮 → 宿主打开标注窗（guest 轮询通道） */
         onAnnOpen?: (payload: { id?: string; x?: number; y?: number }) => void;
+        /** 页内小窗改颜色/标签 → 宿主持久化（guest 轮询通道） */
+        onAnnMeta?: (payload: { id?: string; color?: string; tags?: string[] }) => void;
         /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
         /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
@@ -787,7 +789,7 @@ export class WebviewController {
             } catch { return; }
             try {
                 this.webview
-                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null})")
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null})")
                     .then((r: any) => {
                         if (r && r.t) {
                             this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
@@ -801,6 +803,9 @@ export class WebviewController {
                         } else if (r && r.o) {
                             this.webview.executeJavaScript("window.__syAnnOpen = null").catch(() => {});
                             this.callbacks.onAnnOpen?.(r.o);
+                        } else if (r && r.m) {
+                            this.webview.executeJavaScript("window.__syAnnMeta = null").catch(() => {});
+                            this.callbacks.onAnnMeta?.(r.m);
                         }
                     })
                     .catch(() => {});

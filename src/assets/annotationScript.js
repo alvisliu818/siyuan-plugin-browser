@@ -24,7 +24,23 @@
         ".sy-ann-pop-note{white-space:pre-wrap;}",
         ".sy-ann-pop-empty{color:#999;font-style:italic;}",
         ".sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}",
-        ".sy-ann-inline{font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.18);border-radius:3px;padding:0 3px;margin-left:3px;cursor:pointer;vertical-align:super;line-height:1;white-space:nowrap;}",
+        ".sy-ann-inline{display:block;font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.12);border-radius:3px;padding:0 3px;margin:2px 0 0;cursor:pointer;line-height:1.4;}",
+        ".sy-ann-c-yellow{background:rgba(255,213,0,.4)!important;}",
+        ".sy-ann-c-green{background:rgba(120,220,120,.45)!important;}",
+        ".sy-ann-c-blue{background:rgba(120,180,255,.45)!important;}",
+        ".sy-ann-c-pink{background:rgba(255,150,200,.45)!important;}",
+        ".sy-ann-c-purple{background:rgba(190,140,255,.45)!important;}",
+        ".sy-ann-swatches{display:flex;gap:4px;align-items:center;margin:6px 0;}",
+        ".sy-ann-sw{width:16px;height:16px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0;}",
+        ".sy-ann-sw.on{border-color:#333;}",
+        ".sy-ann-sw-yellow{background:rgba(255,213,0,.9);}",
+        ".sy-ann-sw-green{background:rgba(120,220,120,.9);}",
+        ".sy-ann-sw-blue{background:rgba(120,180,255,.9);}",
+        ".sy-ann-sw-pink{background:rgba(255,150,200,.9);}",
+        ".sy-ann-sw-purple{background:rgba(190,140,255,.9);}",
+        ".sy-ann-tags{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0;}",
+        ".sy-ann-tag{font-size:11px;background:#eef;border-radius:3px;padding:1px 6px;cursor:pointer;color:#335;}",
+        ".sy-ann-taginput{font-size:12px;border:1px solid #ddd;border-radius:4px;padding:2px 6px;width:110px;}",
         ".sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}",
         ".sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}",
         "@keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}",
@@ -125,7 +141,7 @@
                 if (sp.e < n.nodeValue.length) n.splitText(sp.e);
                 var target = sp.s > 0 ? n.splitText(sp.s) : n;
                 var mark = document.createElement("mark");
-                mark.className = "sy-ann-hl";
+                mark.className = "sy-ann-hl sy-ann-c-" + (ann.color || "yellow");
                 mark.setAttribute("data-ann-id", String(ann.id || ""));
                 // splitText 后 target 的 nodeValue 恰好是 [s,e) 区间文本，必须带回 mark 内
                 mark.textContent = target.nodeValue;
@@ -223,6 +239,19 @@
         return null;
     }
 
+    var COLORS = ["yellow", "green", "blue", "pink", "purple"];
+    var bubbleColor = "yellow";
+    var popHideTimer = null;
+    function cancelPopHide() { if (popHideTimer) { clearTimeout(popHideTimer); popHideTimer = null; } }
+    // 移开宽限：鼠标离开高亮后延迟收起，留出移入小窗点按钮的时间
+    function schedulePopHide() {
+        cancelPopHide();
+        popHideTimer = setTimeout(function () {
+            popHideTimer = null;
+            if (!popPinned && !popHover) { var p = document.getElementById("sy-ann-pop"); if (p) layerHide(p); }
+        }, 300);
+    }
+
     function ensurePop() {
         var p = document.getElementById("sy-ann-pop");
         if (p) return p;
@@ -232,42 +261,84 @@
         p.style.display = "none";
         try { p.setAttribute("popover", "manual"); } catch (e) {}
         p.addEventListener("click", function (e) {
+            var id = p.getAttribute("data-ann-id");
+            var sw = e.target.closest ? e.target.closest("[data-ann-color]") : null;
+            if (sw) { e.stopPropagation(); setMeta(id, { color: sw.getAttribute("data-ann-color") }); return; }
+            var tg = e.target.closest ? e.target.closest("[data-ann-tag]") : null;
+            if (tg) { e.stopPropagation(); removeTag(id, tg.getAttribute("data-ann-tag")); return; }
             var b = e.target.closest ? e.target.closest("[data-ann-act]") : null;
             if (!b) return;
             e.stopPropagation();
             var act = b.getAttribute("data-ann-act");
-            if (act === "edit") {
-                var id = p.getAttribute("data-ann-id");
-                hidePop(true);
-                window.__syAnnOpen = { id: id, x: 0, y: 0 };
-            } else if (act === "close") {
-                hidePop(true);
+            if (act === "edit") { hidePop(true); window.__syAnnOpen = { id: id, x: 0, y: 0, edit: true }; }
+            else if (act === "close") { hidePop(true); }
+        });
+        p.addEventListener("keydown", function (e) {
+            if (e.key === "Enter" && e.target.classList && e.target.classList.contains("sy-ann-taginput")) {
+                e.preventDefault(); e.stopPropagation();
+                var v = String(e.target.value || "").trim();
+                if (v) { addTag(p.getAttribute("data-ann-id"), v); e.target.value = ""; }
             }
         });
-        p.addEventListener("mouseenter", function () { popHover = true; });
-        p.addEventListener("mouseleave", function () { popHover = false; if (!popPinned) hidePop(); });
+        p.addEventListener("mouseenter", function () { popHover = true; cancelPopHide(); });
+        p.addEventListener("mouseleave", function () { popHover = false; if (!popPinned) schedulePopHide(); });
         document.body.appendChild(p);
         return p;
     }
 
-    function showPop(ann, x, y, pinned) {
-        var p = ensurePop();
-        popPinned = !!pinned;
-        p.setAttribute("data-ann-id", String(ann.id || ""));
+    function applyColor(id, color) {
+        var safeId = String(id || "").replace(/[^A-Za-z0-9_-]/g, "");
+        var ms = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + safeId + '"]');
+        for (var i = 0; i < ms.length; i++) ms[i].className = "sy-ann-hl sy-ann-c-" + (color || "yellow");
+    }
+    function setMeta(id, patch) {
+        var ann = findAnn(id);
+        if (!ann) return;
+        if (patch.color) ann.color = patch.color;
+        if (patch.tags) ann.tags = patch.tags;
+        window.__syAnnMeta = { id: id, color: ann.color || "yellow", tags: ann.tags || [] };
+        applyColor(id, ann.color);
+        var p = document.getElementById("sy-ann-pop");
+        if (p && p.style.display !== "none" && p.getAttribute("data-ann-id") === String(id)) renderPopBody(p, ann);
+    }
+    function addTag(id, t) { var a = findAnn(id); if (!a) return; var tags = (a.tags || []).slice(); if (tags.indexOf(t) < 0) tags.push(t); setMeta(id, { tags: tags }); }
+    function removeTag(id, t) { var a = findAnn(id); if (!a) return; setMeta(id, { tags: (a.tags || []).filter(function (x) { return x !== t; }) }); }
+
+    function renderPopBody(p, ann) {
         var note = String(ann.note || "").trim();
         var html = "";
         if (ann.quote) html += '<div class="sy-ann-pop-quote">' + esc(ann.quote) + "</div>";
         html += note ? '<div class="sy-ann-pop-note">' + esc(note) + "</div>" : '<div class="sy-ann-pop-empty">（无批注）</div>';
+        html += '<div class="sy-ann-swatches">';
+        for (var i = 0; i < COLORS.length; i++) {
+            var c = COLORS[i];
+            html += '<button class="sy-ann-sw sy-ann-sw-' + c + ((ann.color || "yellow") === c ? " on" : "") + '" data-ann-color="' + c + '" title="' + c + '"></button>';
+        }
+        html += "</div>";
+        var tags = ann.tags || [];
+        html += '<div class="sy-ann-tags">';
+        for (var j = 0; j < tags.length; j++) html += '<span class="sy-ann-tag" data-ann-tag="' + esc(tags[j]) + '" title="点击移除">' + esc(tags[j]) + " ×</span>";
+        html += '<input class="sy-ann-taginput" placeholder="+标签(回车)" />';
+        html += "</div>";
         html += '<div class="sy-ann-pop-actions"><button data-ann-act="edit">在思源编辑</button><button data-ann-act="close">关闭</button></div>';
         p.innerHTML = html;
+    }
+
+    function showPop(ann, x, y, pinned) {
+        var p = ensurePop();
+        cancelPopHide();
+        popPinned = !!pinned;
+        p.setAttribute("data-ann-id", String(ann.id || ""));
+        renderPopBody(p, ann);
         var px = Math.min(Math.max(x + 12, 8), Math.max(8, window.innerWidth - 350));
-        var py = Math.min(Math.max(y + 12, 8), Math.max(8, window.innerHeight - 200));
+        var py = Math.min(Math.max(y + 12, 8), Math.max(8, window.innerHeight - 240));
         p.style.left = px + "px"; p.style.top = py + "px";
         setPos("sy-ann-pop", Math.round(px), Math.round(py));
         layerShow(p, "block");
     }
 
     function hidePop(force) {
+        cancelPopHide();
         if (popPinned && !force) return;
         popPinned = false;
         var p = document.getElementById("sy-ann-pop");
@@ -280,7 +351,7 @@
         if (!m || popPinned) return;
         var id = m.getAttribute("data-ann-id");
         var cur = document.getElementById("sy-ann-pop");
-        if (cur && cur.style.display !== "none" && cur.getAttribute("data-ann-id") === String(id)) return;
+        if (cur && cur.style.display !== "none" && cur.getAttribute("data-ann-id") === String(id)) { cancelPopHide(); return; }
         var ann = findAnn(id);
         if (ann) showPop(ann, e.clientX, e.clientY, false);
     }, true);
@@ -289,7 +360,7 @@
         if (!m || popPinned || popHover) return;
         var to = e.relatedTarget;
         if (to && to.closest && to.closest("#sy-ann-pop")) return;
-        hidePop();
+        schedulePopHide();
     }, true);
 
     // 点击高亮/内联小字 → 固定快速小窗（不开思源窗口）;「在思源编辑」按钮才开。点别处收起
@@ -319,8 +390,17 @@
         b.className = "sy-ann-bubble";
         b.style.display = "none";
         try { b.setAttribute("popover", "manual"); } catch (e) {}
-        b.innerHTML = '<button class="sy-ann-create" data-ann-act="create">标注</button>' +
+        b.innerHTML = '<span class="sy-ann-swatches">' + COLORS.map(function (c) { return '<button class="sy-ann-sw sy-ann-sw-' + c + (c === "yellow" ? " on" : "") + '" data-ann-color="' + c + '" title="' + c + '"></button>'; }).join("") + "</span>" +
+            '<button class="sy-ann-create" data-ann-act="create">标注</button>' +
             '<button data-ann-act="close" title="关闭">×</button>';
+        b.addEventListener("click", function (e) {
+            var sw = e.target.closest ? e.target.closest("[data-ann-color]") : null;
+            if (!sw) return;
+            e.stopPropagation();
+            bubbleColor = sw.getAttribute("data-ann-color");
+            var sws = b.querySelectorAll(".sy-ann-sw");
+            for (var i = 0; i < sws.length; i++) sws[i].classList.toggle("on", sws[i] === sw);
+        });
         // mousedown 阶段处理（mouseup 清选区之前），阻止选区被清除
         b.addEventListener("mousedown", function (e) {
             e.preventDefault();
@@ -329,6 +409,7 @@
             if (!t) return;
             var act = t.getAttribute("data-ann-act");
             if (act === "create" && b.__ann) {
+                b.__ann.color = bubbleColor;
                 window.__syAnnCreate = b.__ann;
                 b.__ann = null;
                 try { window.getSelection().removeAllRanges(); } catch (err) {}
@@ -402,7 +483,14 @@
     window.__syAnnSetNotes = function (items) {
         for (var i = 0; i < (items || []).length; i++) {
             var it = items[i];
-            for (var j = 0; j < list.length; j++) if (String(list[j].id) === String(it.id)) list[j].note = it.note;
+            for (var j = 0; j < list.length; j++) {
+                if (String(list[j].id) === String(it.id)) {
+                    list[j].note = it.note;
+                    if (it.color) list[j].color = it.color;
+                    if (it.tags) list[j].tags = it.tags;
+                }
+            }
+            if (it.color) applyColor(it.id, it.color);
             var safeId = String(it.id || "").replace(/[^A-Za-z0-9_-]/g, "");
             var inl = document.querySelector('.sy-ann-inline[data-ann-id="' + safeId + '"]');
             if (inl) {

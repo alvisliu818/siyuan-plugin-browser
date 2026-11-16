@@ -16,6 +16,7 @@ export interface AnnCreatePayload {
     quote?: string;
     prefix?: string;
     suffix?: string;
+    color?: string;
 }
 
 /** 传给页内脚本的标注项 */
@@ -31,6 +32,10 @@ interface AnnItem {
     noteId?: string;
     /** 锚点块 id（引述块/段落本身） */
     anchorBlockId?: string;
+    /** 高亮颜色（yellow/green/blue/pink/purple） */
+    color?: string;
+    /** 标签 */
+    tags?: string[];
 }
 
 function htmlUnescape(s: string): string {
@@ -69,7 +74,23 @@ const ANN_CSS = `
 .sy-ann-pop-note{white-space:pre-wrap;}
 .sy-ann-pop-empty{color:#999;font-style:italic;}
 .sy-ann-pop-meta{margin-top:6px;font-size:11px;color:#aaa;}
-.sy-ann-inline{font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.18);border-radius:3px;padding:0 3px;margin-left:3px;cursor:pointer;vertical-align:super;line-height:1;white-space:nowrap;}
+.sy-ann-inline{display:block;font-size:11px;color:#8a6d1a;background:rgba(255,213,0,.12);border-radius:3px;padding:0 3px;margin:2px 0 0;cursor:pointer;line-height:1.4;}
+.sy-ann-c-yellow{background:rgba(255,213,0,.4)!important;}
+.sy-ann-c-green{background:rgba(120,220,120,.45)!important;}
+.sy-ann-c-blue{background:rgba(120,180,255,.45)!important;}
+.sy-ann-c-pink{background:rgba(255,150,200,.45)!important;}
+.sy-ann-c-purple{background:rgba(190,140,255,.45)!important;}
+.sy-ann-swatches{display:flex;gap:4px;align-items:center;margin:6px 0;}
+.sy-ann-sw{width:16px;height:16px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0;}
+.sy-ann-sw.on{border-color:#333;}
+.sy-ann-sw-yellow{background:rgba(255,213,0,.9);}
+.sy-ann-sw-green{background:rgba(120,220,120,.9);}
+.sy-ann-sw-blue{background:rgba(120,180,255,.9);}
+.sy-ann-sw-pink{background:rgba(255,150,200,.9);}
+.sy-ann-sw-purple{background:rgba(190,140,255,.9);}
+.sy-ann-tags{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0;}
+.sy-ann-tag{font-size:11px;background:#eef;border-radius:3px;padding:1px 6px;cursor:pointer;color:#335;}
+.sy-ann-taginput{font-size:12px;border:1px solid #ddd;border-radius:4px;padding:2px 6px;width:110px;}
 .sy-ann-pop-actions{margin-top:8px;display:flex;gap:6px;justify-content:flex-end;}
 .sy-ann-pop-actions button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:2px 8px;cursor:pointer;}
 @keyframes syAnnFlash{0%{background:rgba(255,160,0,.9);}100%{background:rgba(255,213,0,.4);}}
@@ -80,12 +101,97 @@ export class AnnotationController {
     /** 本会话已加载的页面标注缓存（urlKey → 标注列表），供点击弹框快速取用 */
     private pageCache = new Map<string, AnnItem[]>();
     private popupUrl: string | null = null;
+    /** urlKey → webview，供元数据变更后回刷页内高亮/小字 */
+    private webviews = new Map<string, IWebviewTag>();
+    private floatChannel: BroadcastChannel | null = null;
 
     constructor(
         private store: AnnotationStore,
         private i18n: Record<string, string>,
         private getSettings: () => BrowserSettings,
-    ) {}
+    ) {
+        // 轻量浮动窗（独立 OS 窗）经 BroadcastChannel 回传颜色/标签/编辑请求
+        try {
+            this.floatChannel = new BroadcastChannel("sy-ann-float");
+            this.floatChannel.onmessage = (ev: MessageEvent) => {
+                const m: any = ev.data;
+                if (!m || !m.id) return;
+                if (m.type === "meta") void this.applyMeta({ id: m.id, color: m.color, tags: m.tags });
+                else if (m.type === "edit") void this.openEditById(String(m.id));
+            };
+        } catch {}
+    }
+
+    /** 跨页缓存按 id 找标注项及其 urlKey */
+    private findItem(id: string): { urlKey: string; item: AnnItem } | null {
+        for (const [urlKey, items] of this.pageCache) {
+            const item = items.find((i) => i.id === id);
+            if (item) return { urlKey, item };
+        }
+        return null;
+    }
+
+    /** 页内小窗/浮动窗改颜色或标签 → 持久化到锚点 custom-syann 并回刷页内 */
+    async applyMeta(payload: { id?: string; color?: string; tags?: string[] }): Promise<void> {
+        try {
+            const found = this.findItem(String(payload?.id || ""));
+            if (!found) return;
+            const { urlKey, item } = found;
+            if (payload.color) item.color = payload.color;
+            if (Array.isArray(payload.tags)) item.tags = payload.tags;
+            const page = this.store.find(urlKey);
+            if (!page?.docId || !item.anchorBlockId) return;
+            const json = JSON.stringify({
+                id: item.id, url: urlKey, quote: item.quote, prefix: item.prefix,
+                suffix: item.suffix, created: item.created, noteId: item.noteId,
+                color: item.color || "yellow", tags: item.tags || [],
+            });
+            await fetchSyncPost("/api/attr/setBlockAttrs", { id: item.anchorBlockId, attrs: { "custom-syann": json } });
+            const wv = this.webviews.get(urlKey);
+            if (wv) {
+                wv.executeJavaScript("window.__syAnnSetNotes && window.__syAnnSetNotes(" + JSON.stringify([item]) + ");").catch(() => {});
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] annotation applyMeta failed:", e);
+        }
+    }
+
+    /** 浮动窗「在思源编辑」：按 id 找批注块开原生 protyle 窗 */
+    async openEditById(id: string): Promise<void> {
+        const found = this.findItem(id);
+        if (!found?.item.noteId) return;
+        try {
+            openWindow({ doc: { id: found.item.noteId }, width: 560, height: 480, alwaysOnTop: true });
+        } catch (e) {
+            console.warn("[browser-plugin] annotation openEdit failed:", e);
+        }
+    }
+
+    /** 点击高亮 → 轻量浮动窗（独立 OS 窗：快、可多开、可拖出思源边界、可固定） */
+    openFloat(webview: IWebviewTag, url: string, payload: { id?: string; x?: number; y?: number }): void {
+        try {
+            const urlKey = AnnotationStore.normalizeKey(url);
+            this.webviews.set(urlKey, webview);
+            const found = this.findItem(String(payload?.id || ""));
+            const item = found?.item;
+            if (!item) return;
+            const data = {
+                id: item.id, quote: item.quote, note: item.note,
+                color: item.color || "yellow", tags: item.tags || [], url,
+            };
+            const remote = (window as any).require?.("@electron/remote");
+            if (!remote?.BrowserWindow) return;
+            const base = window.location.origin + "/plugins/" + ((window as any).browserPlugin?.name || "siyuan-plugin-browser") + "/";
+            const win = new remote.BrowserWindow({
+                width: 380, height: 340, frame: false, transparent: false,
+                alwaysOnTop: false, skipTaskbar: true,
+                webPreferences: { nodeIntegration: true, contextIsolation: false },
+            });
+            win.loadURL(base + "annotation-popup.html#" + encodeURIComponent(JSON.stringify(data)));
+        } catch (e) {
+            console.warn("[browser-plugin] annotation openFloat failed:", e);
+        }
+    }
 
     /** dom-ready 注入页内脚本并恢复本页标注高亮 */
     async onPageReady(webview: IWebviewTag, url: string, title: string): Promise<void> {
@@ -98,6 +204,7 @@ export class AnnotationController {
                 items = await this.fetchAnnotations(page.docId);
             }
             this.pageCache.set(urlKey, items);
+            this.webviews.set(urlKey, webview);
             const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + ");";
             // 样式必须先于脚本经 insertCSS 注入（不受页面 meta CSP 限制）；
             // 页内 ensureStyle 只作兜底
@@ -215,6 +322,7 @@ export class AnnotationController {
             if (noteItemBlockId) {
                 fetchSyncPost("/api/block/updateBlock", { id: noteItemBlockId, dataType: "markdown", data: "- " }).catch(() => {});
             }
+            const color = String(payload?.color || "yellow");
             const anchorJson = JSON.stringify({
                 id: annId,
                 url: urlKey,
@@ -223,6 +331,8 @@ export class AnnotationController {
                 suffix: String(payload?.suffix || "").slice(0, 60),
                 created: now,
                 noteId: noteItemBlockId,
+                color,
+                tags: [],
             });
             await fetchSyncPost("/api/attr/setBlockAttrs", { id: anchorId, attrs: { "custom-syann": anchorJson } });
             await this.store.upsert(urlKey, page);
@@ -236,6 +346,8 @@ export class AnnotationController {
                     created: now,
                     noteId: noteItemBlockId || undefined,
                     anchorBlockId: anchorId,
+                    color,
+                    tags: [],
                 };
                 webview.executeJavaScript("window.__syAnnApply && window.__syAnnApply(" + JSON.stringify([item]) + ");").catch(() => {});
             }
@@ -430,6 +542,8 @@ export class AnnotationController {
                     created: Number(anchor.created) || 0,
                     noteId: noteId || undefined,
                     anchorBlockId: String(row.id || ""),
+                    color: String(anchor.color || "yellow"),
+                    tags: Array.isArray(anchor.tags) ? anchor.tags.map(String) : [],
                 });
             }
             return items;

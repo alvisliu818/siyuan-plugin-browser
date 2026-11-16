@@ -119,6 +119,7 @@ module.exports = (env, argv) => {
                     { from: "README.zh-CN.md", to: "README.zh-CN.md", noErrorOnMissing: true },
                     { from: "src/i18n", to: "i18n" },
                     { from: "src/preload.js", to: "preload.js" },
+                    { from: "src/assets/annotation-popup.html", to: "annotation-popup.html" },
                 ],
             }),
         ],

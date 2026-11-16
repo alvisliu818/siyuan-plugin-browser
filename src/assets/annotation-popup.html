@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>标注</title>
+<style>
+  html,body{margin:0;height:100%;font-family:sans-serif;font-size:13px;color:#222;background:#fff;}
+  #bar{display:flex;align-items:center;gap:6px;padding:6px 8px;background:#f5f5f5;border-bottom:1px solid #e0e0e0;-webkit-app-region:drag;user-select:none;}
+  #bar .t{flex:1;font-weight:600;font-size:12px;color:#555;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+  #bar button{-webkit-app-region:no-drag;border:none;background:transparent;cursor:pointer;font-size:14px;padding:2px 6px;border-radius:4px;color:#555;}
+  #bar button:hover{background:#e0e0e0;}
+  #bar button.on{color:#1a73e8;background:#dbeafe;}
+  #body{padding:10px 12px;overflow:auto;height:calc(100% - 33px);box-sizing:border-box;}
+  .q{font-size:12px;color:#666;border-left:3px solid #f5c542;padding-left:8px;margin-bottom:6px;white-space:pre-wrap;}
+  .n{white-space:pre-wrap;margin-bottom:6px;}
+  .empty{color:#999;font-style:italic;}
+  .sws{display:flex;gap:5px;align-items:center;margin:6px 0;}
+  .sw{width:16px;height:16px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0;}
+  .sw.on{border-color:#333;}
+  .sw-yellow{background:rgba(255,213,0,.9);} .sw-green{background:rgba(120,220,120,.9);}
+  .sw-blue{background:rgba(120,180,255,.9);} .sw-pink{background:rgba(255,150,200,.9);}
+  .sw-purple{background:rgba(190,140,255,.9);}
+  .tags{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0;}
+  .tag{font-size:11px;background:#eef;border-radius:3px;padding:1px 6px;cursor:pointer;color:#335;}
+  #taginput{font-size:12px;border:1px solid #ddd;border-radius:4px;padding:2px 6px;width:110px;}
+  .acts{display:flex;gap:6px;justify-content:flex-end;margin-top:10px;}
+  .acts button{border:1px solid #ddd;background:#f7f7f7;border-radius:4px;font-size:12px;padding:3px 10px;cursor:pointer;}
+  .acts .pri{background:#1a73e8;color:#fff;border:none;}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="t">标注</span>
+  <button id="pin" title="固定（置顶，点别处不消失）">📌</button>
+  <button id="close" title="关闭">×</button>
+</div>
+<div id="body"></div>
+<script>
+(function () {
+  var data = {};
+  try { data = JSON.parse(decodeURIComponent(location.hash.slice(1) || "{}")); } catch (e) {}
+  var COLORS = ["yellow", "green", "blue", "pink", "purple"];
+  var color = data.color || "yellow";
+  var tags = (data.tags || []).slice();
+  var pinned = false;
+  var chan = null;
+  try { chan = new BroadcastChannel("sy-ann-float"); } catch (e) {}
+  function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
+  function send() { if (chan) chan.postMessage({ type: "meta", id: data.id, color: color, tags: tags }); }
+  function render() {
+    var h = "";
+    if (data.quote) h += '<div class="q">' + esc(data.quote) + "</div>";
+    h += data.note ? '<div class="n">' + esc(data.note) + "</div>" : '<div class="empty">（无批注）</div>';
+    h += '<div class="sws">';
+    for (var i = 0; i < COLORS.length; i++) h += '<button class="sw sw-' + COLORS[i] + (COLORS[i] === color ? " on" : "") + '" data-c="' + COLORS[i] + '"></button>';
+    h += "</div>";
+    h += '<div class="tags">';
+    for (var j = 0; j < tags.length; j++) h += '<span class="tag" data-t="' + esc(tags[j]) + '" title="点击移除">' + esc(tags[j]) + " ×</span>";
+    h += '<input id="taginput" placeholder="+标签(回车)" />';
+    h += "</div>";
+    h += '<div class="acts"><button id="edit" class="pri">在思源编辑</button></div>';
+    document.getElementById("body").innerHTML = h;
+    var sws = document.querySelectorAll(".sw");
+    for (var k = 0; k < sws.length; k++) sws[k].onclick = function () { color = this.getAttribute("data-c"); send(); render(); };
+    var tgs = document.querySelectorAll(".tag");
+    for (var m = 0; m < tgs.length; m++) tgs[m].onclick = function () { var t = this.getAttribute("data-t"); tags = tags.filter(function (x) { return x !== t; }); send(); render(); };
+    var ti = document.getElementById("taginput");
+    ti.onkeydown = function (e) { if (e.key === "Enter") { var v = String(ti.value || "").trim(); if (v && tags.indexOf(v) < 0) { tags.push(v); send(); render(); } } };
+    document.getElementById("edit").onclick = function () { if (chan) chan.postMessage({ type: "edit", id: data.id }); };
+  }
+  render();
+  var remote = null;
+  try { remote = require("@electron/remote"); } catch (e) {}
+  document.getElementById("pin").onclick = function () {
+    pinned = !pinned;
+    this.classList.toggle("on", pinned);
+    try { remote.getCurrentWindow().setAlwaysOnTop(pinned); } catch (e) {}
+  };
+  document.getElementById("close").onclick = function () { try { remote.getCurrentWindow().close(); } catch (e) { window.close(); } };
+})();
+</script>
+</body>
+</html>

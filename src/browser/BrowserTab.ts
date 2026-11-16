@@ -208,8 +208,12 @@ export class BrowserTab {
                 onAnnCreate: (payload: AnnCreatePayload) => {
                     this.annotation?.create(this.webview, this.controller.getCurrentUrl(), this.controller.getCurrentTitle(), payload);
                 },
-                onAnnOpen: (payload: { id?: string; x?: number; y?: number }) => {
-                    this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
+                onAnnOpen: (payload: { id?: string; x?: number; y?: number; edit?: boolean }) => {
+                    if (payload?.edit) this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
+                    else this.annotation?.openFloat(this.webview, this.controller.getCurrentUrl(), payload);
+                },
+                onAnnMeta: (payload: { id?: string; color?: string; tags?: string[] }) => {
+                    void this.annotation?.applyMeta(payload);
                 },
                 onEdgeInstall: (id: string, source: string) =>
                     this.deps.installEdgeExtension?.(id, source) ?? Promise.resolve(),
