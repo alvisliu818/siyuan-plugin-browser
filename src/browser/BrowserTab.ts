@@ -129,7 +129,7 @@ export class BrowserTab {
         this.settings = deps.settings.get();
         this.element = this.buildDom();
         if (deps.annotations) {
-            this.annotation = new AnnotationController(deps.annotations, deps.i18n, () => this.settings);
+            this.annotation = new AnnotationController(deps.annotations, deps.i18n, () => this.settings, (url) => deps.openUrlInNewTab(url));
         }
         this.webview = this.element.querySelector("webview") as unknown as IWebviewTag;
         this.toolbar = new Toolbar(deps.i18n, {

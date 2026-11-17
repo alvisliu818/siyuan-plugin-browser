@@ -422,9 +422,40 @@ export class WebviewController {
                     this.webview.executeJavaScript(`fetch(${JSON.stringify(src)}).then(r=>r.blob()).then(b=>{const r=new FileReader();r.onload=()=>navigator.clipboard.write([new ClipboardItem({'image/png':b})]);r.readAsArrayBuffer(b);});`).catch(() => {});
                 },
                 excerpt: (mode) => this.callbacks.onExcerpt?.(mode),
+                annotate: () => this.annotateFromContextMenu(params.selectionText),
                 onExtensionMenuItem: (item) => this.onExtMenuItem?.(item),
             }, this.extMenuProvider ? this.extMenuProvider() : []);
         });
+    }
+
+    /** 右键菜单「标注」：锚点前后缀在页面里现取（与选区气泡同一套归一化），取不到回落菜单事件自带的选区文本 */
+    private annotateFromContextMenu(fallbackText: string): void {
+        const script = `(function(){
+            var sel = window.getSelection();
+            if (!sel || !sel.rangeCount || sel.isCollapsed) return null;
+            var quote = String(sel.toString() || "").replace(/\\s+/g, " ").trim();
+            if (!quote || quote.length > 3000) return null;
+            var range = sel.getRangeAt(0), pre = "", suf = "";
+            try {
+                if (range.startContainer.nodeType === 3) pre = String(range.startContainer.nodeValue.slice(0, range.startOffset)).replace(/\\s+/g, " ").trim().slice(-30);
+                if (range.endContainer.nodeType === 3) suf = String(range.endContainer.nodeValue.slice(range.endOffset)).replace(/\\s+/g, " ").trim().slice(0, 30);
+            } catch (err) {}
+            return { quote: quote, prefix: pre, suffix: suf };
+        })()`;
+        const fallback = () => {
+            const quote = String(fallbackText || "").replace(/\s+/g, " ").trim();
+            if (quote) this.callbacks.onAnnCreate?.({ quote });
+        };
+        try {
+            this.webview.executeJavaScript(script)
+                .then((r: any) => {
+                    if (r && r.quote) this.callbacks.onAnnCreate?.(r);
+                    else fallback();
+                })
+                .catch(fallback);
+        } catch {
+            fallback();
+        }
     }
 
     /** 扩展右键菜单项：BrowserTab 注入（缓存读取）与点击回调 */

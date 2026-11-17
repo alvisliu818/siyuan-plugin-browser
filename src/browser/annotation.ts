@@ -118,6 +118,8 @@ export class AnnotationController {
         private store: AnnotationStore,
         private i18n: Record<string, string>,
         private getSettings: () => BrowserSettings,
+        /** 列表浮动窗「跳转」目标页签不存在/已导航走时，整页打开 url#syann=id 的兜底 */
+        private openLink?: (url: string) => void,
     ) {
         // 轻量浮动窗（独立 OS 窗）经 BroadcastChannel 回传颜色/标签/编辑/保存批注/移动请求
         try {
@@ -341,11 +343,31 @@ export class AnnotationController {
         }
     }
 
-    /** 列表浮动窗点条目 → 页内滚动到对应高亮并闪烁 */
+    /** 列表浮动窗点条目 → 页内滚动到对应高亮并闪烁。
+     *  页签不在/已导航到别的页面/页内定位失败时，回退整页打开 url#syann=<id>（走 onPageReady 的自动定位流程），不再静默无反应 */
     private gotoAnnotation(id: string, url: string): void {
-        const wv = this.webviews.get(AnnotationStore.normalizeKey(url));
-        if (!wv) return;
-        wv.executeJavaScript("window.__syAnnFocused=null; window.__syAnnFocus && window.__syAnnFocus(" + JSON.stringify(id) + ");").catch(() => {});
+        const urlKey = AnnotationStore.normalizeKey(url);
+        const wv = this.webviews.get(urlKey);
+        if (wv) {
+            let currentKey = "";
+            try { currentKey = AnnotationStore.normalizeKey(String((wv as any).getURL?.() || "")); } catch {}
+            // 页签不在前台(offsetParent null)时页内滚动用户看不见,同样走整页打开
+            let visible = false;
+            try { visible = (wv as any).offsetParent !== null; } catch {}
+            if (currentKey === urlKey && visible) {
+                try {
+                    wv.executeJavaScript("window.__syAnnFocused=null; (window.__syAnnFocus && window.__syAnnFocus(" + JSON.stringify(id) + ")) || false")
+                        .then((found: any) => {
+                            if (!found && this.openLink) this.openLink(url + "#syann=" + id);
+                        })
+                        .catch(() => { if (this.openLink) this.openLink(url + "#syann=" + id); });
+                    return;
+                } catch {
+                    // guest 失效（重建竞态）走兜底
+                }
+            }
+        }
+        if (this.openLink) this.openLink(url + "#syann=" + id);
     }
 
     /** 列表浮动窗「标注此页」→ 页面级标注 */
@@ -382,21 +404,30 @@ export class AnnotationController {
                 (webview as any).__syAnnNoteHook = true;
                 webview.addEventListener("focus", () => void this.refreshNotes(webview));
             }
-            // SPA/懒加载正文晚于 dom-ready 渲染：补画两轮（已包裹的标注不会重复包裹）
-            for (const delay of [2000, 5000]) {
+            // SPA/懒加载正文晚于 dom-ready 渲染：补画几轮（已包裹的标注不会重复包裹）。
+            // 慢页面/广告重的站点正文可能 10s 后才就位,给到 16s。
+            for (const delay of [2000, 5000, 10000, 16000]) {
                 setTimeout(() => {
                     webview.executeJavaScript("window.__syAnnRender && window.__syAnnRender()").catch(() => {});
                 }, delay);
             }
             // 从标注文档链接跳转而来（url 带 #syann=<id>）：滚动到对应高亮；
-            // 高亮渲染时点不定（懒加载），按间隔重试，页内脚本成功后自动置闩
+            // 高亮渲染时点不定（懒加载），按间隔重试，页内脚本成功后自动置闩。
+            // 全部重试后仍未定位（页面内容已变化等）→ 宿主提示,不再无声无息
             const focusId = AnnotationController.extractFocusId(url);
             if (focusId) {
-                for (const delay of [600, 1600, 3200, 6500, 10000]) {
+                for (const delay of [600, 1600, 3200, 6500, 10000, 16000, 22000]) {
                     setTimeout(() => {
                         webview.executeJavaScript("window.__syAnnFocus && window.__syAnnFocus(" + JSON.stringify(focusId) + ");").catch(() => {});
                     }, delay);
                 }
+                setTimeout(() => {
+                    try {
+                        webview.executeJavaScript("window.__syAnnFocused === " + JSON.stringify(focusId)).then((ok: any) => {
+                            if (!ok) showMessage(this.i18n.annotationJumpFailed || "未能在页面上定位该标注（页面内容可能已变化）", 4000, "info");
+                        }).catch(() => {});
+                    } catch {}
+                }, 24500);
             }
         } catch (e) {
             console.warn("[browser-plugin] annotation inject failed:", e);
@@ -652,6 +683,9 @@ export class AnnotationController {
                 notebook: s.annotationNotebook,
                 path: hpath,
                 markdown: md,
+                // 内核 fileTreeCreateContext 恒携带该键，缺省 false 时 create 广播不会被
+                // 原生文档树消费（Files.ts 仅在 listDocTree=true 时 selectItem），文档不显示
+                listDocTree: true,
             });
             if (r?.code !== 0) {
                 showMessage((this.i18n.annotationFailed || "标注失败") + ": " + (r?.msg || "createDoc"), 4000, "error");

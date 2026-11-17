@@ -158,6 +158,7 @@
   "openAnnotationDoc": "Open annotation document",
   "annotationCreated": "Annotated",
   "annotationFailed": "Annotation failed",
+  "annotationJumpFailed": "Could not locate the annotation on the page (content may have changed)",
   "annotationNotebook": "Annotation notebook",
   "annotationNotebookRequired": "Select an annotation notebook in plugin settings first",
   "annotationParentPath": "Annotation path",

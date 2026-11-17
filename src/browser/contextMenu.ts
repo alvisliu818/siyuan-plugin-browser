@@ -26,6 +26,8 @@ export function showWebViewContextMenu(
         saveAs?: (url: string, suggestedName?: string) => void;
         copyImage?: (src: string) => void;
         excerpt?: (mode: "article" | "part") => void;
+        /** 选中文字标注到思源（右键菜单入口，与选区气泡同一链路） */
+        annotate?: () => void;
         /** 点击扩展菜单项（触发 SW 的 onClicked） */
         onExtensionMenuItem?: (item: IExtensionMenuItem) => void;
     },
@@ -117,6 +119,12 @@ export function showWebViewContextMenu(
         click: () => callbacks.excerpt?.("article"),
     });
     if (params.selectionText) {
+        menu.addItem({
+            id: "annotateSelection",
+            iconHTML: iconExcerpt(),
+            label: i18n.annotateSelection || "标注",
+            click: () => callbacks.annotate?.(),
+        });
         menu.addItem({
             id: "excerptPart",
             iconHTML: iconExcerpt(),

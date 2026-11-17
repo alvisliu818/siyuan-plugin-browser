@@ -156,23 +156,34 @@
                 wrapped++;
             } catch (e) { /* 节点已失效等情况忽略 */ }
         }
-        // 内联小字：高亮后附截断的批注摘要，页面内不点开即可快速浏览
-        if (wrapped && inlineVisible && ann.note && String(ann.note).trim()) {
-            try {
-                var marks = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + renderedId + '"]');
-                var lastMark = marks[marks.length - 1];
-                if (lastMark && !lastMark.querySelector(".sy-ann-inline")) {
-                    var inline = document.createElement("span");
-                    inline.className = "sy-ann-inline";
-                    inline.setAttribute("data-ann-id", String(ann.id || ""));
-                    var nt = String(ann.note).replace(/\s+/g, " ").trim();
-                    inline.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
-                    inline.title = nt;
-                    lastMark.appendChild(inline);
-                }
-            } catch (e) { /* 忽略 */ }
-        }
+        // 内联小字：高亮后附截断的批注摘要，页面内不点开即可快速浏览（不存在则补建）
+        if (wrapped) upsertInline(renderedId, ann.note);
         return wrapped;
+    }
+
+    // 内联小字写入/更新：新建标注时批注为空、只有高亮没有小字元素，之后写入的
+    // 批注经 __syAnnSetNotes 回刷时必须补建元素，否则页内永远不显示（刷新页面才出现）
+    function upsertInline(safeId, note) {
+        var nt = String(note || "").replace(/\s+/g, " ").trim();
+        try {
+            var inl = document.querySelector('.sy-ann-inline[data-ann-id="' + safeId + '"]');
+            if (!nt) {
+                if (inl) inl.remove();
+                return;
+            }
+            if (!inl) {
+                if (!inlineVisible) return;
+                var marks = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + safeId + '"]');
+                var lastMark = marks[marks.length - 1];
+                if (!lastMark || lastMark.querySelector(".sy-ann-inline")) return;
+                inl = document.createElement("span");
+                inl.className = "sy-ann-inline";
+                inl.setAttribute("data-ann-id", safeId);
+                lastMark.appendChild(inl);
+            }
+            inl.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
+            inl.title = nt;
+        } catch (e) { /* 节点已失效等情况忽略 */ }
     }
 
     // ===== 悬浮弹窗（鼠标悬浮高亮 → 显示绑定的思源块内容）=====
@@ -557,12 +568,7 @@
             }
             if (it.color) applyColor(it.id, it.color);
             var safeId = String(it.id || "").replace(/[^A-Za-z0-9_-]/g, "");
-            var inl = document.querySelector('.sy-ann-inline[data-ann-id="' + safeId + '"]');
-            if (inl) {
-                var nt = String(it.note || "").replace(/\s+/g, " ").trim();
-                inl.textContent = nt.length > 40 ? nt.slice(0, 40) + "…" : nt;
-                inl.title = nt;
-            }
+            upsertInline(safeId, it.note);
         }
     };
 
