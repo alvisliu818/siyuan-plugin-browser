@@ -221,6 +221,12 @@ export class BrowserTab {
                 onAnnRemove: (payload: { kind?: string; id?: string; quote?: string; prefix?: string; suffix?: string }) => {
                     void this.annotation?.setDisplayOff(this.webview, this.controller.getCurrentUrl(), payload);
                 },
+                onAnnRect: (payload: { id?: string; rect?: { x: number; y: number; w: number; h: number }; vrect?: { x: number; y: number; w: number; h: number } }) => {
+                    void this.annotation?.onRectCaptured(this.webview, this.controller.getCurrentUrl(), this.controller.getCurrentTitle(), payload);
+                },
+                onAnnReanchor: (payload: { id?: string; quote?: string; prefix?: string; suffix?: string }) => {
+                    void this.annotation?.reanchorText(this.webview, this.controller.getCurrentUrl(), payload);
+                },
                 onAnnOpen: (payload: { id?: string; x?: number; y?: number; edit?: boolean }) => {
                     if (payload?.edit) void this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
                     else void this.annotation?.openFloat(this.webview, this.controller.getCurrentUrl(), payload);
@@ -1867,6 +1873,14 @@ export class BrowserTab {
                 },
             });
         }
+        menu.addItem({
+            id: "annotateRect",
+            iconHTML: "",
+            label: this.deps.i18n.annotateRect || "框选标注（截图区域）",
+            click: () => {
+                this.annotation!.beginCapture(this.webview, url);
+            },
+        });
         menu.addItem({
             id: "annotatePage",
             iconHTML: "",

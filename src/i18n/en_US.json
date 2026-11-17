@@ -173,5 +173,12 @@
   "showAnnRemoveDesc": "Show Un-highlight and Un-note buttons in the selection bubble: they only hide the on-page display; the annotation document and its blocks are kept, and the hidden state persists across page reloads.",
   "showAnnFloat": "Show annotation popup on hover/click",
   "showAnnFloatDesc": "Show the annotation float window when hovering or clicking a highlight; when off, only the page highlights and the annotation list (address-bar ✎ menu) remain.",
-  "showAnnFloatOff": "Annotation popup is disabled in settings"
+  "showAnnFloatOff": "Annotation popup is disabled in settings",
+  "annotateRect": "Capture region annotation",
+  "annotationRectCreated": "Region annotation created",
+  "annotationRectCaptureHint": "Drag to select a region on the page; Esc to cancel",
+  "annotationReanchorHint": "Select the new text, then click Re-anchor in the bubble",
+  "annotationRecaptured": "Region re-captured (note kept)",
+  "annotationReanchored": "Text re-selected (note kept)",
+  "annotationReanchorNone": "Only text annotations can be re-anchored (use Re-capture for regions)"
 }

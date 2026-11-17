@@ -40,6 +40,12 @@ interface AnnItem {
     hlOff?: boolean;
     /** 已取消页内批注小字（持久化在锚点 custom-syann 的 inline=false） */
     inlineOff?: boolean;
+    /** 标注类型：缺省 = 文字标注；rect = 框选截图标注 */
+    kind?: "text" | "rect";
+    /** 框选区域（页面文档坐标） */
+    rect?: { x: number; y: number; w: number; h: number };
+    /** 框选截图的 asset 路径（如 /assets/annot/xxx.png） */
+    shot?: string;
 }
 
 function htmlUnescape(s: string): string {
@@ -51,6 +57,10 @@ function htmlUnescape(s: string): string {
         .replace(/&quot;/g, "\"")
         .replace(/&#39;/g, "'")
         .replace(/&amp;/g, "&");
+}
+
+function escMd(t: string): string {
+    return t.replace(/([\[\]])/g, "\\$&");
 }
 
 function joinPath(...parts: string[]): string {
@@ -136,6 +146,16 @@ export class AnnotationController {
                 else if (m.type === "edit" && m.id) void this.openEditById(String(m.id));
                 else if (m.type === "goto" && m.id) this.gotoAnnotation(String(m.id), String(m.url || ""));
                 else if (m.type === "createPage") this.createPageFromFloat(String(m.url || ""));
+                else if (m.type === "recapture" && m.id) {
+                    const f = this.findItem(String(m.id));
+                    const wv = f ? this.webviews.get(f.urlKey) : null;
+                    if (wv) this.beginCapture(wv, String(m.id));
+                }
+                else if (m.type === "reanchorSel" && m.id) {
+                    const f = this.findItem(String(m.id));
+                    const wv = f ? this.webviews.get(f.urlKey) : null;
+                    if (wv) this.beginReanchor(wv, String(m.id));
+                }
                 else if (m.type === "openDoc") void this.openDoc(String(m.url || ""));
                 else if (m.type === "saveNote" && m.id) void this.saveNoteFromFloat(String(m.id), String(m.note ?? ""));
                 else if (m.id && (m.type === "pin" || m.type === "hide" || m.type === "resize" || m.type === "move" || m.type === "close")) {
@@ -266,6 +286,7 @@ export class AnnotationController {
             const data = {
                 id: item.id, quote: item.quote, note: item.note,
                 color: item.color || "yellow", tags: item.tags || [], url,
+                kind: item.kind || "text", shot: item.shot || "",
                 hover: !!payload?.hover,
             };
             const remote = (window as any).require?.("@electron/remote");
@@ -323,7 +344,7 @@ export class AnnotationController {
             const listKey = "list:" + urlKey;
             const data = {
                 mode: "list", url, listKey,
-                items: (items || []).map((i) => ({ id: i.id, quote: i.quote, note: i.note, color: i.color || "yellow", tags: i.tags || [] })),
+                items: (items || []).map((i) => ({ id: i.id, quote: i.quote, note: i.note, color: i.color || "yellow", tags: i.tags || [], kind: i.kind || "text" })),
             };
             const remote = (window as any).require?.("@electron/remote");
             if (!remote?.BrowserWindow) return;
@@ -572,37 +593,13 @@ export class AnnotationController {
             // - 有选区：引述块，链接带 #syann=<id> 片段，打开网页后自动滚动到标注高亮；
             // - 无选区：页面级标注，块内容即网页链接，点击打开网页。
             const annUrl = url + "#syann=" + annId;
-            const escMd = (t: string) => t.replace(/([\[\]])/g, "\\$&");
             // 大纲式结构，一次插入两级 markdown（避免插入后查询的竞态）：
             //   - [选中文字](链接)     ← 列表项锚点（custom-syann）
             //       - （批注）          ← 子列表项（noteId，随后清空占位）
             const anchorMd = quote
                 ? "- [" + escMd(quote) + "](" + annUrl + ")\n    - （批注）"
                 : "- [" + escMd(this.safeTitle(title || url)) + "](" + url + ") - " + stamp + "\n    - （批注）";
-            const ins: any = await fetchSyncPost("/api/block/insertBlock", {
-                parentID: page.docId,
-                dataType: "markdown",
-                data: anchorMd,
-            });
-            if (ins?.code !== 0) throw new Error(ins?.msg || "insertBlock failed");
-            // 从返回的 DOM（ops[0].data）里按 data-type 解析各层级块 id，确定性取 id
-            const ops = (Array.isArray(ins.data) ? ins.data : [ins.data])[0]?.doOperations || [];
-            const html = String(ops[0]?.data || "");
-            const tagRe = /<div\b([^>]*)>/g;
-            const byType: Record<string, string[]> = {};
-            let mm: RegExpExecArray | null;
-            while ((mm = tagRe.exec(html))) {
-                const nid = /data-node-id="([^"]+)"/.exec(mm[1]);
-                const dt = /data-type="([^"]+)"/.exec(mm[1]);
-                if (nid && dt) {
-                    (byType[dt[1]] = byType[dt[1]] || []).push(nid[1]);
-                }
-            }
-            const listId = (byType["NodeList"] || [])[0] || "";
-            const itemsInList = byType["NodeListItem"] || [];
-            const anchorId = itemsInList[0] || listId;
-            const noteItemBlockId = itemsInList[1] || "";
-            if (!anchorId) throw new Error("未返回标注块 id");
+            const { anchorId, noteItemId: noteItemBlockId } = await this.insertAnchorBlocks(page.docId, anchorMd);
             // 占位清空（保留空列表项，类似 Logseq 新建 bullet）；
             // 列表项必须用列表语法更新，data:" " 会被内核忽略
             if (noteItemBlockId) {
@@ -753,6 +750,210 @@ export class AnnotationController {
         }
     }
 
+    /** 插入锚点两级块（列表项锚点 + 嵌套批注项），从返回 DOM 解析块 id */
+    private async insertAnchorBlocks(pageDocId: string, anchorMd: string): Promise<{ anchorId: string; noteItemId: string }> {
+        const ins: any = await fetchSyncPost("/api/block/insertBlock", {
+            parentID: pageDocId,
+            dataType: "markdown",
+            data: anchorMd,
+        });
+        if (ins?.code !== 0) throw new Error(ins?.msg || "insertBlock failed");
+            // 从返回的 DOM（ops[0].data）里按 data-type 解析各层级块 id，确定性取 id
+        const ops = (Array.isArray(ins.data) ? ins.data : [ins.data])[0]?.doOperations || [];
+        const html = String(ops[0]?.data || "");
+        const tagRe = /<div\b([^>]*)>/g;
+        const byType: Record<string, string[]> = {};
+        let mm: RegExpExecArray | null;
+        while ((mm = tagRe.exec(html))) {
+                const nid = /data-node-id="([^"]+)"/.exec(mm[1]);
+                const dt = /data-type="([^"]+)"/.exec(mm[1]);
+                if (nid && dt) {
+                    (byType[dt[1]] = byType[dt[1]] || []).push(nid[1]);
+                }
+            }
+        const listId = (byType["NodeList"] || [])[0] || "";
+        const itemsInList = byType["NodeListItem"] || [];
+        const anchorId = itemsInList[0] || listId;
+        const noteItemBlockId = itemsInList[1] || "";
+        if (!anchorId) throw new Error("未返回标注块 id");
+        return { anchorId, noteItemId: noteItemBlockId };
+    }
+
+    /** 上传框选截图到思源 assets(dataURL → PNG → /api/asset/upload),返回 asset 路径 */
+    private async uploadShot(dataUrl: string, domain: string): Promise<string> {
+        const prefix = "data:image/png;base64,";
+        if (!dataUrl.startsWith(prefix)) throw new Error("截图数据不是 PNG");
+        const b64 = dataUrl.slice(prefix.length);
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const safe = String(domain || "page").replace(/[^a-zA-Z0-9_-]+/g, "-");
+        const name = `annot-${safe}-${Date.now().toString(36)}.png`;
+        const fd = new FormData();
+        fd.append("path", "/assets/annot/");
+        fd.append("file", new Blob([bytes], {type: "image/png"}), name);
+        const resp = await fetch("/api/asset/upload", {method: "POST", body: fd});
+        const j: any = await resp.json();
+        if (j?.code !== 0) throw new Error(j?.msg || "上传截图失败");
+        const map = j?.data?.succMap || {};
+        const path = String(j?.data?.path || Object.values(map)[0] || "");
+        if (!path) throw new Error("上传截图失败:内核未返回路径");
+        return path;
+    }
+
+    /** 进入框选模式(id 为空 = 新建框选标注;有 id = 重新框选) */
+    beginCapture(webview: IWebviewTag, id?: string): void {
+        void webview.executeJavaScript("window.__syAnnCaptureStart && window.__syAnnCaptureStart(" + JSON.stringify(id || null) + ");").catch(() => {});
+    }
+
+    /** 进入文字改锚模式:浮窗「重新选中文字」→ 下一次选区在气泡里点「改锚」 */
+    beginReanchor(webview: IWebviewTag, id: string): void {
+        void webview.executeJavaScript("window.__syAnnReanchorPending = " + JSON.stringify(id) + ";").catch(() => {});
+        showMessage(this.i18n.annotationReanchorHint || "请选中新的文字,气泡里点「改锚」", 4000, "info");
+    }
+
+    /** 框选完成回调:新建框选标注 / 重新框选(换图换区域,批注保持对应) */
+    async onRectCaptured(webview: IWebviewTag, url: string, title: string,
+                         payload: { id?: string; rect?: { x: number; y: number; w: number; h: number } }): Promise<void> {
+        const i18n = this.i18n;
+        try {
+            if (!/^https?:\/\//i.test(url)) return;
+            const rect = payload?.rect;
+            if (!rect || rect.w < 10 || rect.h < 10) return;
+            // 宿主侧截屏(视口坐标;遮罩已在页内移除,不会截进图里)
+            const vrect = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.w), height: Math.round(rect.h) };
+            const img: any = await (webview as any).capturePage(vrect);
+            const dataUrl = typeof img?.toDataURL === "function" ? String(img.toDataURL()) : String(img?.dataURL || "");
+            if (!dataUrl.startsWith("data:image/png;base64,")) throw new Error("截屏失败");
+            let domain = "";
+            try { domain = new URL(url).hostname; } catch {}
+            const shot = await this.uploadShot(dataUrl, domain);
+            const urlKey = AnnotationStore.normalizeKey(url);
+            const reId = String(payload?.id || "");
+            if (reId) {
+                await this.updateRectShot(urlKey, reId, shot, rect);
+                return;
+            }
+            const s = this.getSettings();
+            if (!s.annotationNotebook) {
+                showMessage(i18n.annotationNotebookRequired || "请先在插件设置中选择标注保存笔记本", 4000, "error");
+                return;
+            }
+            let page = this.store.find(urlKey);
+            if (!page) page = await this.ensurePageDoc(url, urlKey, title, s);
+            if (!page) return;
+            const now = Date.now();
+            const annId = "ann-" + now.toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+            const annUrl = url + "#syann=" + annId;
+            // 框选锚点 = 图片链接列表项(点击跳回网页并定位框选区)+ 嵌套批注项
+            const anchorMd = "- [![框选](" + shot + ")](" + annUrl + ")\n    - （批注）";
+            const { anchorId, noteItemId: noteItemBlockId } = await this.insertAnchorBlocks(page.docId, anchorMd);
+            fetchSyncPost("/api/block/updateBlock", { id: noteItemBlockId, dataType: "markdown", data: "- " }).catch(() => {});
+            const anchorJson = JSON.stringify({
+                id: annId, url: urlKey, kind: "rect",
+                rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) },
+                shot, created: now, noteId: noteItemBlockId, color: "yellow", tags: [],
+            });
+            await fetchSyncPost("/api/attr/setBlockAttrs", { id: anchorId, attrs: { "custom-syann": anchorJson } });
+            await this.store.upsert(urlKey, page);
+            const item: AnnItem = {
+                id: annId, kind: "rect", quote: "", prefix: "", suffix: "", note: "",
+                created: now, noteId: noteItemBlockId || undefined, anchorBlockId: anchorId,
+                color: "yellow", tags: [], rect, shot,
+            };
+            const cached = this.pageCache.get(urlKey) || [];
+            cached.push(item);
+            this.pageCache.set(urlKey, cached);
+            webview.executeJavaScript("window.__syAnnApply && window.__syAnnApply(" + JSON.stringify([item]) + ");").catch(() => {});
+            showMessage(i18n.annotationRectCreated || "已框选标注", 2000, "info");
+        } catch (e: any) {
+            console.warn("[browser-plugin] annotation rect capture failed:", e);
+            showMessage((i18n.annotationFailed || "标注失败") + ": " + (e?.message || e), 4000, "error");
+        }
+    }
+
+    /** 重新框选:换图换区域;批注内容与 noteId 保持对应 */
+    private async updateRectShot(urlKey: string, id: string, shot: string,
+                                 rect: { x: number; y: number; w: number; h: number }): Promise<void> {
+        const found = this.findItem(id);
+        if (!found?.item.anchorBlockId) throw new Error("找不到原标注");
+        const { item } = found;
+        const oldShot = String(item.shot || "");
+        // 锚点块内容换图(保留链接结构):从块的 markdown 里替换旧 asset 路径
+        const q: any = await fetchSyncPost("/api/query/sql", { stmt: "SELECT markdown FROM blocks WHERE id='" + item.anchorBlockId + "'" });
+        let md = String(q?.data?.[0]?.markdown || "");
+        if (oldShot && md.indexOf(oldShot) >= 0) {
+            md = md.split(oldShot).join(shot);
+        } else {
+            md = "- [![框选](" + shot + ")](" + urlKey + "#syann=" + item.id + ")";
+        }
+        const r: any = await fetchSyncPost("/api/block/updateBlock", { id: item.anchorBlockId, dataType: "markdown", data: md });
+        if (r?.code !== 0) throw new Error(r?.msg || "updateBlock failed");
+        item.shot = shot;
+        item.rect = rect;
+        const json = JSON.stringify({
+            id: item.id, url: urlKey, kind: "rect",
+            rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) },
+            shot, created: item.created, noteId: item.noteId,
+            color: item.color || "yellow", tags: item.tags || [],
+            hl: item.hlOff !== true, inline: item.inlineOff !== true,
+        });
+        await fetchSyncPost("/api/attr/setBlockAttrs", { id: item.anchorBlockId, attrs: { "custom-syann": json } });
+        // 旧截图文件清理(每张截图文件唯一,不会被其他标注引用)
+        if (oldShot) {
+            fetchSyncPost("/api/file/removeFile", { path: oldShot }).catch(() => {});
+        }
+        const wv = this.webviews.get(urlKey);
+        if (wv) {
+            wv.executeJavaScript("window.__syAnnSetNotes && window.__syAnnSetNotes(" + JSON.stringify([item]) + ");").catch(() => {});
+        }
+        showMessage(this.i18n.annotationRecaptured || "已重新框选(批注保持对应)", 2000, "info");
+    }
+
+    /** 文字改锚:换锚点文字与高亮位置,批注内容保持对应 */
+    async reanchorText(webview: IWebviewTag, url: string,
+                       payload: { id?: string; quote?: string; prefix?: string; suffix?: string }): Promise<void> {
+        const i18n = this.i18n;
+        const found = this.findItem(String(payload?.id || ""));
+        if (!found || found.item.kind === "rect" || !found.item.anchorBlockId) {
+            showMessage(i18n.annotationReanchorNone || "只有文字标注支持重新选中(框选标注请用重新框选)", 4000, "info");
+            return;
+        }
+        const quote = String(payload?.quote || "").trim().slice(0, 2000);
+        if (!quote) return;
+        const { urlKey, item } = found;
+        const prefix = String(payload?.prefix || "").slice(0, 60);
+        const suffix = String(payload?.suffix || "").slice(0, 60);
+        try {
+            // 锚点块内容换链接文字(保持链接目标):从块 markdown 里重建 "- [新文字](链接)"
+            const q: any = await fetchSyncPost("/api/query/sql", { stmt: "SELECT markdown FROM blocks WHERE id='" + item.anchorBlockId + "'" });
+            const md = String(q?.data?.[0]?.markdown || "").trim();
+            const linkAt = md.lastIndexOf("](");
+            if (linkAt < 0 || !md.endsWith(")")) throw new Error("锚点块结构异常");
+            const link = md.slice(linkAt + 2, md.length - 1);
+            const newMd = "- [" + escMd(quote) + "](" + link + ")";
+            const r: any = await fetchSyncPost("/api/block/updateBlock", { id: item.anchorBlockId, dataType: "markdown", data: newMd });
+            if (r?.code !== 0) throw new Error(r?.msg || "updateBlock failed");
+            item.quote = quote;
+            item.prefix = prefix;
+            item.suffix = suffix;
+            const json = JSON.stringify({
+                id: item.id, url: urlKey, quote, prefix, suffix, created: item.created,
+                noteId: item.noteId, color: item.color || "yellow", tags: item.tags || [],
+                hl: item.hlOff !== true, inline: item.inlineOff !== true,
+            });
+            await fetchSyncPost("/api/attr/setBlockAttrs", { id: item.anchorBlockId, attrs: { "custom-syann": json } });
+            const wv = this.webviews.get(urlKey);
+            if (wv) {
+                wv.executeJavaScript("window.__syAnnReanchorDone && window.__syAnnReanchorDone(" + JSON.stringify(item) + ");").catch(() => {});
+            }
+            showMessage(i18n.annotationReanchored || "已重新选中文字(批注保持对应)", 2000, "info");
+        } catch (e: any) {
+            console.warn("[browser-plugin] annotation reanchor failed:", e);
+            showMessage((i18n.annotationRemoveFailed || "取消失败") + ": " + (e?.message || e), 4000, "error");
+        }
+    }
+
     /** 定位/创建页面标注文档（存放路径 → 域名 → 页面标题） */
     private async ensurePageDoc(url: string, urlKey: string, title: string, s: BrowserSettings): Promise<AnnotationPageInfo | null> {
         let domain = "";
@@ -828,6 +1029,26 @@ export class AnnotationController {
                     // 旧结构页面级：锚点段落自身即批注（noteId 指向该段，供就地编辑/在思源编辑）
                     note = String(row.content || "");
                     if (!noteId) noteId = String(row.id || "");
+                }
+                if (anchor.kind === "rect") {
+                    items.push({
+                        id: String(anchor.id || row.id),
+                        kind: "rect",
+                        quote: "",
+                        prefix: "",
+                        suffix: "",
+                        note,
+                        created: Number(anchor.created) || 0,
+                        noteId: noteId || undefined,
+                        anchorBlockId: String(row.id || ""),
+                        color: String(anchor.color || "yellow"),
+                        tags: Array.isArray(anchor.tags) ? anchor.tags.map(String) : [],
+                        hlOff: anchor.hl === false,
+                        inlineOff: anchor.inline === false,
+                        rect: anchor.rect && typeof anchor.rect === "object" ? anchor.rect : undefined,
+                        shot: String(anchor.shot || ""),
+                    });
+                    continue;
                 }
                 items.push({
                     id: String(anchor.id || row.id),

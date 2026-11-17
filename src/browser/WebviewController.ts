@@ -38,6 +38,8 @@ export class WebviewController {
         /** 鼠标离开高亮 → 通知悬浮浮动窗自动收起（未固定时） */
         onAnnHoverEnd?: (payload: { id?: string }) => void;
         onAnnRemove?: (payload: { kind?: string; id?: string; quote?: string; prefix?: string; suffix?: string }) => void;
+        onAnnRect?: (payload: { id?: string; rect?: { x: number; y: number; w: number; h: number }; vrect?: { x: number; y: number; w: number; h: number } }) => void;
+        onAnnReanchor?: (payload: { id?: string; quote?: string; prefix?: string; suffix?: string }) => void;
         /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
         onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
         /** webview 渲染进程崩溃（render-process-gone）：宿主应重建 webview 并恢复 lastKnownUrl */
@@ -853,7 +855,7 @@ export class WebviewController {
             } catch { return; }
             try {
                 this.webview
-                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null, h: window.__syAnnHoverEnd || null, r: window.__syAnnRemove || null, g: window.__syGuestMousedownSeq || 0})")
+                    .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null, a: window.__syAnnCreate || null, o: window.__syAnnOpen || null, m: window.__syAnnMeta || null, h: window.__syAnnHoverEnd || null, r: window.__syAnnRemove || null, c: window.__syAnnRectCaptured || null, e2: window.__syAnnReanchor || null, g: window.__syGuestMousedownSeq || 0})")
                     .then((r: any) => {
                         // guest 点击计数独立处理：mousedown 先于 click，可能与其他
                         // 信号同时出现，不能进 else 链
@@ -882,6 +884,12 @@ export class WebviewController {
                         } else if (r && r.r && (r.r.id || r.r.quote)) {
                             this.webview.executeJavaScript("window.__syAnnRemove = null").catch(() => {});
                             this.callbacks.onAnnRemove?.(r.r);
+                        } else if (r && r.c && r.c.rect) {
+                            this.webview.executeJavaScript("window.__syAnnRectCaptured = null").catch(() => {});
+                            this.callbacks.onAnnRect?.(r.c);
+                        } else if (r && r.e2 && (r.e2.id || r.e2.quote)) {
+                            this.webview.executeJavaScript("window.__syAnnReanchor = null").catch(() => {});
+                            this.callbacks.onAnnReanchor?.(r.e2);
                         }
                     })
                     .catch(() => {});

@@ -52,6 +52,11 @@
         ".sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}",
         "@keyframes syAnnFlash{0%{box-shadow:0 0 0 0 rgba(255,140,0,.85);}70%{box-shadow:0 0 0 12px rgba(255,140,0,0);}100%{box-shadow:0 0 0 0 rgba(255,140,0,0);}}",
         ".sy-ann-flash{animation:syAnnFlash 0.9s ease-out 2;}",
+        ".sy-ann-rect{position:absolute;box-sizing:border-box;border:2px solid rgba(255,170,0,.85);background:rgba(255,213,0,.12);cursor:pointer;z-index:2147483640;border-radius:2px;}",
+        ".sy-ann-rect:hover{background:rgba(255,170,0,.2);}",
+        ".sy-ann-capture{position:fixed;left:0;top:0;right:0;bottom:0;z-index:2147483646;cursor:crosshair;background:rgba(0,0,0,.06);}",
+        ".sy-ann-capture-box{position:fixed;border:1px dashed #1a73e8;background:rgba(26,115,232,.12);pointer-events:none;}",
+        ".sy-ann-capture-tip{position:fixed;left:8px;top:8px;z-index:2147483647;background:#1a73e8;color:#fff;font-size:12px;padding:3px 8px;border-radius:4px;font-family:sans-serif;}",
         ".sy-ann-bubble .sy-ann-remove{color:#d93025;font-size:11px;padding:3px 6px;}"
     ].join("");
 
@@ -64,7 +69,9 @@
     }
 
     var list = window.__syAnnList = [];
-    var removeVisible = true; // 选区气泡是否显示「取消高亮/小字」（宿主设置开关，__syAnnInit/SetRemoveVisible 下发）
+    var removeVisible = true;
+    var captureId = null;     // 框选模式:正在为哪条标注重新框选(null=新建)
+    var reanchorPending = null; // 文字改锚模式:待重新选中的标注 id // 选区气泡是否显示「取消高亮/小字」（宿主设置开关，__syAnnInit/SetRemoveVisible 下发）
 
     function esc(s) {
         return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -465,6 +472,8 @@
             '<button class="sy-ann-create" data-ann-act="create">标注</button>' +
             '<button class="sy-ann-remove" data-ann-act="unhl" style="' + (removeVisible ? "" : "display:none;") + '">取消高亮</button>' +
             '<button class="sy-ann-remove" data-ann-act="uninline" style="' + (removeVisible ? "" : "display:none;") + '">取消小字</button>' +
+            '<button class="sy-ann-remove" data-ann-act="uninline" style="' + (removeVisible ? "" : "display:none;") + '">取消小字</button>' +
+            '<button class="sy-ann-remove" data-ann-act="reanchor" style="display:none" title="把这条标注改锚到当前选区(批注保持对应)">改锚</button>' +
             '<button data-ann-act="close" title="关闭">×</button>';
         b.addEventListener("click", function (e) {
             var sw = e.target.closest ? e.target.closest("[data-ann-color]") : null;
@@ -484,6 +493,17 @@
             if (act === "create" && b.__ann) {
                 b.__ann.color = bubbleColor;
                 window.__syAnnCreate = b.__ann;
+                b.__ann = null;
+                try { window.getSelection().removeAllRanges(); } catch (err) {}
+            } else if (act === "reanchor" && b.__ann) {
+                // 文字改锚:换锚点文字与高亮位置,批注内容保持对应(宿主写回)
+                window.__syAnnReanchor = {
+                    id: reanchorPending || b.__ann.id || "",
+                    quote: b.__ann.quote,
+                    prefix: b.__ann.prefix,
+                    suffix: b.__ann.suffix,
+                };
+                reanchorPending = null;
                 b.__ann = null;
                 try { window.getSelection().removeAllRanges(); } catch (err) {}
             } else if ((act === "unhl" || act === "uninline") && b.__ann) {
@@ -534,6 +554,9 @@
             } catch (err) {}
             var b = ensureBubble();
             b.__ann = { quote: quote, prefix: pre, suffix: suf, id: hitId };
+            // 改锚按钮:改锚模式挂起,或选区压着已有高亮(就地改锚)
+            var reBtn = b.querySelector('[data-ann-act="reanchor"]');
+            if (reBtn) reBtn.style.display = (reanchorPending || hitId) ? "" : "none";
             var bx = Math.min(Math.max(r.left + r.width / 2 - 34, 8), window.innerWidth - 90);
             var by = r.top > 40 ? r.top - 34 : r.bottom + 6;
             b.style.left = bx + "px";
@@ -607,6 +630,11 @@
             p.removeChild(m);
             try { p.normalize(); } catch (err) {}
         }
+        // 框选标注的矩形 overlay 一并移除
+        var rects = document.querySelectorAll('.sy-ann-rect[data-ann-id="' + safeId + '"]');
+        for (var r = 0; r < rects.length; r++) {
+            if (rects[r].parentNode) rects[r].parentNode.removeChild(rects[r]);
+        }
         removeInline(safeId);
     }
 
@@ -618,14 +646,16 @@
     }
 
     window.__syAnnRender = function () {
-        for (var i = 0; i < list.length; i++) wrapOne(list[i]);
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].kind === "rect") wrapRectOne(list[i]); else wrapOne(list[i]);
+        }
     };
 
     window.__syAnnApply = function (items) {
         ensureStyle();
         for (var i = 0; i < (items || []).length; i++) {
             list.push(items[i]);
-            wrapOne(items[i]);
+            if (items[i].kind === "rect") wrapRectOne(items[i]); else wrapOne(items[i]);
         }
     };
 
@@ -633,6 +663,27 @@
     window.__syAnnSetNotes = function (items) {
         for (var i = 0; i < (items || []).length; i++) {
             var it = items[i];
+            if (it.kind === "rect") {
+                // 框选标注:更新 overlay 位置与批注小字(重新框选后宿主推送)
+                var safeR = String(it.id || "").replace(/[^A-Za-z0-9_-]/g, "");
+                var r = document.querySelector('.sy-ann-rect[data-ann-id="' + safeR + '"]');
+                if (r && it.rect) {
+                    r.style.left = it.rect.x + "px";
+                    r.style.top = it.rect.y + "px";
+                    r.style.width = it.rect.w + "px";
+                    r.style.height = it.rect.h + "px";
+                    var lbl = r.querySelector(".sy-ann-inline");
+                    if (lbl) lbl.textContent = it.note || "";
+                }
+                for (var j2 = 0; j2 < list.length; j2++) {
+                    if (String(list[j2].id) === String(it.id)) {
+                        list[j2].note = it.note;
+                        list[j2].rect = it.rect;
+                        list[j2].shot = it.shot;
+                    }
+                }
+                continue;
+            }
             for (var j = 0; j < list.length; j++) {
                 if (String(list[j].id) === String(it.id)) {
                     list[j].note = it.note;
@@ -648,6 +699,115 @@
 
     // 从标注文档链接跳转过来（url 带 #syann=<id> 片段）：滚动到对应高亮并闪烁提示。
     // 高亮可能晚于首次调用渲染（懒加载页面），宿主会按间隔重试；成功后置闩不再重复滚动。
+    // ===== 框选标注:遮罩 + 拖拽取框(视口内) =====
+    // 坐标:overlay 移除后宿主 capturePage 按**视口坐标**截屏;同时上报**文档坐标**
+    // (视口坐标 + 滚动偏移)供矩形 overlay 在页面里持久定位
+    window.__syAnnCaptureStart = function (id) {
+        if (document.getElementById("sy-ann-capture")) return;
+        captureId = id || null;
+        var ov = document.createElement("div");
+        ov.id = "sy-ann-capture";
+        ov.className = "sy-ann-capture";
+        var tip = document.createElement("div");
+        tip.className = "sy-ann-capture-tip";
+        tip.textContent = "拖拽框选区域,Esc 取消";
+        var box = document.createElement("div");
+        box.className = "sy-ann-capture-box";
+        box.style.display = "none";
+        ov.appendChild(tip);
+        ov.appendChild(box);
+        var sx = 0, sy = 0, dragging = false;
+        ov.addEventListener("mousedown", function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            dragging = true;
+            sx = e.clientX; sy = e.clientY;
+            box.style.left = sx + "px"; box.style.top = sy + "px";
+            box.style.width = "0px"; box.style.height = "0px";
+            box.style.display = "";
+        });
+        ov.addEventListener("mousemove", function (e) {
+            if (!dragging) return;
+            e.preventDefault();
+            var x = Math.min(sx, e.clientX), y = Math.min(sy, e.clientY);
+            box.style.left = x + "px"; box.style.top = y + "px";
+            box.style.width = Math.abs(e.clientX - sx) + "px";
+            box.style.height = Math.abs(e.clientY - sy) + "px";
+        });
+        ov.addEventListener("mouseup", function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var w = Math.abs(e.clientX - sx), h = Math.abs(e.clientY - sy);
+            var vx = Math.min(sx, e.clientX), vy = Math.min(sy, e.clientY);
+            var done = function () {
+                if (ov.parentNode) ov.parentNode.removeChild(ov);
+                captureId = null;
+            };
+            if (w < 10 || h < 10) { done(); return; }
+            // 遮罩先移除再上报:宿主截屏不能把遮罩截进去
+            done();
+            var vrect = { x: Math.round(vx), y: Math.round(vy), w: Math.round(w), h: Math.round(h) };
+            window.__syAnnRectCaptured = {
+                id: id,
+                rect: { x: vrect.x + (window.scrollX || 0), y: vrect.y + (window.scrollY || 0), w: vrect.w, h: vrect.h },
+                vrect: vrect,
+            };
+        });
+        document.body.appendChild(ov);
+    };
+
+    // 框选标注渲染:文档坐标矩形 overlay + 角标批注小字
+    function wrapRectOne(item) {
+        if (!item || !item.rect) return;
+        if (item.hlOff === true) return;
+        var safeId = String(item.id || "").replace(/[^A-Za-z0-9_-]/g, "");
+        var r = document.querySelector('.sy-ann-rect[data-ann-id="' + safeId + '"]');
+        if (r) return; // 已渲染(懒加载重试不重复)
+        r = document.createElement("div");
+        r.className = "sy-ann-rect";
+        r.setAttribute("data-ann-id", safeId);
+        r.style.left = item.rect.x + "px";
+        r.style.top = item.rect.y + "px";
+        r.style.width = item.rect.w + "px";
+        r.style.height = item.rect.h + "px";
+        r.addEventListener("mouseenter", function () {
+            window.__syAnnOpen = { id: item.id, x: item.rect.x, y: item.rect.y, hover: true };
+        });
+        r.addEventListener("click", function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            window.__syAnnOpen = { id: item.id, x: item.rect.x, y: item.rect.y };
+        });
+        if (item.note && inlineVisible) {
+            var lbl = document.createElement("div");
+            lbl.className = "sy-ann-inline";
+            lbl.setAttribute("data-ann-id", safeId);
+            lbl.textContent = item.note;
+            r.appendChild(lbl);
+        }
+        document.body.appendChild(r);
+    }
+
+    // 文字改锚完成:去旧高亮 → 替换列表条目 → 包新文字
+    window.__syAnnReanchorDone = function (item) {
+        if (!item || !item.id) return;
+        removeMarks(String(item.id));
+        for (var j = 0; j < list.length; j++) {
+            if (String(list[j].id) === String(item.id)) { list[j] = item; break; }
+        }
+        window.__syAnnRender();
+    };
+
+    // Escape 优先取消框选模式
+    var _origKeydown = document.addEventListener;
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && captureId !== null) {
+            var ov = document.getElementById("sy-ann-capture");
+            if (ov && ov.parentNode) ov.parentNode.removeChild(ov);
+            captureId = null;
+        }
+    }, true);
+
     window.__syAnnFocus = function (id) {
         if (!id) return false;
         if (window.__syAnnFocused === id) return true;

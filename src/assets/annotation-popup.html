@@ -120,7 +120,7 @@
       var it = items[i];
       var nt = String(it.note || "").replace(/\s+/g, " ").trim();
       h += '<div class="li" data-id="' + esc(it.id) + '"><span class="dot dot-' + esc(it.color || "yellow") + '"></span><span class="tx">' +
-        '<div class="q">' + esc(it.quote || "(页面级)") + "</div>" +
+        '<div class="q">' + esc(it.quote || (it.kind === "rect" ? "(框选)" : "(页面级)")) + "</div>" +
         (nt ? '<div class="n">' + esc(nt) + "</div>" : "") +
         ((it.tags || []).length ? '<div>' + it.tags.map(function (t) { return '<span class="tg">' + esc(t) + "</span>"; }).join("") + "</div>" : "") +
         "</span></div>";
@@ -134,7 +134,9 @@
   function render() {
     if (data.mode === "list") { renderList(); return; }
     var h = "";
-    if (data.quote) h += '<div class="q">' + esc(data.quote) + "</div>";
+    if (data.kind === "rect" && data.shot) {
+      h += '<div class="q"><img src="' + location.origin + esc(data.shot) + '" style="max-width:100%;display:block;border-radius:4px;"></div>';
+    } else if (data.quote) h += '<div class="q">' + esc(data.quote) + "</div>";
     // 批注文本可点击进入简单编辑（写回思源批注块）
     h += data.note
       ? '<div class="n edt" id="noteTxt" title="点击编辑批注">' + esc(data.note) + "</div>"
@@ -146,7 +148,10 @@
     for (var j = 0; j < tags.length; j++) h += '<span class="tag" data-t="' + esc(tags[j]) + '" title="点击移除">' + esc(tags[j]) + " ×</span>";
     h += '<input id="taginput" placeholder="+标签(回车)" />';
     h += "</div>";
-    h += '<div class="acts"><button id="edit" class="pri">在思源编辑</button></div>';
+    var extraActs = "";
+    if (data.kind === "rect") extraActs += '<button id="recap">重新框选</button>';
+    else extraActs += '<button id="reasel">重新选中文字</button>';
+    h += '<div class="acts">' + extraActs + '<button id="edit" class="pri">在思源编辑</button></div>';
     document.getElementById("body").innerHTML = h;
     var sws = document.querySelectorAll(".sw");
     for (var k = 0; k < sws.length; k++) sws[k].onclick = function () { color = this.getAttribute("data-c"); send(); render(); };
@@ -155,6 +160,10 @@
     var ti = document.getElementById("taginput");
     ti.onkeydown = function (e) { if (e.key === "Enter") { var v = String(ti.value || "").trim(); if (v && tags.indexOf(v) < 0) { tags.push(v); send(); render(); } } };
     document.getElementById("edit").onclick = function () { if (chan) chan.postMessage({ type: "edit", id: data.id }); };
+    var rc = document.getElementById("recap");
+    if (rc) rc.onclick = function () { if (chan) chan.postMessage({ type: "recapture", id: data.id }); window.close(); };
+    var rs = document.getElementById("reasel");
+    if (rs) rs.onclick = function () { if (chan) chan.postMessage({ type: "reanchorSel", id: data.id }); window.close(); };
     document.getElementById("noteTxt").onclick = openEditor;
   }
   // 批注简单编辑：textarea 就地编辑 → saveNote 经宿主写回思源批注块；

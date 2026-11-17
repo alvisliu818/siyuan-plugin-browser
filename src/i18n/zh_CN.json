@@ -174,5 +174,12 @@
   "showAnnRemoveDesc": "选中网页文字时，悬浮气泡里显示「取消高亮」「取消小字」按钮：仅隐藏页内对应显示，标注文档与批注内容保留；取消状态持久化，重开网页不再恢复对应显示。",
   "showAnnFloat": "悬停/点击高亮弹出批注悬浮窗",
   "showAnnFloatDesc": "鼠标悬停/点击页内标注高亮时，弹出批注悬浮窗；关闭后仅保留页内高亮与「标注文档列表」（地址栏 ✎ 菜单）。",
-  "showAnnFloatOff": "批注悬浮弹窗已在设置中关闭"
+  "showAnnFloatOff": "批注悬浮弹窗已在设置中关闭",
+  "annotateRect": "框选标注（截图区域）",
+  "annotationRectCreated": "已框选标注",
+  "annotationRectCaptureHint": "在页面上拖拽框选区域,Esc 取消",
+  "annotationReanchorHint": "请选中新的文字,气泡里点「改锚」",
+  "annotationRecaptured": "已重新框选(批注保持对应)",
+  "annotationReanchored": "已重新选中文字(批注保持对应)",
+  "annotationReanchorNone": "只有文字标注支持重新选中(框选标注请用重新框选)"
 }
