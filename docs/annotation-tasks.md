@@ -60,3 +60,11 @@
 - 测试库实例必须 schtasks 拉起才常驻（agent 沙盒命令结束回收进程树）
 - **main.js 调试补丁保留**：D:\programs\SiYuan\resources\app\electron-dist\main.js 含环境变量门控补丁（`if(process.env.SY_REMOTE_DEBUG_PORT)`），正常启动 inert，跨会话 CDP 调试依赖它，未还原（如需还原删除该 if 块即可）
 - 插件源码不受 git 跟踪（monorepo .gitignore 忽略）；改动前备份在 C:\Users\alvisliu\.qoder\tmp\annotation.ts.bak-planB
+## 2026-11-18 v0.3.13 后：取消高亮/取消小字 + 悬浮弹窗开关（b8b26f2 + 27210a3）
+
+- **选区气泡新增「取消高亮」「取消小字」**：用户拍板语义=页内显示层面取消，**标注文档与块不删**。状态持久化在锚点 custom-syann 新增 `hl`/`inline` 布尔字段（缺省视为 true 兼容旧数据），fetchAnnotations 带回 hlOff/inlineOff，页内 wrapOne 跳过包裹/小字。**关键坑：applyMeta 与 showDialog 懒补 noteId 都会整体重写 custom-syann，必须带上 hl/inline，否则改色/改标签会静默重置已取消的显示。**
+- 命中优先级：选区与高亮相交（range.intersectsNode）带 id > quote+前后文精确匹配 > quote 唯一匹配；多条同文不猜，提示点对应高亮。
+- **设置新增两项**：showAnnRemove（气泡取消按钮显隐，页内经 __syAnnSetRemoveVisible 回刷）、showAnnFloat（悬停/点击高亮弹悬浮窗总开关，关闭后悬停静默、点击一次性 toast）。
+- **悬浮弹窗自收起修复**：原设计 mouseenter 置 hovered 但**弹窗显示在光标下时边界事件不触发** → hovered 恒 false → 800ms 后自收（=「移上去还关」）；修法=计时器到期实测 body.matches(":hover") 续期 + pointermove 兜底同步 hovered。
+- **固定后仍自关 bug 双保险**：宿主侧 floatWins 记 __syPinned，hide 消息对已固定窗口直接忽略；openFloat 重入不再对已固定窗口下发 autohide（防 hover 重触发改回自动收起）。
+- 轮询消费：WebviewController 注入轮询对象加 `window.__syAnnRemove`，BrowserTab onAnnRemove → annotation.setDisplayOff。
