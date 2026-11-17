@@ -68,3 +68,15 @@
 - **悬浮弹窗自收起修复**：原设计 mouseenter 置 hovered 但**弹窗显示在光标下时边界事件不触发** → hovered 恒 false → 800ms 后自收（=「移上去还关」）；修法=计时器到期实测 body.matches(":hover") 续期 + pointermove 兜底同步 hovered。
 - **固定后仍自关 bug 双保险**：宿主侧 floatWins 记 __syPinned，hide 消息对已固定窗口直接忽略；openFloat 重入不再对已固定窗口下发 autohide（防 hover 重触发改回自动收起）。
 - 轮询消费：WebviewController 注入轮询对象加 `window.__syAnnRemove`，BrowserTab onAnnRemove → annotation.setDisplayOff。
+
+## 2026-11-18 框选截图标注 + 改锚/重新框选（35ae788）
+
+**框选标注（新类型 kind:rect）**：✎ 菜单「框选标注」→ 页内遮罩拖拽（视口内）→ 页面移除遮罩后上报两份坐标（文档坐标=视口+滚动，给 overlay 持久定位；视口坐标给宿主 `webview.capturePage(vrect)` 截屏——**截屏发生在宿主侧轮询消费时（≤300ms 后），遮罩必须先移除**）→ PNG 经 `/api/asset/upload`（FormData，本地免鉴权）落 `/assets/annot/`。锚点=图片链接列表项 `- [![框选](assets/x.png)](url#syann=id)` + 嵌套批注项；custom-syann 增 `kind:"rect"`/`rect`(文档坐标)/`shot` 字段。页内 overlay = 文档坐标绝对定位 div（批注小字角标沿用 sy-ann-inline），hover/点击与文字高亮同链路（悬浮窗内显示截图本体）。
+
+**改锚/重新框选（批注内容与 noteId 保持对应）**：悬浮窗按钮「重新选中文字」（文字标注）/「重新框选」（框选标注）→ host 进入对应模式（页内 `__syAnnReanchorPending=id` / `__syAnnCaptureStart(id)`）→ 用户下一次选区/拖拽 → 轮询通道 `__syAnnReanchor`/`__syAnnRectCaptured` 消费 → 改锚=锚点块 markdown 重建链接文字（lastIndexOf("](") 取链接目标）+ custom-syann 更新 + 页内 `__syAnnReanchorDone`（去旧高亮→换列表条目→重新包裹）；重新框选=新截图上传 → 锚点块 md 里 split/join 换 asset 路径（保留链接结构）→ 旧截图 `/api/file/removeFile` 清理（每张文件唯一无共享）→ overlay 重定位。
+
+**实现坑**：
+- **多层数据转义（本轮第二次踩）**：heredoc python 补丁里 `\w+` 匹配 chunk 名漏掉连字符名（bubble-btn/host-entry 静默丢段）、`\n`/`\r` 解成真实控制字符进 TS 字符串——**大段代码一律走 Write 临时文件 + python 按锚点拼接**，拼接后 node --check 必跑；拼接型补丁的重复定义（removeMarks 嵌套进旧函数体）靠括号深度扫描定位。
+- escMd 从 create() 局部提升为模块函数、insertAnchorBlocks 从 create() 抽取复用（原文搬迁避免重打转义）。
+- 取消高亮/小字对框选同样生效（overlay 在 removeMarks 里一并移除）；框选无恢复路径（与文字标注一致）。
+- 待办：框选 overlay 在页面重排后会漂移（文档坐标不跟随重排）；滚动截长图（拼接）未做；Esc 取消框选已有，框选最小尺寸 10px。
