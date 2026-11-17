@@ -51,7 +51,8 @@
         ".sy-ann-pop-bar button.on{color:#1a73e8;background:#dbeafe;}",
         ".sy-ann-pop-resize{position:absolute;right:0;bottom:0;width:14px;height:14px;cursor:nwse-resize;}",
         "@keyframes syAnnFlash{0%{box-shadow:0 0 0 0 rgba(255,140,0,.85);}70%{box-shadow:0 0 0 12px rgba(255,140,0,0);}100%{box-shadow:0 0 0 0 rgba(255,140,0,0);}}",
-        ".sy-ann-flash{animation:syAnnFlash 0.9s ease-out 2;}"
+        ".sy-ann-flash{animation:syAnnFlash 0.9s ease-out 2;}",
+        ".sy-ann-bubble .sy-ann-remove{color:#d93025;font-size:11px;padding:3px 6px;}"
     ].join("");
 
     function ensureStyle() {
@@ -63,6 +64,7 @@
     }
 
     var list = window.__syAnnList = [];
+    var removeVisible = true; // 选区气泡是否显示「取消高亮/小字」（宿主设置开关，__syAnnInit/SetRemoveVisible 下发）
 
     function esc(s) {
         return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -118,6 +120,7 @@
 
     function wrapOne(ann) {
         if (!ann || !ann.quote || !String(ann.quote).trim()) return 0;
+        if (ann.hlOff === true) return 0; // 已取消高亮：不再包裹（重开页面 fetchAnnotations 带回 hlOff）
         // 已渲染过的标注跳过：懒加载重试(__syAnnRender)会对全部条目重新定位，
         // 原位置文本已被包裹并从收集范围排除，重新 locate 会退化命中到错误的
         // 出现位置（同一标注在错误位置重复高亮）
@@ -157,7 +160,7 @@
             } catch (e) { /* 节点已失效等情况忽略 */ }
         }
         // 内联小字：高亮后附截断的批注摘要，页面内不点开即可快速浏览（不存在则补建）
-        if (wrapped) upsertInline(renderedId, ann.note);
+        if (wrapped && ann.inlineOff !== true) upsertInline(renderedId, ann.note);
         return wrapped;
     }
 
@@ -460,6 +463,8 @@
         try { b.setAttribute("popover", "manual"); } catch (e) {}
         b.innerHTML = '<span class="sy-ann-swatches">' + COLORS.map(function (c) { return '<button class="sy-ann-sw sy-ann-sw-' + c + (c === "yellow" ? " on" : "") + '" data-ann-color="' + c + '" title="' + c + '"></button>'; }).join("") + "</span>" +
             '<button class="sy-ann-create" data-ann-act="create">标注</button>' +
+            '<button class="sy-ann-remove" data-ann-act="unhl" style="' + (removeVisible ? "" : "display:none;") + '">取消高亮</button>' +
+            '<button class="sy-ann-remove" data-ann-act="uninline" style="' + (removeVisible ? "" : "display:none;") + '">取消小字</button>' +
             '<button data-ann-act="close" title="关闭">×</button>';
         b.addEventListener("click", function (e) {
             var sw = e.target.closest ? e.target.closest("[data-ann-color]") : null;
@@ -479,6 +484,17 @@
             if (act === "create" && b.__ann) {
                 b.__ann.color = bubbleColor;
                 window.__syAnnCreate = b.__ann;
+                b.__ann = null;
+                try { window.getSelection().removeAllRanges(); } catch (err) {}
+            } else if ((act === "unhl" || act === "uninline") && b.__ann) {
+                // 取消高亮/小字：只动页内显示，宿主把状态写回锚点属性（标注文档不删）
+                window.__syAnnRemove = {
+                    kind: act === "unhl" ? "hl" : "inline",
+                    id: b.__ann.id || "",
+                    quote: b.__ann.quote,
+                    prefix: b.__ann.prefix,
+                    suffix: b.__ann.suffix,
+                };
                 b.__ann = null;
                 try { window.getSelection().removeAllRanges(); } catch (err) {}
             }
@@ -508,8 +524,16 @@
             } catch (err) {}
             var r = range.getBoundingClientRect();
             if (!r || (!r.width && !r.height)) { hideBubble(); return; }
+            // 选区与已有高亮相交时带上标注 id：取消操作直接命中，不受同文重复标注干扰
+            var hitId = "";
+            try {
+                var marks = document.querySelectorAll("mark.sy-ann-hl[data-ann-id]");
+                for (var mi = 0; mi < marks.length; mi++) {
+                    if (range.intersectsNode(marks[mi])) { hitId = marks[mi].getAttribute("data-ann-id") || ""; break; }
+                }
+            } catch (err) {}
             var b = ensureBubble();
-            b.__ann = { quote: quote, prefix: pre, suffix: suf };
+            b.__ann = { quote: quote, prefix: pre, suffix: suf, id: hitId };
             var bx = Math.min(Math.max(r.left + r.width / 2 - 34, 8), window.innerWidth - 90);
             var by = r.top > 40 ? r.top - 34 : r.bottom + 6;
             b.style.left = bx + "px";
@@ -528,12 +552,14 @@
 
     // ===== 宿主入口 =====
 
-    window.__syAnnInit = function (items, showInline) {
+    window.__syAnnInit = function (items, showInline, showRemove) {
         ensureStyle();
         if (showInline !== undefined) inlineVisible = !!showInline;
+        if (showRemove !== undefined) removeVisible = !!showRemove;
         list.length = 0;
         for (var i = 0; i < (items || []).length; i++) list.push(items[i]);
         window.__syAnnRender();
+        syncRemoveBtns();
     };
 
     // 设置开关：显示/隐藏页内批注小字
@@ -542,6 +568,54 @@
         var inls = document.querySelectorAll(".sy-ann-inline");
         for (var i = 0; i < inls.length; i++) inls[i].style.display = inlineVisible ? "" : "none";
     };
+
+    // 设置开关：显示/隐藏选区气泡「取消高亮/小字」按钮
+    window.__syAnnSetRemoveVisible = function (v) {
+        removeVisible = !!v;
+        syncRemoveBtns();
+    };
+
+    function syncRemoveBtns() {
+        var btns = document.querySelectorAll("#sy-ann-bubble .sy-ann-remove");
+        for (var i = 0; i < btns.length; i++) btns[i].style.display = removeVisible ? "" : "none";
+    }
+
+    // 取消高亮（宿主已写回锚点属性）：去 mark 连带其内联小字；列表项打标记防懒加载重试重新包裹
+    window.__syAnnSetMark = function (id) {
+        for (var j = 0; j < list.length; j++) {
+            if (String(list[j].id) === String(id)) list[j].hlOff = true;
+        }
+        removeMarks(String(id));
+    };
+
+    // 只取消小字：保高亮
+    window.__syAnnSetInlineOff = function (id) {
+        for (var j = 0; j < list.length; j++) {
+            if (String(list[j].id) === String(id)) list[j].inlineOff = true;
+        }
+        removeInline(String(id).replace(/[^A-Za-z0-9_-]/g, ""));
+    };
+
+    function removeMarks(id) {
+        var safeId = String(id).replace(/[^A-Za-z0-9_-]/g, "");
+        var marks = document.querySelectorAll('mark.sy-ann-hl[data-ann-id="' + safeId + '"]');
+        for (var i = 0; i < marks.length; i++) {
+            var m = marks[i];
+            var p = m.parentNode;
+            if (!p) continue;
+            while (m.firstChild) p.insertBefore(m.firstChild, m);
+            p.removeChild(m);
+            try { p.normalize(); } catch (err) {}
+        }
+        removeInline(safeId);
+    }
+
+    function removeInline(safeId) {
+        var inls = document.querySelectorAll('.sy-ann-inline[data-ann-id="' + safeId + '"]');
+        for (var k = 0; k < inls.length; k++) {
+            if (inls[k].parentNode) inls[k].parentNode.removeChild(inls[k]);
+        }
+    }
 
     window.__syAnnRender = function () {
         for (var i = 0; i < list.length; i++) wrapOne(list[i]);

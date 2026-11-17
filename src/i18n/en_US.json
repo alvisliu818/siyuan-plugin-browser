@@ -163,5 +163,15 @@
   "annotationNotebookRequired": "Select an annotation notebook in plugin settings first",
   "annotationParentPath": "Annotation path",
   "annotationParentPathDesc": "Annotation documents are saved under this path: path → site domain → page annotation document. Select text on a page and click Annotate to write into the document; reopening the page restores highlight positions, and hovering a highlight shows the bound SiYuan block content.",
-  "annotationNoDoc": "No annotation document for this page yet"
+  "annotationNoDoc": "No annotation document for this page yet",
+  "annotationRemovedHl": "Highlight hidden (annotation document kept)",
+  "annotationRemovedInline": "Inline note hidden",
+  "annotationRemoveNone": "No saved annotation matches this selection",
+  "annotationRemoveAmbiguous": "Multiple annotations match this text; click the exact highlight first",
+  "annotationRemoveFailed": "Failed to hide",
+  "showAnnRemove": "Show \"Un-highlight / Un-note\" in selection bubble",
+  "showAnnRemoveDesc": "Show Un-highlight and Un-note buttons in the selection bubble: they only hide the on-page display; the annotation document and its blocks are kept, and the hidden state persists across page reloads.",
+  "showAnnFloat": "Show annotation popup on hover/click",
+  "showAnnFloatDesc": "Show the annotation float window when hovering or clicking a highlight; when off, only the page highlights and the annotation list (address-bar ✎ menu) remain.",
+  "showAnnFloatOff": "Annotation popup is disabled in settings"
 }

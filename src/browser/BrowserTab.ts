@@ -218,6 +218,9 @@ export class BrowserTab {
                 onAnnCreate: (payload: AnnCreatePayload) => {
                     this.annotation?.create(this.webview, this.controller.getCurrentUrl(), this.controller.getCurrentTitle(), payload);
                 },
+                onAnnRemove: (payload: { kind?: string; id?: string; quote?: string; prefix?: string; suffix?: string }) => {
+                    void this.annotation?.setDisplayOff(this.webview, this.controller.getCurrentUrl(), payload);
+                },
                 onAnnOpen: (payload: { id?: string; x?: number; y?: number; edit?: boolean }) => {
                     if (payload?.edit) void this.annotation?.showDialog(this.webview, this.controller.getCurrentUrl(), payload);
                     else void this.annotation?.openFloat(this.webview, this.controller.getCurrentUrl(), payload);
@@ -1835,9 +1838,10 @@ export class BrowserTab {
      * - 标注此页：无选区的页面级标注
      * - 打开标注文档：跳转到当前页对应的思源标注文档
      */
-    /** 设置变更（标注小字开关等）回刷页内标注 UI */
-    applyAnnSettings(show?: boolean): void {
+    /** 设置变更（标注小字/取消按钮开关）回刷页内标注 UI */
+    applyAnnSettings(show?: boolean, showRemove?: boolean): void {
         this.annotation?.applyInlineVisibility(show);
+        this.annotation?.applyRemoveVisibility(showRemove);
     }
 
     private async showAnnotationMenu(x?: number, y?: number): Promise<void> {

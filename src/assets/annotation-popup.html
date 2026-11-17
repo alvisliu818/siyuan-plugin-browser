@@ -84,6 +84,9 @@
     hideT = setTimeout(function () {
       hideT = null;
       if (busy()) return;
+      // 触发时实测 :hover：弹窗显示在光标下时 mouseenter 可能不触发（hovered 滞后），
+      // 鼠标在弹窗上就绝不自动收起——续期等待，移出后再收
+      try { if (document.body.matches(":hover")) { scheduleHide(); return; } } catch (err) {}
       if (autoHide && !pinned && !hovered && !dragging && !resizing) { if (chan) chan.postMessage({ type: "hide", id: data.id }); }
     }, 800);
   }
@@ -104,6 +107,8 @@
   };
   document.body.addEventListener("mouseenter", function () { hovered = true; cancelHide(); });
   document.body.addEventListener("mouseleave", function () { hovered = false; if (autoHide && !pinned) scheduleHide(); });
+  // mouseenter 在「弹窗显示在光标下」时可能不触发边界事件：pointermove 兜底同步 hovered
+  document.body.addEventListener("pointermove", function () { if (!hovered) { hovered = true; cancelHide(); } });
   function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }
   function send() { if (chan) chan.postMessage({ type: "meta", id: data.id, color: color, tags: tags }); }
   function renderList() {

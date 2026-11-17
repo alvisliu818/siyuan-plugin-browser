@@ -36,6 +36,10 @@ interface AnnItem {
     color?: string;
     /** 标签 */
     tags?: string[];
+    /** 已取消高亮（持久化在锚点 custom-syann 的 hl=false；重开页面不再包裹） */
+    hlOff?: boolean;
+    /** 已取消页内批注小字（持久化在锚点 custom-syann 的 inline=false） */
+    inlineOff?: boolean;
 }
 
 function htmlUnescape(s: string): string {
@@ -69,6 +73,7 @@ const ANN_CSS = `
 .sy-ann-bubble{position:fixed!important;z-index:2147483645;display:flex;align-items:center;gap:2px;background:#fff;border:1px solid #e0e0e0;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.22);padding:3px;font-family:sans-serif;margin:0!important;right:auto!important;bottom:auto!important;}
 .sy-ann-bubble button{border:none;background:transparent;cursor:pointer;font-size:12px;padding:3px 10px;border-radius:4px;line-height:16px;}
 .sy-ann-bubble .sy-ann-create{background:#1a73e8;color:#fff;font-weight:600;}
+.sy-ann-bubble .sy-ann-remove{color:#d93025;font-size:11px;padding:3px 6px;}
 .sy-ann-pop{position:fixed!important;z-index:2147483645;max-width:340px;max-height:260px;overflow:auto;background:#fff;color:#222;border:none!important;outline:none;border-radius:10px;box-shadow:0 4px 18px rgba(0,0,0,.18);padding:10px 12px;font-size:13px;line-height:1.5;font-family:sans-serif;word-break:break-word;margin:0!important;right:auto!important;bottom:auto!important;}
 .sy-ann-pop-quote{font-size:12px;color:#666;border-left:3px solid #f5c542;padding-left:8px;margin-bottom:6px;white-space:pre-wrap;}
 .sy-ann-pop-note{white-space:pre-wrap;}
@@ -136,8 +141,9 @@ export class AnnotationController {
                 else if (m.id && (m.type === "pin" || m.type === "hide" || m.type === "resize" || m.type === "move" || m.type === "close")) {
                     const w = this.floatWins.get(String(m.id));
                     if (!w || w.isDestroyed()) return;
-                    if (m.type === "pin") w.setAlwaysOnTop(!!m.value);
-                    else if (m.type === "hide") w.hide();
+                    // 固定状态记在宿主侧：已固定的窗口一律忽略 hide 请求（弹窗侧调度失误的双保险）
+                    if (m.type === "pin") { (w as any).__syPinned = !!m.value; w.setAlwaysOnTop(!!m.value); }
+                    else if (m.type === "hide") { if (!(w as any).__syPinned) w.hide(); }
                     else if (m.type === "resize") w.setSize(Number(m.w) || 380, Number(m.h) || 340);
                     else if (m.type === "move") {
                         // 标题栏手动拖动（弹窗页 pointer capture + rAF 节流）
@@ -173,6 +179,7 @@ export class AnnotationController {
                 id: item.id, url: urlKey, quote: item.quote, prefix: item.prefix,
                 suffix: item.suffix, created: item.created, noteId: item.noteId,
                 color: item.color || "yellow", tags: item.tags || [],
+                hl: item.hlOff !== true, inline: item.inlineOff !== true,
             });
             await fetchSyncPost("/api/attr/setBlockAttrs", { id: item.anchorBlockId, attrs: { "custom-syann": json } });
             const wv = this.webviews.get(urlKey);
@@ -237,6 +244,11 @@ export class AnnotationController {
     /** 点击高亮 → 轻量浮动窗（独立 OS 窗：快、可多开、可拖出思源边界、可固定） */
     async openFloat(webview: IWebviewTag, url: string, payload: { id?: string; x?: number; y?: number; hover?: boolean }): Promise<void> {
         try {
+            // 设置开关关闭悬浮弹窗：悬停静默跳过；点击给一次性提示（避免「点了没反应」的困惑）
+            if (this.getSettings().showAnnFloat === false) {
+                if (!payload?.hover) showMessage(this.i18n.showAnnFloatOff || "批注悬浮弹窗已在设置中关闭", 2500, "info");
+                return;
+            }
             const urlKey = AnnotationStore.normalizeKey(url);
             this.webviews.set(urlKey, webview);
             let found = this.findItem(String(payload?.id || ""));
@@ -264,8 +276,11 @@ export class AnnotationController {
             const sy = Math.max(0, Math.min(Math.round(window.screenY + wr.top + (payload?.y || 0) + 12), (window.screen.availHeight || 1080) - 350));
             const exist = this.floatWins.get(item.id);
             if (exist && !exist.isDestroyed()) {
-                exist.__syAutoHide = !!payload?.hover;
-                this.floatChannel?.postMessage({ type: "autohide", id: item.id, value: !!payload?.hover });
+                // 已固定的窗口不再下发 autohide 状态（保持 pinned 语义，防止被 hover 重触发改回自动收起）
+                if (!(exist as any).__syPinned) {
+                    exist.__syAutoHide = !!payload?.hover;
+                    this.floatChannel?.postMessage({ type: "autohide", id: item.id, value: !!payload?.hover });
+                }
                 exist.setPosition(sx, sy);
                 exist.show();
                 exist.focus();
@@ -343,6 +358,83 @@ export class AnnotationController {
         }
     }
 
+    /** 设置开关变更后回刷各页内选区气泡「取消高亮/小字」按钮显隐 */
+    applyRemoveVisibility(show?: boolean): void {
+        const v = show === undefined ? this.getSettings().showAnnRemove !== false : !!show;
+        for (const wv of this.webviews.values()) {
+            wv.executeJavaScript("window.__syAnnSetRemoveVisible && window.__syAnnSetRemoveVisible(" + JSON.stringify(v) + ");").catch(() => {});
+        }
+    }
+
+    /**
+     * 取消标注（页内显示层面，标注文档与块保留）：kind=hl 取消高亮 / inline 取消批注小字。
+     * 状态持久化在锚点 custom-syann 的 hl/inline 字段，重开页面 fetchAnnotations 带回后不再恢复对应显示。
+     * 命中优先级：页内给出的高亮 id > quote+前后文精确匹配 > 仅 quote 唯一匹配（多条同文匹配则提示用户点高亮）。
+     */
+    async setDisplayOff(webview: IWebviewTag, url: string, payload: { kind?: string; id?: string; quote?: string; prefix?: string; suffix?: string }): Promise<void> {
+        const i18n = this.i18n;
+        try {
+            const urlKey = AnnotationStore.normalizeKey(url);
+            let items = this.pageCache.get(urlKey);
+            if (!items) {
+                const page = this.store.find(urlKey);
+                if (page?.docId) {
+                    items = await this.fetchAnnotations(page.docId);
+                    this.pageCache.set(urlKey, items);
+                }
+            }
+            if (!items || !items.length) {
+                showMessage(i18n.annotationRemoveNone || "该选区没有已保存的标注", 3000, "info");
+                return;
+            }
+            let target: AnnItem | undefined;
+            const wantId = String(payload?.id || "");
+            if (wantId) target = items.find((i) => i.id === wantId);
+            if (!target) {
+                const quote = String(payload?.quote || "").replace(/\s+/g, " ").trim();
+                const pre = String(payload?.prefix || "").replace(/\s+/g, " ").trim();
+                const suf = String(payload?.suffix || "").replace(/\s+/g, " ").trim();
+                const byQuote = items.filter((i) => i.quote === quote);
+                if (byQuote.length === 1) target = byQuote[0];
+                else if (byQuote.length > 1) {
+                    target = byQuote.find((i) => (i.prefix || "") === pre && (i.suffix || "") === suf);
+                    if (!target) {
+                        showMessage(i18n.annotationRemoveAmbiguous || "该文字对应多条标注，请点击对应高亮后再取消", 5000, "info");
+                        return;
+                    }
+                }
+            }
+            if (!target?.anchorBlockId) {
+                showMessage(i18n.annotationRemoveNone || "该选区没有已保存的标注", 3000, "info");
+                return;
+            }
+            const t = target;
+            const unHl = payload?.kind !== "inline";
+            const newHlOff = unHl ? true : t.hlOff === true;
+            const newInlineOff = unHl ? t.inlineOff === true : true;
+            // 显示层状态写回锚点属性（不删块、不动批注内容）
+            const json = JSON.stringify({
+                id: t.id, url: urlKey, quote: t.quote, prefix: t.prefix,
+                suffix: t.suffix, created: t.created, noteId: t.noteId,
+                color: t.color || "yellow", tags: t.tags || [],
+                hl: !newHlOff, inline: !newInlineOff,
+            });
+            await fetchSyncPost("/api/attr/setBlockAttrs", { id: t.anchorBlockId, attrs: { "custom-syann": json } });
+            t.hlOff = newHlOff;
+            t.inlineOff = newInlineOff;
+            const call = unHl
+                ? "window.__syAnnSetMark && window.__syAnnSetMark(" + JSON.stringify(t.id) + ");"
+                : "window.__syAnnSetInlineOff && window.__syAnnSetInlineOff(" + JSON.stringify(t.id) + ");";
+            webview.executeJavaScript(call).catch(() => {});
+            showMessage(unHl
+                ? (i18n.annotationRemovedHl || "已取消高亮（标注文档保留）")
+                : (i18n.annotationRemovedInline || "已取消小字"), 2000, "info");
+        } catch (e: any) {
+            console.warn("[browser-plugin] annotation setDisplayOff failed:", e);
+            showMessage((i18n.annotationRemoveFailed || "取消失败") + ": " + (e?.message || e), 4000, "error");
+        }
+    }
+
     /** 列表浮动窗点条目 → 页内滚动到对应高亮并闪烁。
      *  页签不在/已导航到别的页面/页内定位失败时，回退整页打开 url#syann=<id>（走 onPageReady 的自动定位流程），不再静默无反应 */
     private gotoAnnotation(id: string, url: string): void {
@@ -390,7 +482,7 @@ export class AnnotationController {
             }
             this.pageCache.set(urlKey, items);
             this.webviews.set(urlKey, webview);
-            const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + "," + JSON.stringify(!!this.getSettings().showAnnInline) + ");";
+            const script = annotationScriptSource + "\nwindow.__syAnnInit(" + JSON.stringify(items) + "," + JSON.stringify(!!this.getSettings().showAnnInline) + "," + JSON.stringify(this.getSettings().showAnnRemove !== false) + ");";
             // 样式必须先于脚本经 insertCSS 注入（不受页面 meta CSP 限制）；
             // 页内 ensureStyle 只作兜底
             try {
@@ -630,6 +722,7 @@ export class AnnotationController {
                         attrs: { "custom-syann": JSON.stringify({
                             id: ann.id, url: urlKey, quote: ann.quote, prefix: ann.prefix,
                             suffix: ann.suffix, created: ann.created, noteId: ann.noteId,
+                            hl: ann.hlOff !== true, inline: ann.inlineOff !== true,
                         }) },
                     }).catch(() => {});
                 }
@@ -747,6 +840,8 @@ export class AnnotationController {
                     anchorBlockId: String(row.id || ""),
                     color: String(anchor.color || "yellow"),
                     tags: Array.isArray(anchor.tags) ? anchor.tags.map(String) : [],
+                    hlOff: anchor.hl === false,
+                    inlineOff: anchor.inline === false,
                 });
             }
             return items;

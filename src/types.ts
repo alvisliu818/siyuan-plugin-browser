@@ -97,6 +97,10 @@ export interface BrowserSettings {
     annotationParentPath: string;
     /** 是否在页内高亮下显示批注小字（绝对定位不占文档流） */
     showAnnInline: boolean;
+    /** 选区悬浮气泡是否显示「取消高亮/小字」按钮（缺省视为 true，兼容旧配置） */
+    showAnnRemove: boolean;
+    /** 悬停/点击页内标注高亮时是否弹出批注悬浮窗（缺省视为 true，兼容旧配置） */
+    showAnnFloat: boolean;
     /** 摘录保存路径（人类可读路径，默认根 "/"/，支持 {{...}} sprig 模板） */
     excerptParentPath: string;
     /** 摘录文档标签（逗号分隔） */

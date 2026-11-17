@@ -164,5 +164,15 @@
   "annotationNotebookRequired": "请先在插件设置中选择标注保存笔记本",
   "annotationParentPath": "标注存放路径",
   "annotationParentPathDesc": "标注文档保存在该路径下，结构为：存放路径 → 网站域名 → 网页标注文档。选中网页文字点「标注」即写入对应文档；重新打开网页会自动恢复高亮位置，悬浮高亮可查看绑定的思源块内容。",
-  "annotationNoDoc": "当前页面还没有标注文档"
+  "annotationNoDoc": "当前页面还没有标注文档",
+  "annotationRemovedHl": "已取消高亮（标注文档保留）",
+  "annotationRemovedInline": "已取消小字",
+  "annotationRemoveNone": "该选区没有已保存的标注",
+  "annotationRemoveAmbiguous": "该文字对应多条标注，请点击对应高亮后再取消",
+  "annotationRemoveFailed": "取消失败",
+  "showAnnRemove": "选区气泡显示「取消高亮/小字」",
+  "showAnnRemoveDesc": "选中网页文字时，悬浮气泡里显示「取消高亮」「取消小字」按钮：仅隐藏页内对应显示，标注文档与批注内容保留；取消状态持久化，重开网页不再恢复对应显示。",
+  "showAnnFloat": "悬停/点击高亮弹出批注悬浮窗",
+  "showAnnFloatDesc": "鼠标悬停/点击页内标注高亮时，弹出批注悬浮窗；关闭后仅保留页内高亮与「标注文档列表」（地址栏 ✎ 菜单）。",
+  "showAnnFloatOff": "批注悬浮弹窗已在设置中关闭"
 }

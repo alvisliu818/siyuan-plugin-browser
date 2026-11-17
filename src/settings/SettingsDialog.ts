@@ -186,6 +186,20 @@ export class SettingsDialog {
                 ${this.i18n.annotationParentPathDesc || "标注文档保存在该路径下，结构为：存放路径 → 网站域名 → 网页标注文档。选中网页文字点「标注」即写入对应文档；重新打开网页会自动恢复高亮位置。"}
             </div>
             <div class="b3-form__row">
+                <label>${this.i18n.showAnnRemove || "选区气泡显示「取消高亮/小字」"}</label>
+                <input id="sb-ann-remove" type="checkbox" ${s.showAnnRemove !== false ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.showAnnRemoveDesc || "选中网页文字时，悬浮气泡里显示「取消高亮」「取消小字」按钮：仅隐藏页内对应显示，标注文档与批注内容保留；取消状态持久化，重开网页不再恢复对应显示。"}
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.showAnnFloat || "悬停/点击高亮弹出批注悬浮窗"}</label>
+                <input id="sb-ann-float" type="checkbox" ${s.showAnnFloat !== false ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.showAnnFloatDesc || "鼠标悬停/点击页内标注高亮时，弹出批注悬浮窗；关闭后仅保留页内高亮与「标注文档列表」（地址栏 ✎ 菜单）。"}
+            </div>
+            <div class="b3-form__row">
                 <label>${this.i18n.extManager || "Chrome 扩展"}</label>
                 <button class="b3-button" id="sb-ext-manager">${this.i18n.extManageOpen || "管理扩展..."}</button>
             </div>
@@ -258,6 +272,8 @@ export class SettingsDialog {
                 excerptAssets: (root.querySelector("#sb-excerpt-assets") as HTMLInputElement).checked,
                 annotationNotebook: (root.querySelector("#sb-ann-nb") as HTMLSelectElement)?.value || "",
                 annotationParentPath: (root.querySelector("#sb-ann-path") as HTMLInputElement)?.value.trim() || "/网页标注",
+                showAnnRemove: (root.querySelector("#sb-ann-remove") as HTMLInputElement)?.checked !== false,
+                showAnnFloat: (root.querySelector("#sb-ann-float") as HTMLInputElement)?.checked !== false,
                 interceptAllLinks: (root.querySelector("#sb-intercept-all") as HTMLInputElement).checked,
                 excludedSites: (root.querySelector("#sb-excluded-sites") as HTMLTextAreaElement).value,
                 adBlockEnabled: (root.querySelector("#sb-adblock") as HTMLInputElement).checked,
